@@ -1,0 +1,50 @@
+# change focus between windows
+hyper - j : yabai -m window --focus south
+hyper - k : yabai -m window --focus north
+hyper - h : yabai -m window --focus west
+hyper - l : yabai -m window --focus east
+
+# change focus between spaces
+# hyper - a: yabai -m space --focus prev
+# hyper - s: yabai -m space --focus next
+
+# change focus by space index
+hyper - 1: yabai -m space --focus 2 # main
+hyper - 2: yabai -m space --focus 3 # school
+hyper - q: yabai -m space --focus 5 # schedule
+hyper - w: yabai -m space --focus 6 # mail
+hyper - tab: yabai -m space --focus 4 # schedule
+hyper - 0x32: yabai -m space --focus 1 # terminal
+
+# go to last space
+
+# switch between displays
+hyper - w : yabai -m display --focus west
+hyper - e : yabai -m display --focus east
+
+# swap window position in a direction
+hyper + fn - j : yabai -m window --swap south
+hyper + fn - k : yabai -m window --swap north
+hyper + fn - h : yabai -m window --swap west
+hyper + fn - l : yabai -m window --swap east
+
+hyper + fn - a : yabai -m window --space prev
+hyper + fn - s : yabai -m window --space next
+# Flip the tree horizontally
+hyper - x : yabai -m space --mirror x-axis
+
+# Flip the tree vertically
+hyper - y : yabai -m space --mirror y-axis
+
+# toggle float
+hyper - n: yabai -m window --toggle float --grid 6:6:1:1:4:4
+
+# toggle fullscreen
+hyper - m: yabai -m window --toggle zoom-fullscreen
+hyper + fn - m : yabai -m window --toggle native-fullscreen 
+
+# balance windows
+hyper - b: yabai -m space --balance
+
+# hyper - ` : open/show/hide music
+# hyper - \ : enable/disable keypress recording
