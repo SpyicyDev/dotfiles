@@ -3,7 +3,7 @@ local wezterm = require 'wezterm'
 local config = {}
 
 if wezterm.config_builder then
-  config = wezterm.config_builder()
+    config = wezterm.config_builder()
 end
 
 config.color_scheme = "catppuccin-mocha"
@@ -17,13 +17,13 @@ config.font = wezterm.font_with_fallback({
 config.font_size = 14
 
 config.window_padding = {
-  left = 0,
-  right = 0,
-  top = 0,
-  bottom = 0,
+    left = 0,
+    right = 0,
+    top = 0,
+    bottom = 0,
 }
 
-config.default_prog = { "/opt/homebrew/bin/tmux", "new-session", "-A", "-s", "main"}
+config.default_prog = { "/opt/homebrew/bin/tmux", "new-session", "-A", "-s", "main" }
 
 config.scrollback_lines = 0
 
@@ -36,6 +36,16 @@ config.keys = {
             wezterm.action.SendKey { key = "c" }
         }
     },
+
+    {
+        key = "T",
+        mods = "CMD",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "c", mods = "CTRL" },
+        }
+    },
+
 
     {
         key = "w",
@@ -53,15 +63,16 @@ config.keys = {
             wezterm.action.SendKey { key = "s", mods = "CTRL" },
             wezterm.action.SendKey { key = "l", mods = "CTRL" },
         }
-    }
+    },
+
 }
 
-for i=1,9 do
+for i = 1, 9 do
     table.insert(config.keys, {
         key = tostring(i),
         mods = "CMD",
         action = wezterm.action.Multiple {
-            wezterm.action.SendKey{ key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
             wezterm.action.SendKey { key = tostring(i) }
         }
     })
