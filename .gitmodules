@@ -28,3 +28,6 @@
 [submodule ".config/tmux/plugins/vim-tmux-navigator"]
 	path = .config/tmux/plugins/vim-tmux-navigator
 	url = https://git::@github.com/christoomey/vim-tmux-navigator
+[submodule ".tmux/plugins/tpm"]
+	path = .tmux/plugins/tpm
+	url = https://github.com/tmux-plugins/tpm

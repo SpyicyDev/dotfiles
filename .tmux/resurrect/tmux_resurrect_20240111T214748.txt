@@ -1,0 +1,21 @@
+pane	chem	1	0	:-	1	fff: /Users/mackhaymond/tex	:/Users/mackhaymond/Desktop/tex/indicator_lab	1	zsh	:
+pane	chem	2	1	:*	1	Macks-MacBook-Air.local	:/Users/mackhaymond/Desktop/tex/ksp_lab	1	zsh	:
+pane	csp	1	1	:*	1	nvim	:/Users/mackhaymond/Desktop/coding/projects/apcsp/create_task	1	nvim	:nvim
+pane	htmx	1	1	:*	1	Macks-Air.lan	:/Users/mackhaymond/Desktop/coding/projects/todo-app-v2	1	zsh	:
+pane	julia	1	0	:-	1	Julia	:/Users/mackhaymond/Desktop/coding/projects/JuliaTest	1	zsh	:
+pane	julia	2	1	:*	1	Julia	:/Users/mackhaymond	1	zsh	:
+pane	lisp	1	0	:-	1	Macks-MacBook-Air.local	:/Users/mackhaymond/.config/nvim	1	zsh	:
+pane	lisp	2	1	:*	1	Macks-MacBook-Air.local	:/Users/mackhaymond/.roswell/local-projects/test	1	nvim	:nvim
+pane	main	1	1	:*	1	mackhaymond@Macks-MacBook-Air:~	:/Users/mackhaymond	1	zsh	:
+pane	ocaml	1	1	:*	1	Macks-Air.lan	:/Users/mackhaymond/Desktop/coding/projects/ocaml_test	1	zsh	:
+window	chem	1	:zsh	0	:-	ae5e,80x23,0,0,1	:
+window	chem	2	:zsh	1	:*	ae5f,80x23,0,0,2	:
+window	csp	1	:nvim	1	:*	e674,169x47,0,0,63	:
+window	htmx	1	:zsh	1	:*	d041,178x48,0,0,4	:
+window	julia	1	:zsh	0	:-	d042,178x48,0,0,5	:
+window	julia	2	:zsh	1	:*	d043,178x48,0,0,6	:
+window	lisp	1	:zsh	0	:-	d044,178x48,0,0,7	:
+window	lisp	2	:nvim	1	:*	d045,178x48,0,0,8	:
+window	main	1	:zsh	1	:*	b36d,169x47,0,0,106	:
+window	ocaml	1	:zsh	1	:*	6850,178x48,0,0,11	:
+state	main	csp
