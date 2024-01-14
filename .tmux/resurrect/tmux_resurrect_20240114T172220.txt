@@ -1,0 +1,5 @@
+pane	main	1	0	:-	1	nvim	:/Users/mackhaymond/.config/tmux	1	nvim	:nvim
+pane	main	2	1	:*	1	nvim	:/Users/mackhaymond/.config/nvim	1	nvim	:nvim
+window	main	1	:nvim	0	:-	cc7f,169x47,0,0,2	:
+window	main	2	:nvim	1	:*	cc80,169x47,0,0,3	:
+state	main	

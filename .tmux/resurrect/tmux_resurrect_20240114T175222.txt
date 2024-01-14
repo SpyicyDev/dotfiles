@@ -1,0 +1,3 @@
+pane	main	1	1	:*	1	mackhaymond@Macks-MacBook-Air:~	:/Users/mackhaymond	1	zsh	:
+window	main	1	:zsh	1	:*	cc83,169x47,0,0,6	:
+state	main	
