@@ -21,6 +21,8 @@ require("lazy").setup("plugins", {
     },
 })
 
+vim.loader.enable()
+
 -- set colorscheme
 vim.cmd.colorscheme "catppuccin-mocha"
 

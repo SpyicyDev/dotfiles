@@ -102,7 +102,6 @@ cmp.setup({
         { name = 'nvim_lsp' },
         { name = 'nvim_lua' },
         { name = 'conjure' },
-        { name = 'nvlime' },
         { name = 'buffer',  keyword_length = 3 },
         { name = 'luasnip', keyword_length = 2 },
     }),
@@ -111,8 +110,8 @@ cmp.setup({
         fields = { 'abbr', 'kind', 'menu' },
         format = require('lspkind').cmp_format({
             menu = {
-                nvim_lsp = "[LSP]",
-                conjure = "[Conjure]",
+                --        nvim_lsp = "[LSP]",
+                --       conjure = "[Conjure]",
             },
             mode = 'symbol_text',
             maxwidth = 50,         -- prevent the popup from showing more than provided characters

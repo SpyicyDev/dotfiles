@@ -13,4 +13,12 @@ return {
         "zbirenbaum/copilot-cmp",
         opts = {},
     },
+
+    {
+        "gptlang/CopilotChat.nvim",
+    },
+
+    {
+        'AndreM222/copilot-lualine',
+    }
 }
