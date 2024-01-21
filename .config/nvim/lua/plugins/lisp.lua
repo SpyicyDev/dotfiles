@@ -2,6 +2,7 @@ return {
     {
         "Olical/conjure",
         -- [Optional] cmp-conjure for cmp
+        ft = { "fennel", "lua" },
         dependencies = {
             {
                 "PaterJason/cmp-conjure",

@@ -41,9 +41,6 @@ lsp_capabilities.textDocument.foldingRange = {
 }
 
 local on_attach = function(client, bufnr)
-    if client.server_capabilities["documentSymbolProvider"] then
-        require("nvim-navic").attach(client, bufnr)
-    end
 end
 
 local default_setup = function(server)

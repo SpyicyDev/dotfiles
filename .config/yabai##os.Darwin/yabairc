@@ -1,3 +1,4 @@
+#vim:ft=bash
 yabai -m signal --add event=dock_did_restart action="sudo yabai --load-sa"
 sudo yabai --load-sa
 
@@ -9,7 +10,7 @@ yabai -m config --space 3 layout float
 yabai -m config window_shadow off
 
 
-yabai -m config mouse_follows_focus on
+# yabai -m config mouse_follows_focus on
 yabai -m mouse_drop_action swap
 
 yabai -m rule --add app="^System Settings$" manage=off
@@ -35,4 +36,3 @@ yabai -m rule --add app="^DevPod$" manage=off
 yabai -m rule --add app="^Setapp$" manage=off 
 yabai -m rule --add app="^Permute$" manage=off 
 yabai -m rule --add app="^Obsidian$" space=5 
-

@@ -40,5 +40,8 @@ return {
     },
 
     -- better code actions window
-    "aznhe21/actions-preview.nvim",
+    {
+        "aznhe21/actions-preview.nvim",
+        event = "LspAttach"
+    },
 }

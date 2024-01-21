@@ -9,17 +9,18 @@ end
 config.color_scheme = "catppuccin-mocha"
 
 config.enable_tab_bar = false
+config.window_decorations = "RESIZE"
 
 config.font = wezterm.font_with_fallback({
     "JetBrainsMono Nerd Font",
     "MesloLGS NF",
 })
-config.font_size = 14
+config.font_size = 15
 
 config.window_padding = {
     left = 0,
     right = 0,
-    top = 0,
+    top = 80,
     bottom = 0,
 }
 
