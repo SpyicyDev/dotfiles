@@ -141,6 +141,20 @@ set_summary() {
 CACHE="$HOME/.cache/agent-tab/titles.tsv"
 NEG_TTL=600
 
+# Condenser model. copilot's --model whitelist tracks the CLI version and the
+# account's entitlements, and an id that vanishes fails EVERY condense: CLI
+# 1.0.75 rejected claude-haiku-4.5 (and every other explicit id) with
+# `Model "…" is not available`, so tabs silently kept their raw interim titles
+# and the cache filled with negative entries — a broken renamer that looks
+# exactly like a slow one. The pin is therefore best-effort: on rejection the
+# condenser falls back to copilot's default model and drops MODEL_SKIP so
+# later runs skip the doomed call, re-probing the pin once the marker ages out
+# (models come back). Override the pin with AGENT_TAB_CONDENSE_MODEL; set it
+# empty to always use copilot's default.
+CONDENSE_MODEL="${AGENT_TAB_CONDENSE_MODEL-claude-haiku-4.5}"
+MODEL_SKIP="${TMPDIR:-/tmp}/agent-tab-model-unavailable.${UID:-$(id -u)}"
+MODEL_SKIP_TTL=86400
+
 now_epoch() { date +%s 2>/dev/null || echo 0; }
 
 title_key() {
@@ -303,7 +317,10 @@ if [ "$mode" = "condense" ]; then
     key=$(title_key "$raw")
     lock="${TMPDIR:-/tmp}/agent-tab-condense.$key.lock"
     mkdir "$lock" 2>/dev/null || exit 0   # another condenser owns this title
-    trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+    # copilot's stderr is kept (not /dev/null'd) so a failure can be told
+    # apart from a rejected --model, which is recoverable.
+    ERRF="$lock/err"
+    trap 'rm -f "$ERRF" 2>/dev/null; rmdir "$lock" 2>/dev/null' EXIT INT TERM
 
     short=$(cached_short "$raw")
     if [ -z "$short" ]; then
@@ -313,18 +330,44 @@ if [ "$mode" = "condense" ]; then
 
         # gtimeout is coreutils' name when /usr/bin/timeout is absent (macOS).
         TO=$(command -v timeout || command -v gtimeout || true)
-        # Copilot prints the answer on stdout, stats on stderr; a pure text
-        # prompt grants no tool permissions. Capture the exit code explicitly
-        # — `|| true` would mask a failed call whose stdout is an error string.
-        if out=$(${TO:+"$TO" 90} copilot -p \
-            "From the coding-session title or first message below, output a 2-4 word tab label built from the MOST SPECIFIC, distinctive words in it: the concrete subject, target, feature, file, tech, or action unique to THIS task. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, deep, inspection, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Someone reading the label should be able to guess the task back. Prefer the unusual identifying word over the category word. Output ONLY the label - no punctuation, quotes, or explanation.
+        PROMPT="From the coding-session title or first message below, output a 2-4 word tab label built from the MOST SPECIFIC, distinctive words in it: the concrete subject, target, feature, file, tech, or action unique to THIS task. Keep proper nouns and real names. DROP generic filler (project, code, app, task, session, various, deep, inspection, thing, stuff, update, changes, improve, and a bare fix/add/refactor when what it acts on is unnamed). Someone reading the label should be able to guess the task back. Prefer the unusual identifying word over the category word. Output ONLY the label - no punctuation, quotes, or explanation.
 
 Examples:
 - 'deep inspection of this project docs, I wanna open source it, make sure nothing reads like AI or oddly specific to me' => Open-source doc cleanup
 - 'refactor the auth middleware to use JWTs instead of session cookies' => JWT auth refactor
 - 'figure out why the websocket reconnect drops messages under load' => Websocket reconnect bug
 
-Title: $raw" --model claude-haiku-4.5 --no-color </dev/null 2>/dev/null); then
+Title: $raw"
+        # Copilot prints the answer on stdout, stats on stderr; a pure text
+        # prompt grants no tool permissions. Capture the exit code explicitly
+        # — `|| true` would mask a failed call whose stdout is an error string.
+        # Empty $1 = no --model flag, i.e. whatever copilot picks by default.
+        copilot_condense() {
+            ${TO:+"$TO" 90} copilot -p "$PROMPT" ${1:+--model "$1"} \
+                --no-color </dev/null 2>"$ERRF"
+        }
+
+        model="$CONDENSE_MODEL"
+        # A standing rejection marker means the pin was refused recently —
+        # go straight to the default instead of burning a doomed call.
+        if [ -n "$model" ] && [ -f "$MODEL_SKIP" ]; then
+            mts=$(stat -f %m "$MODEL_SKIP" 2>/dev/null || echo 0)
+            [ "$(( $(now_epoch) - mts ))" -lt "$MODEL_SKIP_TTL" ] && model=""
+        fi
+
+        ok=0
+        if out=$(copilot_condense "$model"); then
+            ok=1
+        elif [ -n "$model" ] && grep -qiE 'not available|unknown model|invalid model' "$ERRF" 2>/dev/null; then
+            # The pin is gone from this CLI/account. Remember it (so the next
+            # condense skips straight to the default) and retry right now on
+            # the default model — a renamed model must not cost a whole
+            # session of raw tab titles.
+            : > "$MODEL_SKIP" 2>/dev/null || true
+            out=$(copilot_condense "") && ok=1
+        fi
+
+        if [ "$ok" = 1 ]; then
             short=$(printf '%s' "$out" | grep -m1 . | sanitize_summary | cut -d' ' -f1-4)
             short=$(fit_words "$short" 24)
             valid_short "$short" || short=""

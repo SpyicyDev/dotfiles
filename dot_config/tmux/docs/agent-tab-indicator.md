@@ -75,15 +75,27 @@ prompt; Codex — `thread_name` from `~/.codex/session_index.jsonl` keyed by
 
 **Tab name format**: `project/short-title`. Project is the basename of the
 hook's `cwd` (`~` for `$HOME`). The raw title is condensed to its 2–4 most
-identifying words by a detached `copilot -p … --model claude-haiku-4.5`
-call (answer on stdout, stats footer on stderr; a plain text prompt grants
-no tool permissions) and cached in `~/.cache/agent-tab/titles.tsv` keyed by
-title hash. The model's output is **validated** before caching (1–4 words,
-no colon/sentence punctuation, not an apology/refusal/auth-error) so error
-strings can't poison the cache; a failed/rejected condense writes a negative
-row that backs off retries for `NEG_TTL` (600 s) instead of re-calling every
-turn. Until the condensation lands (or if `copilot` fails), the tab shows
-`project/<raw title>` (word-trimmed to 24 cells) as an interim.
+identifying words by a detached `copilot -p …` call (answer on stdout, stats
+footer on stderr; a plain text prompt grants no tool permissions) and cached
+in `~/.cache/agent-tab/titles.tsv` keyed by title hash. The model's output is
+**validated** before caching (1–4 words, no colon/sentence punctuation, not an
+apology/refusal/auth-error) so error strings can't poison the cache; a
+failed/rejected condense writes a negative row that backs off retries for
+`NEG_TTL` (600 s) instead of re-calling every turn. Until the condensation
+lands (or if `copilot` fails), the tab shows `project/<raw title>`
+(word-trimmed to 24 cells) as an interim.
+
+**Model pin is best-effort.** `--model` is set from `CONDENSE_MODEL`
+(default `claude-haiku-4.5`, override with `$AGENT_TAB_CONDENSE_MODEL`, empty
+= always copilot's default). copilot's whitelist tracks the CLI version and
+the account's entitlements, and a pin that disappears fails *every* condense —
+CLI 1.0.75 rejected `claude-haiku-4.5` with `Model "…" is not available`, so
+tabs sat on their raw interim titles and the cache filled with negatives. That
+reads as "the renamer is slow" when it is actually dead, so the failure is now
+recoverable: on a rejection the condenser retries immediately on copilot's
+default model and touches `$TMPDIR/agent-tab-model-unavailable.$UID`, which
+makes later runs skip the doomed call for 24 h (`MODEL_SKIP_TTL`) before
+re-probing the pin.
 
 ### 2. `scripts/agent-tab-watcher.sh` (presence daemon)
 
@@ -186,6 +198,16 @@ so stale summaries simply vanish.
   `~/.codex/hooks.json.bak-agent-tab`.)
 - **No summary on a fresh Claude session** → no `ai-title` yet; the first
   prompt is used as fallback, the real title appears on later events.
+- **Tabs keep the long raw title (renamer never shortens them)** → the
+  condense is failing, not lagging. Check for negative rows piling up:
+  `awk -F'\t' '$2==""' ~/.cache/agent-tab/titles.tsv | tail`. Then run one by
+  hand — it prints copilot's own error:
+  `bash ~/.config/tmux/scripts/agent-tab-indicator.sh condense @1 proj "some test title"`
+  and `copilot -p hi --model "$AGENT_TAB_CONDENSE_MODEL"`. A dead pin
+  self-heals onto the default model (see *Model pin* above); `rm
+  $TMPDIR/agent-tab-model-unavailable.$UID` forces an immediate re-probe.
+  Purge stale negatives with
+  `awk -F'\t' '$2!=""' titles.tsv > t && mv t titles.tsv`.
 - **Wrong/garbled tab title stuck** → a bad condense may be cached. Clear it
   with `rm ~/.cache/agent-tab/titles.tsv` (rebuilds on the next agent event);
   a single bad title backs off for 600 s on its own (`NEG_TTL`).
