@@ -47,8 +47,8 @@ case "$app" in
   "Notion Calendar")   home=calendar ;;
   Messages)            home=messages ;;
   ChatGPT|Claude)      home=ai ;;
-  Codex)               home=codex ;;
 esac
+yabai_is_agent_app "$app" && home="$YABAI_AGENT_LABEL"
 cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)
 [ -n "$home" ] && [ "$cur_label" = "$home" ] && exit 0
 if [ "$app" = "Arc" ]; then

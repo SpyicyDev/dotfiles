@@ -102,7 +102,11 @@ yabai -m rule --add app="^Notion Calendar$" space=calendar
 yabai -m rule --add app="^Messages$" space=messages
 yabai -m rule --add app="^ChatGPT$" space=ai
 yabai -m rule --add app="^Claude$" space=ai
-yabai -m rule --add app="^Codex$" space=codex
+# `agent` (hyper+esc) is the generic coding-agent view -- NOT one pinned app. Its
+# app set lives in yabai_common.sh (YABAI_AGENT_APPS) and is sourced here so this
+# rule can never drift from the pinned-home guards in the yabai_* scripts.
+. "${HOME}/code/various_scripts/yabai_common.sh"
+yabai -m rule --add app="$YABAI_AGENT_APPS_RE" space=agent
 
 # Re-apply rules to currently-open windows on yabai (re)start.
 # Catches windows whose creation events were missed (login race, crash-restart).

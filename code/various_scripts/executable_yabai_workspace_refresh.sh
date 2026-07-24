@@ -188,7 +188,7 @@ label_missing_workspace_labels() {
   label_space_if_missing 7 calendar
   label_space_if_missing 8 messages
   label_space_if_missing 9 ai
-  label_space_if_missing 10 codex
+  label_space_if_missing 10 agent
 }
 
 label_missing_workspace_labels
@@ -208,7 +208,9 @@ assign_label_to_pinned_app_space messages '^Messages$'
 # ChatGPT and Claude share the `ai` home space; whichever is running labels it.
 assign_label_to_pinned_app_space ai '^ChatGPT$'
 assign_label_to_pinned_app_space ai '^Claude$'
-assign_label_to_pinned_app_space codex '^Codex$'
+# The coding-agent apps share the `agent` home space; whichever is running labels
+# it (one regex over the whole set -- see YABAI_AGENT_APPS in yabai_common.sh).
+assign_label_to_pinned_app_space agent "$YABAI_AGENT_APPS_RE"
 
 label_missing_workspace_labels
 

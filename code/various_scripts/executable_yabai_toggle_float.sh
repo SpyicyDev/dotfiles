@@ -21,6 +21,9 @@ set -u
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
+# shellcheck source=/dev/null  # required sibling: the agent app list + helper
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+
 info=$(yabai -m query --windows --window 2>/dev/null) || exit 0
 app=$(printf '%s' "$info" | jq -r '.app // ""' 2>/dev/null)
 cur=$(printf '%s' "$info" | jq -r '.space // empty' 2>/dev/null)
@@ -39,8 +42,8 @@ case "$app" in
   "Notion Calendar")   home=calendar ;;
   Messages)            home=messages ;;
   ChatGPT|Claude)      home=ai ;;
-  Codex)               home=codex ;;
 esac
+yabai_is_agent_app "$app" && home="$YABAI_AGENT_LABEL"
 
 if [ -n "$home" ]; then
   cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)

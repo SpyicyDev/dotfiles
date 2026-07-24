@@ -19,7 +19,36 @@
 # Canonical labeled spaces, in stable display order. The single source of this list.
 # (Consumed by the sourcing scripts' `for label in $YABAI_LABELS` loops.)
 # shellcheck disable=SC2034
-YABAI_LABELS="terminal main school todo schedule mail calendar messages ai codex"
+YABAI_LABELS="terminal main school todo schedule mail calendar messages ai agent"
+
+# --- agent: the generic coding-agent view (hyper+esc) ---------------------------
+# `agent` is a normal labeled space, but it is NOT pinned to one app: any coding-
+# agent GUI homes there, whichever of them happens to be running (Conductor is the
+# primary). It replaced the old single-app `codex` space when Codex.app went away.
+#
+# This list is the SINGLE source of the app set. It is consumed by:
+#   - yabairc            (the `space=agent` rule, via YABAI_AGENT_APPS_RE)
+#   - yabai_workspace_refresh.sh   (labeling the space by whoever is running)
+#   - yabai_send_window{,_external}.sh / yabai_toggle_float.sh  (pinned-home guard)
+#   - yabai_startup_reconcile.sh   (the login-race home map)
+# Add an app HERE and every consumer picks it up. Names are yabai's `.app` field
+# (the app's display name), `|`-separated.
+YABAI_AGENT_LABEL="agent"
+YABAI_AGENT_APPS="Conductor|Claudia|OpenChamber|OpenCode|Jean|T3 Code (Alpha)"
+
+# The same list as a yabai `rule --add app=` regex: anchored, with the literal
+# parens of names like "T3 Code (Alpha)" escaped so they aren't read as a group.
+# shellcheck disable=SC2034
+YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$"
+
+# True if $1 is one of the coding-agent apps. Substring match on a `|`-delimited
+# list (no eval, no regex) so app names with spaces/parens need no quoting care.
+yabai_is_agent_app() {
+  case "|$YABAI_AGENT_APPS|" in
+    *"|$1|"*) return 0 ;;
+  esac
+  return 1
+}
 
 # Resolve the master (laptop) display index from a displays-JSON blob passed as $1
 # (or from a live `yabai -m query --displays` if $1 is empty/omitted): UUID match

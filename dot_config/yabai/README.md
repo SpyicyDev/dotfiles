@@ -8,7 +8,7 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 
 **Core Mental Model:**
 
-- **Master display (laptop)**: Always present, hosts all 10 canonical labeled workspaces (terminal, main, school, todo, schedule, mail, calendar, messages, ai, codex). Stable reference point.
+- **Master display (laptop)**: Always present, hosts all 10 canonical labeled workspaces (terminal, main, school, todo, schedule, mail, calendar, messages, ai, agent). Stable reference point.
 - **External display**: Optional. Comes up empty-and-ready when docked; user manually pushes workspaces there (or pulls them back home). Automatically healed on undock.
 - **Labeled spaces, not indexed**: Spaces are identified by stable **labels** (not fragile array indices), because macOS renumbers indices whenever Mission Control is touched or displays change. All bindings, rules, and scripts use labels as the canonical reference.
 - **Stack layout**: Only one window visible at a time per space; other windows are hidden in a z-order stack. Navigate with `hyper+z` (next) / `hyper+x` (prev).
@@ -102,7 +102,19 @@ These apps automatically appear on their designated space when launched:
 | Messages | messages |
 | ChatGPT | ai |
 | Claude | ai |
-| Codex | codex |
+| Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha) | agent |
+
+**`agent` (hyper+esc) — the generic coding-agent view.** Unlike every other label,
+`agent` is not one app's home: it is a *view* that whichever coding-agent GUI is
+running lands on (Conductor is the primary). The app set is defined ONCE, as
+`YABAI_AGENT_APPS` in `yabai_common.sh`, and is consumed by the `space=agent`
+rule (which sources it), the refresh script's label assignment, the pinned-home
+guards in `yabai_send_window{,_external}.sh` / `yabai_toggle_float.sh`, and the
+startup reconciler's home map — **add an app there and nowhere else.** Because the
+space can legitimately be empty, `f18` (focus `agent`) is the one *conditional*
+focus bind: with no windows on the space it does nothing rather than dumping you on
+an empty desktop. It replaced the old single-app `codex` space, which went stale
+when Codex.app was uninstalled.
 
 **Arc (browser):** *not* a yabai rule (the two main windows go to two different
 spaces, and Little Arc is indistinguishable to yabai). The two main Arc windows
@@ -189,7 +201,7 @@ Move focus to a labeled space without moving it. Focus stays on the current disp
 | `hyper - e` | E | `yabai_workspace.sh focus calendar` | calendar |
 | `hyper - d` | D | `yabai_workspace.sh focus messages` | messages |
 | `hyper - f` | F | `yabai_workspace.sh focus ai` | ai |
-| `f18` | Caps+Esc | `yabai_workspace.sh focus codex` | codex |
+| `f18` | Caps+Esc | `yabai_workspace.sh focus agent` | agent (no-op when empty) |
 
 #### Send Window to Workspace (Hyper+Fn Layer)
 
@@ -206,7 +218,7 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 | `hyper + fn - e` | Fn+E | `yabai_send_window.sh calendar` | calendar |
 | `hyper + fn - d` | Fn+D | `yabai_send_window.sh messages` | messages |
 | `hyper + fn - f` | Fn+F | `yabai_send_window.sh ai` | ai |
-| `f19` | Fn+Caps+Esc | `yabai_send_window.sh codex` | codex |
+| `f19` | Fn+Caps+Esc | `yabai_send_window.sh agent` | agent |
 
 **Pinned Apps (cannot be sent off their home spaces):**
 - wezterm → terminal
@@ -217,7 +229,7 @@ Move the focused window to a target space and **follow focus to it** (unless pin
 - Messages → messages
 - ChatGPT → ai
 - Claude → ai
-- Codex → codex
+- Conductor, Claudia, OpenChamber, OpenCode, Jean, T3 Code (Alpha) → agent
 - Arc → protected on `main`/`school` (any Arc window on either is shielded; rare Little-Arc-on-home included)
 
 #### External Scratch-Work Space (`ext`)
@@ -311,10 +323,10 @@ This single remapping enables nearly every downstream binding.
 |------|----|----|---------|
 | F1 + hyper | F13 | `f13 : yabai_display.sh master` | Focus master (laptop) display |
 | F2 + hyper | F14 | `f14 : yabai_display.sh external` | Focus external display |
-| Escape + hyper (no fn) | F18 | `f18 : yabai_workspace.sh focus codex` | Focus codex workspace |
-| Escape + hyper + fn | F19 | `f19 : yabai_send_window.sh codex` | Send window to codex workspace |
-| Caps_Lock + Escape (simultaneous) | F18 | `f18 : yabai_workspace.sh focus codex` | Alt ergonomic path to focus codex |
-| Fn + Caps_Lock + Escape (simultaneous) | F19 | `f19 : yabai_send_window.sh codex` | Alt ergonomic path to send to codex |
+| Escape + hyper (no fn) | F18 | `f18 : yabai_workspace.sh focus agent` | Focus agent workspace |
+| Escape + hyper + fn | F19 | `f19 : yabai_send_window.sh agent` | Send window to agent workspace |
+| Caps_Lock + Escape (simultaneous) | F18 | `f18 : yabai_workspace.sh focus agent` | Alt ergonomic path to focus agent |
+| Fn + Caps_Lock + Escape (simultaneous) | F19 | `f19 : yabai_send_window.sh agent` | Alt ergonomic path to send to agent |
 
 #### System FN Row Preservation
 
@@ -504,7 +516,7 @@ It does **not** bounce other apps off the terminal space. (Earlier this enforced
 
 #### Canonical Space Ordering
 
-The 10 spaces are always maintained in the order: terminal, main, school, todo, schedule, mail, calendar, messages, ai, codex.
+The 10 spaces are always maintained in the order: terminal, main, school, todo, schedule, mail, calendar, messages, ai, agent.
 
 **Responsibility:** `yabai_reorder_spaces.sh` (called at the end of `yabai_workspace_refresh.sh` and after `yabai_space_move.sh` operations).
 
@@ -555,7 +567,7 @@ Other login-time dependencies: **Karabiner** (caps_lock→hyper, the F13/F14/F18
 # From anywhere, press hyper+<key> for the workspace
 hyper - 1              # Focus "main" workspace
 hyper - 0x32 (`)       # Focus "terminal" workspace
-f18                    # Focus "codex" workspace
+f18                    # Focus "agent" workspace (no-op if the space is empty)
 ```
 
 **What happens:**
@@ -576,7 +588,7 @@ f18                    # Focus "codex" workspace
 # From anywhere, press hyper+fn+<key> for the destination
 hyper + fn - 1         # Send focused window to "main" and follow
 hyper + fn - 0x32 (`)  # Send to "terminal" (if not pinned) and follow
-f19                    # Send to "codex" and follow
+f19                    # Send to "agent" and follow
 ```
 
 **What happens:**
@@ -809,7 +821,7 @@ git push origin main
 | `hyper - e` | E | Focus calendar | |
 | `hyper - d` | D | Focus messages | |
 | `hyper - f` | F | Focus ai | |
-| `f18` | Caps Lock+Escape | Focus codex | Karabiner-mapped |
+| `f18` | Caps Lock+Escape | Focus agent | Karabiner-mapped; no-op when no agent app is open |
 | **Send Window to Workspace** |
 | `hyper + fn - 0x32` | Fn+Backtick | Send to terminal | Respects pinned homes |
 | `hyper + fn - 1` | Fn+1 | Send to main | Respects pinned homes |
@@ -820,7 +832,7 @@ git push origin main
 | `hyper + fn - e` | Fn+E | Send to calendar | Respects pinned homes |
 | `hyper + fn - d` | Fn+D | Send to messages | Respects pinned homes |
 | `hyper + fn - f` | Fn+F | Send to ai | Respects pinned homes |
-| `f19` | Fn+Caps Lock+Escape | Send to codex | Karabiner-mapped |
+| `f19` | Fn+Caps Lock+Escape | Send to agent | Karabiner-mapped |
 | `hyper + fn - g` | Fn+G | Fling window to external `ext` space | On-demand; stacks; dissolves to main on hyper+0 / push / undock |
 | `hyper - g` | G | Focus external `ext` space | No-op if `ext` doesn't exist |
 | **Window Layout & Navigation** |

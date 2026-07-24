@@ -41,11 +41,25 @@ query_space_index() {
     head -n 1
 }
 
+# Window ids on space index $1 (empty output = the space is empty).
+space_window_ids() {
+  yabai -m query --windows --space "$1" 2>/dev/null |
+    jq -r '.[].id' 2>/dev/null
+}
+
 focus_space() {
   local space_index
 
   space_index=$(query_space_index "$LABEL")
   [ -z "$space_index" ] && return 0
+
+  # `agent` (hyper+esc) is CONDITIONAL: it is a generic coding-agent view rather
+  # than a fixed app's home, so with nothing on it -- no Conductor et al. running,
+  # nothing flung there with hyper+fn+esc -- the key is a no-op instead of a trip
+  # to an empty space. Every other label focuses unconditionally, as before.
+  if [ "$LABEL" = "${YABAI_AGENT_LABEL:-agent}" ] && [ -z "$(space_window_ids "$space_index")" ]; then
+    return 0
+  fi
 
   yabai -m space --focus "$space_index" >/dev/null 2>&1 || true
 }

@@ -16,6 +16,9 @@ export USER="${USER:-$(id -un)}"
 TARGET="${1:-}"
 [ -z "$TARGET" ] && exit 64
 
+# shellcheck source=/dev/null  # required sibling: the agent app list + helper
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+
 info=$(yabai -m query --windows --window 2>/dev/null) || exit 0
 app=$(printf '%s' "$info" | jq -r '.app // ""' 2>/dev/null)
 cur=$(printf '%s' "$info" | jq -r '.space // empty' 2>/dev/null)
@@ -35,8 +38,10 @@ case "$app" in
   "Notion Calendar")   home=calendar ;;
   Messages)            home=messages ;;
   ChatGPT|Claude)      home=ai ;;
-  Codex)               home=codex ;;
 esac
+# The coding-agent apps (Conductor et al.) all home to `agent` -- one list, in
+# yabai_common.sh, rather than a case arm per app.
+yabai_is_agent_app "$app" && home="$YABAI_AGENT_LABEL"
 
 if [ -n "$home" ]; then
   cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)

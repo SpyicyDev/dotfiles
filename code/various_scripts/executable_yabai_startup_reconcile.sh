@@ -7,8 +7,8 @@
 # launched event, and yabairc's one-shot `rule --apply` can run BEFORE those windows
 # exist -- or before `sudo yabai --load-sa` finishes (window->space moves need the
 # scripting addition). Result: pinned apps (WezTerm, Todoist, Granola, Spark Mail,
-# Notion Calendar, Messages, ChatGPT, Codex; Arc via Hammerspoon) sit on the wrong
-# space until a manual `yabai --restart-service`.
+# Notion Calendar, Messages, ChatGPT, the coding-agent apps; Arc via Hammerspoon)
+# sit on the wrong space until a manual `yabai --restart-service`.
 #
 # This POLLS UNTIL STABLE: re-load the scripting addition once, then repeatedly
 # re-apply the space= rules + re-pin Arc until every RUNNING pinned app is on its
@@ -28,6 +28,9 @@ export USER="${USER:-$(id -un)}"
 HS="/opt/homebrew/bin/hs"
 
 CAP_SECONDS="${YABAI_RECONCILE_CAP:-90}"   # hard stop so a never-launching app can't poll forever
+
+# shellcheck source=/dev/null  # required sibling: the agent app list (YABAI_AGENT_*)
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
 LOCK="${TMPDIR:-/tmp}/yabai_startup_reconcile.lock"
 
 # Single-flight (mirrors yabai_heal.sh): one reconcile at a time. A concurrent
@@ -53,11 +56,13 @@ pins_settled() {
   local win spaces off
   win=$(yabai -m query --windows 2>/dev/null) || return 1
   spaces=$(yabai -m query --spaces 2>/dev/null) || return 1
-  off=$(jq -n --argjson w "$win" --argjson s "$spaces" '
+  off=$(jq -n --argjson w "$win" --argjson s "$spaces" \
+             --arg agents "$YABAI_AGENT_APPS" --arg agentlabel "$YABAI_AGENT_LABEL" '
     ($s | map({ (.index|tostring): (.label // "") }) | add) as $lbl
-    | { "wezterm-gui":"terminal", "WezTerm":"terminal", "Todoist":"todo",
+    | ($agents | split("|") | map({ (.): $agentlabel }) | add) as $agent_home
+    | ({ "wezterm-gui":"terminal", "WezTerm":"terminal", "Todoist":"todo",
         "Granola":"schedule", "Spark Mail":"mail", "Notion Calendar":"calendar",
-        "Messages":"messages", "ChatGPT":"ai", "Claude":"ai", "Codex":"codex" } as $home
+        "Messages":"messages", "ChatGPT":"ai", "Claude":"ai" } + $agent_home) as $home
     | [ $w[]
         | select($home[.app] != null)
         | { want: $home[.app], have: ($lbl[(.space|tostring)] // "") }
