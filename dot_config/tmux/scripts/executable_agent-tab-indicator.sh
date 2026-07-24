@@ -62,6 +62,28 @@ agent="${2:-}"
 
 JQ="$(command -v jq || true)"
 
+# Watchdog for the companion daemon. agent-tab-watcher.sh is spawned exactly
+# once, from tmux.conf, so if it ever dies mid-session (stray pkill, OOM, a
+# tmux hiccup) everything it drives silently stops — no blink (the glyph
+# freezes on the @agent_blink=unset color), no workflow gear, no presence
+# seeding, no GC — until the next `prefix r`, and nothing surfaces the failure.
+# Hooks fire constantly, so re-assert it here: in the healthy case this is a
+# file test plus a kill -0, no forks. Respawn goes through the tmux server so
+# the daemon outlives this short-lived hook process. PIDFILE path must match
+# the watcher's.
+ensure_watcher() {
+    local pidfile pid=""
+    pidfile="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.pid"
+    if [ -f "$pidfile" ]; then
+        read -r pid < "$pidfile" 2>/dev/null || pid=""
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    tmux run-shell -b "bash $HOME/.config/tmux/scripts/agent-tab-watcher.sh" 2>/dev/null || true
+}
+ensure_watcher
+
 # ---------------------------------------------------------------- helpers
 
 window_state() {

@@ -53,10 +53,29 @@ command -v tmux >/dev/null 2>&1 || exit 0
 # unconditional trap can delete a live sibling's pidfile, then the next reload
 # finds none and starts another). Reap any prior instance, then claim the
 # pidfile, and only clean it up on exit if it's still ours.
-PIDFILE="${TMPDIR:-/tmp}/agent-tab-watcher.$(id -u).pid"
+PIDFILE="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.pid"
 prev=$(cat "$PIDFILE" 2>/dev/null || true)
 if [ -n "$prev" ] && [ "$prev" != "$$" ] && kill -0 "$prev" 2>/dev/null; then
     kill "$prev" 2>/dev/null || true
+fi
+# Belt to the pidfile's braces: also sweep for stragglers whose pidfile we
+# can't see (a respawn under a different TMPDIR, a cleaned tmp dir). Two live
+# daemons would both toggle @agent_blink each second and the glyph would sit
+# on one color — the exact symptom this daemon exists to produce. One pgrep at
+# startup only; the loop below never forks for this.
+#
+# -fx (whole command line must match EXACTLY) is load-bearing: a substring
+# `pgrep -f agent-tab-watcher` also matches any shell, editor or grep whose
+# argv merely mentions this path, and we kill what we match. Missing a stray
+# spawned some other way is harmless (the pidfile still covers the normal
+# case); killing a bystander is not.
+SELF="$HOME/.config/tmux/scripts/agent-tab-watcher.sh"
+if command -v pgrep >/dev/null 2>&1; then
+    for stray in $(pgrep -fx "bash $SELF" 2>/dev/null; pgrep -fx "/bin/bash $SELF" 2>/dev/null; pgrep -fx "$SELF" 2>/dev/null); do
+        if [ "$stray" != "$$" ] && [ "$stray" != "$PPID" ]; then
+            kill "$stray" 2>/dev/null || true
+        fi
+    done
 fi
 echo $$ > "$PIDFILE"
 # Remove the pidfile on exit only if it's still ours. The signal traps must
@@ -108,9 +127,23 @@ session_has_running_workflow() {
     return 1
 }
 
+# A failed tmux command is NOT proof the server died — it can also be a
+# transient hiccup (server mid-reload, EINTR, fd pressure). Exiting on the
+# first one is how the daemon silently disappears after days of uptime, taking
+# the blink, the workflow gear and the state GC with it and leaving no trace.
+# Tolerate a short streak, and only quit once the server is confirmed gone.
+FAIL_LIMIT=5
+fail_streak=0
+server_gone() { ! tmux list-sessions >/dev/null 2>&1; }
+
 while :; do
-    # window_id<space>pane_tty for every pane; failure = server gone.
-    panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null) || exit 0
+    # window_id<space>pane_tty for every pane.
+    if ! panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null); then
+        fail_streak=$((fail_streak + 1))
+        { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
+        sleep "$POLL_SECONDS"
+        continue
+    fi
 
     # One ps for all TTYs: agent TTYs, plus tty=pid for claude panes (workflow
     # lookup needs the pid; codex panes are skipped — no workflows there).
@@ -129,7 +162,13 @@ $(ps -ax -o tty=,pid=,comm= 2>/dev/null)
 EOF
 
     # Current per-window state in one call (formats resolve window options).
-    states=$(tmux list-windows -a -F '#{window_id} #{@agent_state}' 2>/dev/null) || exit 0
+    if ! states=$(tmux list-windows -a -F '#{window_id} #{@agent_state}' 2>/dev/null); then
+        fail_streak=$((fail_streak + 1))
+        { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
+        sleep "$POLL_SECONDS"
+        continue
+    fi
+    fail_streak=0
 
     # Windows containing at least one agent pane, and the claude pid per window
     # (first agent pane wins) for workflow lookup.

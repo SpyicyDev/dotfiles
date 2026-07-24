@@ -90,10 +90,12 @@ turn. Until the condensation lands (or if `copilot` fails), the tab shows
 Singleton, spawned from tmux.conf, polls every 1 s (doubling as the
 running-glyph blink driver — it toggles the global `@agent_blink` option
 each tick while any window is running). The singleton guard is
-ownership-aware: each start reaps any prior instance and only clears the PID
-file if it still owns it, and signal traps route through `exit` so `kill`
-actually stops the daemon — every `prefix r` reload converges back to one
-watcher (the naive check-then-write version leaked a daemon per reload). It
+ownership-aware: each start reaps any prior instance (by PID file, plus a
+`pgrep` sweep for stragglers whose PID file was lost — two live daemons would
+both toggle `@agent_blink` per tick and cancel each other out) and only clears
+the PID file if it still owns it, and signal traps route through `exit` so
+`kill` actually stops the daemon — every `prefix r` reload converges back to
+one watcher (the naive check-then-write version leaked a daemon per reload). It
 matches agent processes to windows by TTY (`ps -o comm` basename
 `claude`/`codex`, plus the bare `N.N.N` pattern — Claude's binary is
 version-named and `#{pane_current_command}` reports that, so formats can't
@@ -109,6 +111,17 @@ Hook-set states are never overridden while the agent lives. Known
 limitation: a one-shot `claude -p` exits right after `Stop`, so its `done`
 tint is GC'd within ~1 s. Per-window state also means two agents in one
 window share a single state (last writer wins).
+
+**Liveness.** The daemon is the single point of failure for the blink, the
+workflow gear and the GC, and its death is silent — a frozen glyph color is
+the only tell (`@agent_blink` unset renders as the *second* color of each
+pair: peach for running, mauve for a workflow). Two guards: it no longer
+exits on the first failed tmux command (a transient failure is not a dead
+server — it tolerates a streak and quits only once `tmux list-sessions`
+confirms the server is gone), and `agent-tab-indicator.sh` re-asserts it on
+every hook invocation (PID-file + `kill -0`; respawn via `tmux run-shell -b`
+so it lands under the server, not under the hook process). So a death now
+self-heals at the next agent event instead of persisting until `prefix r`.
 
 **Background-workflow awareness** (Claude only — codex has no workflows): a
 backgrounded Workflow keeps running after the main turn's `Stop` fires, and
@@ -156,8 +169,14 @@ so stale summaries simply vanish.
 
 ## Troubleshooting
 
-- **Tab stuck in a state** → is the watcher alive? `cat ${TMPDIR:-/tmp}/agent-tab-watcher.$(id -u).pid`
-  and `kill -0 $(cat …)`. It respawns on tmux.conf reload (`prefix r`).
+- **Tab stuck in a state, or the glyph never blinks / the workflow gear never
+  appears** → the watcher is dead. All three symptoms have one cause; check
+  with `pgrep -lf agent-tab-watcher`. Any agent hook now respawns it
+  automatically (see *Liveness* above); to force it, `tmux run-shell -b "bash
+  ~/.config/tmux/scripts/agent-tab-watcher.sh"` or reload with `prefix r`.
+  Confirm it is driving the animation: `for i in 1 2 3 4; do tmux show -gv
+  @agent_blink; sleep 0.5; done` should print alternating pairs — sampling on a
+  whole-second boundary reads the same value twice and looks stuck.
 - **Codex tabs only ever show idle** → hook trust not granted; run `codex`
   and approve, or check `[hooks.state]` entries in `~/.codex/config.toml`.
   (Installing the entries reserialized `hooks.json` — whitespace/`\/`
