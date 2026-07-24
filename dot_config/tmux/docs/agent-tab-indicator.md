@@ -69,9 +69,13 @@ Subagent-context events (payload has `agent_id`) are ignored so a
 subagent's Stop can't flip the main agent's tab.
 
 **Summary sources** (best first): Claude — last `ai-title` entry in the
-transcript tail (`transcript_path` from the payload), else the submitted
-prompt; Codex — `thread_name` from `~/.codex/session_index.jsonl` keyed by
-`session_id`, else the prompt. Sanitized (no `#`/`"`/`%`, one line, ≤60 chars).
+transcript tail (`transcript_path` from the payload), else `session_title`,
+else the submitted prompt; Codex — `thread_name` from
+`~/.codex/session_index.jsonl` keyed by `session_id`, else the prompt.
+Sanitized (no `#`/`"`/`%`, one line, ≤60 chars). `extract_summary` tags its
+output `final\t<title>` (the agent's own conversation title) or
+`interim\t<title>` (the prompt, standing in until that title exists) — only
+`final` is worth a model call, see below.
 
 **Tab name format**: `project/short-title`. Project is the basename of the
 hook's `cwd` (`~` for `$HOME`). The raw title is condensed to its 2–4 most
@@ -84,6 +88,16 @@ failed/rejected condense writes a negative row that backs off retries for
 `NEG_TTL` (600 s) instead of re-calling every turn. Until the condensation
 lands (or if `copilot` fails), the tab shows `project/<raw title>`
 (word-trimmed to 24 cells) as an interim.
+
+**One condense per session.** Only a `final` title is condensed. The prompt
+fallback was condensed too, which cost a *second* call every session for one
+turn of prettier tab: the agent writes its real title during turn 1, and that
+title hashes to a different cache key, so the prompt's label was thrown away
+almost immediately — and it was distilled from the weaker source. So turn 1
+now shows `project/<prompt>` verbatim and the short label lands once the real
+title exists (typically that same turn's `Stop`). The cache read still happens
+for interim titles, so a repeated prompt — or one condensed by an older
+version — is reused for free.
 
 **Model pin is best-effort.** `--model` is set from `CONDENSE_MODEL`
 (default `claude-haiku-4.5`, override with `$AGENT_TAB_CONDENSE_MODEL`, empty

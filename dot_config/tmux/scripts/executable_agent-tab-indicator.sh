@@ -236,7 +236,13 @@ compose_summary() {
     # Set "<project>/<short>" immediately from cache when we've condensed
     # this title before; otherwise show "<project>/<raw>" as an interim and
     # condense in a detached child (an LLM call must never block a hook).
-    local win="$1" raw="$2" payload="$3" proj short
+    # $2 is extract_summary's tagged "<src>\t<title>" (bare text = final).
+    local win="$1" tagged="$2" payload="$3" proj short src raw
+    [ -n "$tagged" ] || return 0
+    case "$tagged" in
+        *$'\t'*) src="${tagged%%$'\t'*}"; raw="${tagged#*$'\t'}" ;;
+        *)       src="final"; raw="$tagged" ;;
+    esac
     [ -n "$raw" ] || return 0
     proj=$(project_name "$payload")
     short=$(cached_short "$raw")
@@ -245,17 +251,28 @@ compose_summary() {
         return 0
     fi
     set_summary "$win" "${proj:+$proj/}$(fit_words "$raw" 24)"
+    # Never spend a model call on the prompt standing in for a missing title.
+    # The agent writes its real title during the first turn, and that title
+    # hashes to a different key — condensing the prompt too bought one turn of
+    # prettier tab for a second call every session, off the weaker source. The
+    # cache read above still applies, so a prompt condensed by an older
+    # version (or a repeated prompt) is reused for free.
+    [ "$src" = "final" ] || return 0
     command -v copilot >/dev/null 2>&1 || return 0
     ( nohup bash "$0" condense "$win" "$proj" "$raw" >/dev/null 2>&1 & ) 2>/dev/null || true
 }
 
-# Conversation title, best source first.
+# Conversation title, best source first. Emits "<src>\t<title>", where <src>
+# distinguishes the agent's own conversation title (`final`) from the turn's
+# prompt standing in until that title exists (`interim`) — compose_summary
+# spends a model call only on `final`. Empty output = no title at all.
+# A tab is a safe delimiter: sanitize_summary maps tabs to spaces.
 #   claude: latest ai-title entry near the transcript tail (cheap: last 64KB),
-#           else the prompt that started the turn.
+#           else session_title, else the prompt that started the turn.
 #   codex:  thread_name from ~/.codex/session_index.jsonl keyed by session_id,
 #           else the prompt.
 extract_summary() {
-    local payload="$1" title=""
+    local payload="$1" title="" src="final"
     [ -n "$JQ" ] || return 0
     [ -n "$payload" ] || return 0
 
@@ -269,7 +286,11 @@ extract_summary() {
                     | "$JQ" -r '.aiTitle // empty' 2>/dev/null || true)
             fi
             if [ -z "$title" ]; then
-                title=$("$JQ" -r '.session_title // .prompt // empty' <<<"$payload" 2>/dev/null || true)
+                title=$("$JQ" -r '.session_title // empty' <<<"$payload" 2>/dev/null || true)
+            fi
+            if [ -z "$title" ]; then
+                title=$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null || true)
+                src="interim"
             fi
             ;;
         codex)
@@ -281,11 +302,14 @@ extract_summary() {
             fi
             if [ -z "$title" ]; then
                 title=$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null || true)
+                src="interim"
             fi
             ;;
     esac
 
-    printf '%s' "$title" | sanitize_summary
+    title=$(printf '%s' "$title" | sanitize_summary)
+    [ -n "$title" ] || return 0
+    printf '%s\t%s' "$src" "$title"
 }
 
 # ------------------------------------------------------------ entry modes
