@@ -213,3 +213,31 @@ source ~/.cache/nu/starship.nu
 source ~/.cache/nu/zoxide.nu
 source ~/.cache/nu/atuin.nu
 source ~/.cache/nu/carapace.nu
+
+# ── Visual: scroll the prompt to the bottom on startup ────────────────────
+# Ports .zshrc:596-604. Fires once per pty — each tmux pane is a unique pty, so
+# a fresh tab opens with its prompt at the bottom, while a nested shell reusing
+# the same pty does not cascade another screenful.
+#
+# The marker path deliberately reuses .zshrc's `zsh-bottom.<pty-inode>.<uid>`
+# name instead of a nu-specific one, so both shells share a single per-pty
+# claim: running `zsh` inside a nu tab (or `nu` inside a zsh tab) will not
+# scroll a second time. $TMPDIR is cleared on boot, so markers reset naturally.
+#
+# Cost is two forks (`tty`, `id`) and only for the first shell to claim a given
+# pty; nu's `ls -l` supplies the inode directly, so there is no stat(1) fork.
+# Must come after the prompt inits above so the scroll lands last.
+if $nu.is-interactive {
+    let tty_path = (do -i { ^tty } | complete | get stdout | str trim)
+    if ($tty_path | is-not-empty) and ($tty_path | path exists) {
+        let inode = (do -i { ls -l $tty_path | get 0.inode })
+        let uid = (do -i { ^id -u } | complete | get stdout | str trim)
+        if ($inode | is-not-empty) and ($uid | is-not-empty) {
+            let mark = ([($env.TMPDIR? | default "/tmp") $"zsh-bottom.($inode).($uid)"] | path join)
+            if not ($mark | path exists) {
+                print -n (1..(term size | get rows) | each { "\n" } | str join)
+                "" | save -f $mark
+            }
+        }
+    }
+}
