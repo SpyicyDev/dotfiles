@@ -1,4 +1,5 @@
 format = """
+${env_var.NU_TAB}\
 $username\
 $hostname\
 $directory\
@@ -72,6 +73,18 @@ style = "bold cyan"
 # `$(<file)` read. Zero subshell forks per prompt (previously this was
 # a [custom.*] block that ran sh+cat + sh+test per prompt).
 # Glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind, ? fetch >24h stale.
+# Nushell data-tab marker. $NU_TAB is set by ~/.config/nushell/env.nu and is
+# never set in zsh, so this renders only in a nu tab and costs zsh nothing.
+# Same [env_var.*] pattern as the three modules below — one starship config
+# serving both shells rather than a second copy to keep in sync.
+#
+# The drift indicator below doubles as a second, passive marker: it is driven
+# by a zsh precmd hook that does not run here, so a nu tab simply never shows
+# it. Correct, since chezmoi drift is a zsh-tab concern.
+[env_var.NU_TAB]
+description = "Set to 'nu' by nushell's env.nu; marks the structured-data tab."
+format = "[$env_value](bold #cba6f7) "
+
 [env_var.STARSHIP_CHEZMOI_DRIFT]
 description = "chezmoi drift glyphs (set by zsh precmd from ~/.cache/chezmoi-drift/state)"
 format = "[ ⚠ chezmoi:$env_value]($style) "

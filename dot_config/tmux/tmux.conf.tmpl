@@ -40,6 +40,19 @@ bind C-t new-window -a -t '{end}' -c "#{HOME}"
 # CMD+SHIFT+R (wezterm) → recreate current tab in place, same cwd.
 bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
 
+# CTRL+CMD+T (wezterm) → new tab running nushell, same cwd. The data tab:
+# JSON/yabai introspection, config surgery, API poking. $SHELL is untouched
+# (still zsh), so this changes nothing outside the tab.
+#
+# No `-n` name is passed on purpose: `automatic-rename` is on with format
+# #{pane_current_command}, and the catppuccin window format falls back to #W
+# when @agent_summary is unset, so the tab labels itself "nu" for free without
+# touching that (space- and quote-sensitive) format expression.
+#
+# nu exits → the window closes, since nu is the window's command, not a shell
+# running under one.
+bind N new-window -a -c "#{pane_current_path}" nu
+
 set -g status-position top
 
 # List of plugins
@@ -165,6 +178,13 @@ set -g @plugin 'tmux-plugins/tmux-resurrect'
 set -g @resurrect-dir '{{ .chezmoi.homeDir }}/.tmux/resurrect'
 set -g @resurrect-capture-pane-contents 'on'
 set -g @resurrect-strategy-nvim 'session'
+# Restore nu tabs as nu, not as the default shell. A `bind N` window runs nu as
+# its command rather than a shell, so without this resurrect sees an unlisted
+# process and respawns the pane with $SHELL (zsh) — the tab would come back
+# silently demoted. @resurrect-processes APPENDS to the built-in default list
+# (see _restore_list in scripts/process_restore_helpers.sh), so the defaults
+# for nvim/less/htop/etc. are preserved.
+set -g @resurrect-processes 'nu'
 set -g @plugin 'tmux-plugins/tmux-continuum'
 set -g @continuum-save-interval '15'
 set -g @continuum-restore 'on'

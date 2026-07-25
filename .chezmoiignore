@@ -16,6 +16,13 @@ OPERATIONS.md
 .tmux/resurrect/**
 .vim/**
 
+# nushell runtime state — env.nu/config.nu are managed, everything else here is
+# generated at run time (history store, plugin registry, vendor autoload).
+.config/nushell/history.txt
+.config/nushell/history.sqlite3
+.config/nushell/plugin.msgpackz
+.config/nushell/vendor/**
+
 .oh-my-zsh/**
 .antidote/**
 .atuin/**

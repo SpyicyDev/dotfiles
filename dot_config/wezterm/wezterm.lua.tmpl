@@ -118,6 +118,21 @@ config.keys = {
         }
     },
 
+    -- CTRL+CMD+T: new tab running nushell instead of the login shell.
+    -- Sends `prefix N` to tmux (see `bind N` in tmux.conf). This does NOT
+    -- change $SHELL — zsh stays the login shell, so fzf, nvim's &shell and
+    -- tmux's default-shell are unaffected. The nu tab is for structured-data
+    -- work (JSON/yabai introspection, config surgery); see
+    -- ~/.config/nushell/config.nu.
+    {
+        key = "t",
+        mods = "CTRL|CMD",
+        action = wezterm.action.Multiple {
+            wezterm.action.SendKey { key = "s", mods = "CTRL" },
+            wezterm.action.SendKey { key = "N", mods = "SHIFT" },
+        }
+    },
+
 }
 
 for i = 1, 9 do
