@@ -507,7 +507,16 @@ cask "hammerspoon"
 # Chromium-based web browser
 cask "helium-browser"
 # Char application
-cask "fastrepl/hyprnote/hyprnote"
+# DISABLED 2026-07-25 — the upstream cask is broken and cannot install. It
+# declares `app "Char.app"`, but the download endpoint now serves
+# Anarlog_1.3.10_aarch64.dmg containing Anarlog.app, so every install aborts
+# with `App source '.../Char.app' is not there`. The product was renamed twice
+# (Hyprnote -> Char -> Anarlog) and neither fastrepl tap's cask kept up.
+# The app is installed manually at /Applications/Anarlog.app; its bundle id is
+# still com.hyprnote.stable, so it uses the existing ~/Library data unchanged.
+# Re-enable when upstream fixes the cask (or switch to an `anarlog` cask if one
+# is published — none exists as of this writing).
+# cask "fastrepl/hyprnote/hyprnote"
 # Vector graphics editor
 cask "inkscape"
 # Keyboard customiser
