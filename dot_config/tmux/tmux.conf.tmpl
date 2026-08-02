@@ -174,7 +174,17 @@ set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},needs-input},#[f
 run-shell -b "bash #{HOME}/.config/tmux/scripts/agent-tab-watcher.sh"
 set-hook -g after-select-window 'run-shell -b "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current #{window_id}"'
 
-set -g @plugin 'tmux-plugins/tmux-resurrect'
+# Fork of tmux-plugins/tmux-resurrect. Its ONLY functional change is
+# strategies/nvim_session.sh: upstream looks for a `Session.vim` in the pane's
+# cwd (the tpope/vim-obsession convention), but we use folke/persistence.nvim,
+# which writes to ~/.local/state/nvim/sessions/ with `/` encoded as `%`. Upstream
+# therefore never matched a session file and restored a bare `nvim` with no
+# buffers; the fork reads persistence.nvim's layout and emits `nvim -S <file>`.
+# Upstream has been frozen since 2023-03; the fork is 0 behind / 4 ahead of it.
+# Safe swap: resurrect self-registers @resurrect-{save,restore}-script-path from
+# its own $CURRENT_DIR, so continuum and tmux-assistant-resurrect (which couple
+# only through tmux options, not the plugin dir name) follow automatically.
+set -g @plugin 'trevin-j/tmux-resurrect-nvim'
 set -g @resurrect-dir '{{ .chezmoi.homeDir }}/.tmux/resurrect'
 set -g @resurrect-capture-pane-contents 'on'
 set -g @resurrect-strategy-nvim 'session'
