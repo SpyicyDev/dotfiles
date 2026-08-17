@@ -81,6 +81,16 @@ main() {
   script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
   status_script="$script_dir/codexbar-usage-status.sh"
 
+  # When the usage provider has explicitly reported an authentication failure,
+  # prefix+u becomes the recovery action. Keep the normal reset-time preview
+  # behavior for every other state.
+  if bash "$status_script" --auth-required >/dev/null 2>&1; then
+    local login_command
+    printf -v login_command 'bash %q --login' "$status_script"
+    tmux display-popup -E -w 80% -h 70% "$login_command"
+    return 0
+  fi
+
   if (( seconds == 0 )); then
     local current
     current="$(get_tmux_opt "@codexbar_reset_preview_until" "0")"

@@ -95,6 +95,8 @@ if (( CODEXBAR_USAGE_DEBUG == 0 && STALE_AFTER_SECONDS < 30 )); then
 fi
 
 WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_timeout' 'CODEXBAR_USAGE_WEB_TIMEOUT' '2')" 1 30)"
+AUTH_REQUIRED_COLOR="$(opt_or_env_or_default '@codexbar_auth_required_color' 'CODEXBAR_USAGE_AUTH_REQUIRED_COLOR' '#cba6f7')"
+AUTH_REQUIRED_TEXT="$(opt_or_env_or_default '@codexbar_auth_required_text' 'CODEXBAR_USAGE_AUTH_REQUIRED_TEXT' 'Need to log in')"
 
 USAGE_PROVIDER="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' 'codex')"
 case "$USAGE_PROVIDER" in
@@ -271,7 +273,7 @@ LOCK_STALE_SECONDS=120
 WAKE_GAP_SECONDS=60
 
 usage() {
-  printf '%s\n' "Usage: $0 {session|weekly|--refresh|--debug-flash-tick <nonce>}" >&2
+  printf '%s\n' "Usage: $0 {session|weekly|--refresh|--publish|--tick|--auth-required|--login|--debug-flash-tick <nonce>}" >&2
 }
 
 now_epoch() {
@@ -1068,6 +1070,7 @@ effective_view_from_context() {
 }
 
 load_cache_fields() {
+  CACHE_STATE='ok'
   CACHE_SESSION_TEXT=''
   CACHE_WEEKLY_TEXT=''
   CACHE_SESSION_COLOR=''
@@ -1083,14 +1086,19 @@ load_cache_fields() {
   command -v jq >/dev/null 2>&1 || return 0
 
   local parsed
-  parsed="$(jq -r '[.session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null || true)"
+  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null || true)"
   [[ -n "$parsed" ]] || return 0
-  IFS=$'\t' read -r CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES <<<"$parsed"
+  IFS=$'\t' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES <<<"$parsed"
 }
 
 render_text_for_mode() {
   local mode="$1" view="$2" debug_suffix="$3"
   local out=''
+
+  if [[ "$CACHE_STATE" == "auth_required" ]]; then
+    printf '%s%s' "$AUTH_REQUIRED_TEXT" "$debug_suffix"
+    return 0
+  fi
 
   if [[ "$view" == "reset" ]]; then
     local now resets_at='' used='' window_minutes=''
@@ -1146,11 +1154,16 @@ publish_to_tmux_opts() {
   tmux set-option -gq @codex_session_text "$session_text" >/dev/null 2>&1 || true
   tmux set-option -gq @codex_weekly_text  "$weekly_text"  >/dev/null 2>&1 || true
 
-  if [[ -n "$CACHE_SESSION_COLOR" ]]; then
-    tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$CACHE_WEEKLY_COLOR" ]]; then
-    tmux set-option -gq @codex_weekly_color "$CACHE_WEEKLY_COLOR" >/dev/null 2>&1 || true
+  if [[ "$CACHE_STATE" == "auth_required" ]]; then
+    tmux set-option -gq @codex_session_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+    tmux set-option -gq @codex_weekly_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+  else
+    if [[ -n "$CACHE_SESSION_COLOR" ]]; then
+      tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$CACHE_WEEKLY_COLOR" ]]; then
+      tmux set-option -gq @codex_weekly_color "$CACHE_WEEKLY_COLOR" >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -1169,10 +1182,15 @@ print_value() {
   fi
 
   if command -v tmux >/dev/null 2>&1; then
-    case "$mode" in
-      session) [[ -n "$CACHE_SESSION_COLOR" ]] && tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true ;;
-      weekly)  [[ -n "$CACHE_WEEKLY_COLOR" ]]  && tmux set-option -gq @codex_weekly_color  "$CACHE_WEEKLY_COLOR"  >/dev/null 2>&1 || true ;;
-    esac
+    if [[ "$CACHE_STATE" == "auth_required" ]]; then
+      tmux set-option -gq @codex_session_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+      tmux set-option -gq @codex_weekly_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+    else
+      case "$mode" in
+        session) [[ -n "$CACHE_SESSION_COLOR" ]] && tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true ;;
+        weekly)  [[ -n "$CACHE_WEEKLY_COLOR" ]]  && tmux set-option -gq @codex_weekly_color  "$CACHE_WEEKLY_COLOR"  >/dev/null 2>&1 || true ;;
+      esac
+    fi
   fi
 
   printf '%s\n' "$(render_text_for_mode "$mode" "$view" "$debug_suffix")"
@@ -1356,10 +1374,30 @@ ensure_codex_cli_in_path() {
   return 0
 }
 
+ensure_claude_cli_in_path() {
+  command -v claude >/dev/null 2>&1 && return 0
+
+  local candidate bin
+  for candidate in \
+    "$HOME/.local/bin/claude" \
+    "$HOME/.bun/bin/claude" \
+    "$HOME/.nvm/versions/node/"*/bin/claude; do
+    if [[ -x "$candidate" ]]; then
+      bin="${candidate%/claude}"
+      PATH="$bin:$PATH"
+      export PATH
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 CLAUDE_OAUTH_KEYCHAIN_SERVICE='Claude Code-credentials'
 CLAUDE_OAUTH_REFRESH_LOCKDIR="${CACHE_DIR}/oauth-refresh.lock"
 CLAUDE_OAUTH_TOKEN_URL='https://platform.claude.com/v1/oauth/token'
 CLAUDE_OAUTH_CLIENT_ID='9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=0
 
 read_claude_oauth_keychain_blob() {
   command -v security >/dev/null 2>&1 || return 1
@@ -1554,6 +1592,11 @@ try_oauth_token_refresh() {
       ""
     ' 2>/dev/null)"
     err_msg="${err_msg//$'\n'/ }"
+    case "$err_type" in
+      invalid_grant|invalid_token|authentication_error)
+        CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=1
+        ;;
+    esac
     log_warn "oauth-refresh: endpoint returned error type=${err_type} msg=${err_msg}"
     release_refresh_lock
     return 1
@@ -1622,6 +1665,7 @@ FETCH_SESSION_WINDOW_MINUTES=''
 FETCH_WEEKLY_WINDOW_MINUTES=''
 FETCH_SESSION_RESETS_AT=''
 FETCH_WEEKLY_RESETS_AT=''
+FETCH_AUTH_REQUIRED=0
 
 reset_fetch_outputs() {
   FETCH_SESSION_USED=''
@@ -1630,6 +1674,8 @@ reset_fetch_outputs() {
   FETCH_WEEKLY_WINDOW_MINUTES=''
   FETCH_SESSION_RESETS_AT=''
   FETCH_WEEKLY_RESETS_AT=''
+  FETCH_AUTH_REQUIRED=0
+  CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=0
 }
 
 fetch_via_codexbar_codex() {
@@ -1756,6 +1802,10 @@ fetch_via_claude_oauth() {
   token="$(read_claude_oauth_access_token 2>/dev/null || true)"
   if [[ -z "${token:-}" ]]; then
     log_warn "refresh[claude]: keychain token unavailable"
+    if (( CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED != 0 )) \
+       || [[ -z "$(read_claude_oauth_refresh_token 2>/dev/null || true)" ]]; then
+      FETCH_AUTH_REQUIRED=1
+    fi
     return 1
   fi
 
@@ -1776,6 +1826,7 @@ fetch_via_claude_oauth() {
     fi
     if [[ -z "${raw:-}" ]]; then
       log_warn "refresh[claude]: empty oauth response after refresh attempt"
+      (( CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED != 0 )) && FETCH_AUTH_REQUIRED=1
       return 1
     fi
   fi
@@ -1791,10 +1842,12 @@ fetch_via_claude_oauth() {
 
     if [[ -z "${raw:-}" ]]; then
       log_warn "refresh[claude]: empty oauth response after refresh attempt"
+      (( CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED != 0 )) && FETCH_AUTH_REQUIRED=1
       return 1
     fi
     if claude_oauth_response_is_auth_error "$raw"; then
       log_warn "refresh[claude]: auth error persists after refresh attempt"
+      FETCH_AUTH_REQUIRED=1
       return 1
     fi
   fi
@@ -1830,6 +1883,53 @@ fetch_via_claude_oauth() {
   fi
 
   return 0
+}
+
+mark_auth_required_cache() {
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+
+  local updated_at tmp
+  updated_at="$(now_epoch)"
+  tmp="$(mktemp "${CACHE_DIR}/usage.json.tmp.XXXXXX")" || return 0
+  umask 077
+  printf '{"updated_at":%s,"state":"auth_required"}\n' "$updated_at" >"$tmp"
+  mv -f "$tmp" "$CACHE_FILE"
+  log_warn "refresh[claude]: authentication required"
+}
+
+cache_auth_required() {
+  [[ "$USAGE_PROVIDER" == "claude" ]] || return 1
+  [[ -f "$CACHE_FILE" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e '.state == "auth_required"' "$CACHE_FILE" >/dev/null 2>&1
+}
+
+login_claude_oauth() {
+  if ! ensure_claude_cli_in_path; then
+    printf '%s\n' 'Claude CLI was not found. Install it, then press prefix + u again.' >&2
+    printf '%s' 'Press Enter to close... '
+    IFS= read -r _ || true
+    return 1
+  fi
+
+  printf '%s\n\n' 'Opening Claude subscription login in your browser...'
+  if ! env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude auth login --claudeai; then
+    printf '\n%s\n' 'Login was not completed.' >&2
+    printf '%s' 'Press Enter to close... '
+    IFS= read -r _ || true
+    return 1
+  fi
+
+  reset_refresh_backoff
+  CODEXBAR_USAGE_FORCE_REFRESH=1 refresh_cache || true
+  publish_to_tmux_opts || true
+  command -v tmux >/dev/null 2>&1 && tmux refresh-client -S >/dev/null 2>&1 || true
+
+  if cache_auth_required; then
+    printf '\n%s\n' 'Login finished, but usage could not be refreshed yet. The bar will retry automatically.'
+    printf '%s' 'Press Enter to close... '
+    IFS= read -r _ || true
+  fi
 }
 
 refresh_cache() {
@@ -1871,7 +1971,11 @@ refresh_cache() {
 
   case "$USAGE_PROVIDER" in
     claude)
-      fetch_via_claude_oauth || { refresh_fail; return 1; }
+      if ! fetch_via_claude_oauth; then
+        (( FETCH_AUTH_REQUIRED != 0 )) && mark_auth_required_cache
+        refresh_fail
+        return 1
+      fi
       ;;
     codex)
       fetch_via_codexbar_codex || { refresh_fail; return 1; }
@@ -1929,7 +2033,7 @@ refresh_cache() {
 
   umask 077
   cat >"$tmp" <<EOF
-{"updated_at":${updated_at},"session_used":${session_used},"weekly_used":${weekly_used},"session_window_minutes":${session_window_minutes_json},"session_resets_at":${session_resets_at_json},"weekly_window_minutes":${weekly_window_minutes_json},"weekly_resets_at":${weekly_resets_at_json},"session_windowMinutes":${session_window_minutes_json},"session_resetsAt":${session_resets_at_json},"weekly_windowMinutes":${weekly_window_minutes_json},"weekly_resetsAt":${weekly_resets_at_json},"session_text":"${session_text}","weekly_text":"${weekly_text}","session_color":"${session_color}","weekly_color":"${weekly_color}"}
+{"updated_at":${updated_at},"state":"ok","session_used":${session_used},"weekly_used":${weekly_used},"session_window_minutes":${session_window_minutes_json},"session_resets_at":${session_resets_at_json},"weekly_window_minutes":${weekly_window_minutes_json},"weekly_resets_at":${weekly_resets_at_json},"session_windowMinutes":${session_window_minutes_json},"session_resetsAt":${session_resets_at_json},"weekly_windowMinutes":${weekly_window_minutes_json},"weekly_resetsAt":${weekly_resets_at_json},"session_text":"${session_text}","weekly_text":"${weekly_text}","session_color":"${session_color}","weekly_color":"${weekly_color}"}
 EOF
 
   mv -f "$tmp" "$CACHE_FILE"
@@ -1976,6 +2080,14 @@ main() {
     --publish)
       publish_to_tmux_opts || true
       exit 0
+      ;;
+    --auth-required)
+      cache_auth_required
+      exit $?
+      ;;
+    --login)
+      login_claude_oauth
+      exit $?
       ;;
     --tick)
       # Debounce: when both catppuccin modules render in the same status tick,
