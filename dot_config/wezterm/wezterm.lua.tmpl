@@ -40,6 +40,15 @@ config.window_padding = {
     bottom = 0,
 }
 
+-- The window height is rarely an exact multiple of the cell height, so a few
+-- leftover pixels always land somewhere. Anchoring content to the bottom parks
+-- them above the first row (invisible against the background) instead of under
+-- the tmux status line, where they read as a gap at the edge of the screen.
+config.window_content_alignment = {
+    horizontal = "Left",
+    vertical = "Bottom",
+}
+
 config.default_prog = { "{{ .homebrew_prefix }}/bin/tmux", "new-session", "-A", "-s", "main" }
 
 -- WezTerm is intentionally NOT fullscreenable -- it lives as a normal tiled window
