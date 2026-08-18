@@ -252,6 +252,120 @@ case "$state" in
     ;;
 esac
 
+RAW_FILE="$CACHE_DIR/usage-raw.json"
+MONO_FONT='font=Menlo size=12'
+
+iso_to_epoch() {
+  local iso="${1:-}"
+  [[ -n "$iso" ]] || return 1
+  if [[ "$iso" =~ ^([0-9-]+T[0-9:]+)\.[0-9]+(.*)$ ]]; then
+    iso="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  fi
+  iso="${iso/+00:00/Z}"
+  local epoch
+  epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$iso" +%s 2>/dev/null || true)"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$epoch"
+}
+
+# "8:10pm (4h32m)" within 24h; "Mon 9pm (6d6h)" beyond.
+format_reset_label() {
+  local epoch="$1" ref="$2"
+  [[ "$epoch" =~ ^[0-9]+$ ]] || { printf '%s' '--'; return 0; }
+  local delta=$(( epoch - ref ))
+  (( delta > 0 )) || { printf '%s' '--'; return 0; }
+  local daytime
+  if (( delta < 86400 )); then
+    daytime="$(date -r "$epoch" "+%-l:%M%p" 2>/dev/null || true)"
+  else
+    daytime="$(date -r "$epoch" "+%a %-l:%M%p" 2>/dev/null || true)"
+  fi
+  daytime="$(printf '%s' "$daytime" | sed 's/:00//;s/AM/am/;s/PM/pm/')"
+  printf '%s (%s)' "${daytime:---}" "$(format_time_until "$epoch" "$ref")"
+}
+
+usage_bar() {
+  local pct="$1" filled i bar=''
+  [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
+  filled=$(( (pct + 5) / 10 ))
+  (( filled > 10 )) && filled=10
+  for (( i = 0; i < 10; i++ )); do
+    if (( i < filled )); then bar+='█'; else bar+='░'; fi
+  done
+  printf '%s' "$bar"
+}
+
+limit_row_color() {
+  local pct="$1" severity="$2"
+  case "$severity" in
+    warning)               printf '%s' "$YELLOW"; return 0 ;;
+    exceeded|blocked|high) printf '%s' "$RED"; return 0 ;;
+  esac
+  if (( pct <= 49 )); then
+    printf '%s' "$GREEN"
+  elif (( pct <= 79 )); then
+    printf '%s' "$YELLOW"
+  else
+    printf '%s' "$RED"
+  fi
+}
+
+# One aligned row per entry in the endpoint's limits[] array:
+#   Fable    ██░░░░░░░░  14% · 86% left · resets Mon 9pm (6d6h)
+LIMIT_ROWS_EMITTED=0
+emit_limit_rows_from_raw() {
+  LIMIT_ROWS_EMITTED=0
+  [[ -f "$RAW_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local rows
+  rows="$(jq -r '.limits[]? | [
+      .kind // "",
+      ((.percent // 0) | floor),
+      .severity // "normal",
+      .resets_at // "",
+      (.scope.model.display_name // "")
+    ] | @tsv' "$RAW_FILE" 2>/dev/null || true)"
+  [[ -n "$rows" ]] || return 0
+
+  local kind pct severity resets_iso scope_name label epoch reset_label color line
+  while IFS=$'\t' read -r kind pct severity resets_iso scope_name; do
+    [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
+    case "$kind" in
+      session)       label='Session' ;;
+      weekly_all)    label='Weekly' ;;
+      weekly_scoped) label="${scope_name:-Scoped}" ;;
+      *)             label="${scope_name:-$kind}" ;;
+    esac
+
+    reset_label='--'
+    if epoch="$(iso_to_epoch "$resets_iso")"; then
+      reset_label="$(format_reset_label "$epoch" "$now")"
+    fi
+
+    color="$(limit_row_color "$pct" "$severity")"
+    line="$(printf '%-8.8s %s %3d%% · %d%% left · resets %s' \
+      "$label" "$(usage_bar "$pct")" "$pct" $(( pct > 100 ? 0 : 100 - pct )) "$reset_label")"
+    printf '%s | %s color=%s trim=false\n' "$line" "$MONO_FONT" "$color"
+    LIMIT_ROWS_EMITTED=$(( LIMIT_ROWS_EMITTED + 1 ))
+  done <<<"$rows"
+}
+
+emit_extra_usage_from_raw() {
+  [[ -f "$RAW_FILE" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local enabled util
+  enabled="$(jq -r '.extra_usage.is_enabled // false' "$RAW_FILE" 2>/dev/null || true)"
+  if [[ "$enabled" == "true" ]]; then
+    util="$(jq -r '(.extra_usage.utilization // 0) | floor' "$RAW_FILE" 2>/dev/null || true)"
+    [[ "$util" =~ ^[0-9]+$ ]] || util=0
+    printf 'Extra usage: on · %d%% of monthly credits used | color=%s\n' "$util" "$GRAY"
+  else
+    printf 'Extra usage: off | color=%s\n' "$GRAY"
+  fi
+}
+
 # ---- Menu bar title: stacked image, cycling-text fallback ------------------
 img=''
 if ensure_renderer; then
@@ -271,17 +385,22 @@ if (( auth_required )); then
   printf 'Not logged in to Claude | color=%s\n' "$AUTH"
   printf 'Log in from tmux: prefix + u | color=%s\n' "$AUTH"
 else
-  session_until="$(format_time_until "$session_resets" "$now")"
-  weekly_until="$(format_time_until "$weekly_resets" "$now")"
-  weekly_day="$(format_reset_daytime "$weekly_resets" || true)"
-
-  printf 'Session: %s — resets in %s | color=%s\n' "$(strip_legacy_prefix "$session_text")" "$session_until" "$c1"
-  if [[ -n "${weekly_day:-}" ]]; then
-    printf 'Weekly: %s — resets %s (in %s) | color=%s\n' "$(strip_legacy_prefix "$weekly_text")" "$weekly_day" "$weekly_until" "$c2"
-  else
-    printf 'Weekly: %s — resets in %s | color=%s\n' "$(strip_legacy_prefix "$weekly_text")" "$weekly_until" "$c2"
+  emit_limit_rows_from_raw
+  if (( LIMIT_ROWS_EMITTED == 0 )); then
+    # Raw endpoint dump not available yet — fall back to the cache summary.
+    session_until="$(format_time_until "$session_resets" "$now")"
+    weekly_until="$(format_time_until "$weekly_resets" "$now")"
+    weekly_day="$(format_reset_daytime "$weekly_resets" || true)"
+    printf 'Session: %s — resets in %s | color=%s\n' "$(strip_legacy_prefix "$session_text")" "$session_until" "$c1"
+    if [[ -n "${weekly_day:-}" ]]; then
+      printf 'Weekly: %s — resets %s (in %s) | color=%s\n' "$(strip_legacy_prefix "$weekly_text")" "$weekly_day" "$weekly_until" "$c2"
+    else
+      printf 'Weekly: %s — resets in %s | color=%s\n' "$(strip_legacy_prefix "$weekly_text")" "$weekly_until" "$c2"
+    fi
   fi
 
+  echo '---'
+  emit_extra_usage_from_raw
   if (( updated_at > 0 )); then
     if (( age < 60 )); then
       printf 'Updated just now | color=%s\n' "$GRAY"
@@ -294,3 +413,4 @@ else
 fi
 echo '---'
 printf 'Refresh now | bash="%s" param1=refresh-now terminal=false refresh=true\n' "$PLUGIN_PATH"
+printf 'Open claude.ai usage settings | href=https://claude.ai/settings/usage\n'

@@ -1857,6 +1857,18 @@ fetch_via_claude_oauth() {
     return 1
   fi
 
+  # Persist the full endpoint response for consumers that want more than the
+  # session/weekly percentages (e.g. the SwiftBar dropdown reads the scoped
+  # per-model limits and extra-usage fields from it). Best-effort.
+  local raw_tmp
+  if raw_tmp="$(umask 077 && mktemp "${CACHE_DIR}/usage-raw.json.tmp.XXXXXX" 2>/dev/null)"; then
+    if printf '%s\n' "$raw" >"$raw_tmp" 2>/dev/null; then
+      mv -f "$raw_tmp" "${CACHE_DIR}/usage-raw.json" 2>/dev/null || rm -f "$raw_tmp" 2>/dev/null || true
+    else
+      rm -f "$raw_tmp" 2>/dev/null || true
+    fi
+  fi
+
   local session_raw weekly_raw
   if ! session_raw="$(printf '%s' "$raw" | jq -er '.five_hour.utilization' 2>/dev/null)"; then
     log_warn "refresh[claude]: missing five_hour.utilization"
