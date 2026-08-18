@@ -135,8 +135,10 @@ ghce() { _load_gh_copilot; ghce "$@"; }
 [[ -s "$HOME/.bun/_bun" ]] && source "$HOME/.bun/_bun"
 
 # atuin (defer to after first prompt for speed)
+# AGENT_PTY is set by tmux-pty-mcp on agent shell windows — skip atuin there
+# so agent-run commands never enter shell history.
 . "$HOME/.atuin/bin/env"
-zsh-defer eval "$(atuin init zsh)"
+[[ -z "$AGENT_PTY" ]] && zsh-defer eval "$(atuin init zsh)"
 
 # broot (defer)
 zsh-defer source "$HOME/.config/broot/launcher/bash/br"
