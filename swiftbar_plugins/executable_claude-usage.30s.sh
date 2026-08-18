@@ -123,7 +123,9 @@ func parseColor(_ hex: String) -> NSColor {
 }
 
 let scale: CGFloat = 2
-let font = NSFont.monospacedDigitSystemFont(ofSize: 8.5 * scale, weight: .semibold)
+// Fully monospaced so the two lines align column-for-column (the bash side
+// pads the percent field to a fixed width).
+let font = NSFont.monospacedSystemFont(ofSize: 8.5 * scale, weight: .semibold)
 
 // suffix is the bare pace delta ("-66%"); the wrapping parens are drawn in
 // the main color so only the number/sign/percent carries the pacing color.
@@ -238,10 +240,12 @@ case "$state" in
     m1="$AUTH"; m2="$AUTH"; c1="$AUTH"; c2="$AUTH"
     ;;
   ok)
+    # Right-pad the percent to 4 chars ("  6%", " 27%", "100%") so the two
+    # lines' percents align under the monospaced renderer font.
     split_pace "$(strip_legacy_prefix "$session_text")"
-    l1="S: ${SPLIT_MAIN:---%}"; p1="$SPLIT_PACE"
+    l1="S: $(printf '%4s' "${SPLIT_MAIN:---%}")"; p1="$SPLIT_PACE"
     split_pace "$(strip_legacy_prefix "$weekly_text")"
-    l2="W: ${SPLIT_MAIN:---%}"; p2="$SPLIT_PACE"
+    l2="W: $(printf '%4s' "${SPLIT_MAIN:---%}")"; p2="$SPLIT_PACE"
     m1="$TEXTC"; m2="$TEXTC"
     c1="$(color_to_hex "$session_color")"
     c2="$(color_to_hex "$weekly_color")"
