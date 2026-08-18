@@ -68,7 +68,7 @@ config.scrollback_lines = 0
 
 -- ── Performance ────────────────────────────────────────────────────────
 config.front_end = "OpenGL"           -- avoids WebGPU square-corner scaling bug
-config.max_fps = 120                  -- match ProMotion display refresh
+config.max_fps = 60                   -- battery: 120Hz scrollback redraw is not worth it
 config.animation_fps = 1              -- minimize animation CPU
 config.cursor_blink_rate = 0          -- disable blink entirely
 config.use_ime = false                -- skip IME event loop (English only)
