@@ -3,6 +3,18 @@
 
 [[ -n "${ZSH_DEBUGRC+1}" ]] && zmodload zsh/zprof
 
+# ─── Agent shells (tmux-pty-mcp) ──────────────────────────────────────────
+# AGENT_PTY=1 marks tmux windows driven by AI agents. Everything below this
+# block exists for a human — plugins, prompt, completions, history. Agents
+# get a bare shell: no ZLE (faster line acceptance for send-keys), zero
+# plugin forks, no history writes, plain prompt.
+if [[ -n "$AGENT_PTY" ]]; then
+  unsetopt zle
+  PS1='%% '
+  HISTFILE=
+  return
+fi
+
 # ─── Bytecode compile hot files (auto-regen when source changes) ──────────
 # zsh transparently uses .zwc if newer than source. Edits Just Work.
 # Note: _cache_init compiles ~/.cache/zsh/*.zsh inline at write-time, so
