@@ -9,6 +9,8 @@
 #                   conversation title condensed to its 2-4 identifying
 #                   words by a cached background copilot/haiku call
 #                   (interim: the raw title until the condensation lands)
+#   @agent_summary_cond  1 while @agent_summary holds a condensed label, unset
+#                   while it holds raw stand-in text — see compose_summary
 #
 # Rendering happens entirely in tmux.conf: the Catppuccin window formats
 # read these options via #{?…} conditionals (background tint per state,
@@ -108,6 +110,7 @@ clear_state() {
     cur=$(window_state "$win")
     tmux set-option -uw -t "$win" @agent_state 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_summary 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null || true
     if [ -n "$cur" ]; then
         tmux refresh-client -S 2>/dev/null || true
     fi
@@ -121,12 +124,25 @@ sanitize_summary() {
     # '/' becomes a space so the only slash in a tab name is the deliberate
     # "<project>/" separator — a model title or project basename can't add
     # its own (it would read as a second path segment).
-    tr '\n\t/' '   ' | tr -d '#"%' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-60
+    # $1 overrides the 60-char bound: a title is display text, but a prompt is
+    # the condenser's *input* and wants more of the sentence (extract_summary).
+    local max="${1:-60}"
+    tr '\n\t/' '   ' | tr -d '#"%' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-"$max"
 }
 
+# $3=1 marks <summary> as a condensed (model-written) label; 0/absent marks it
+# as raw stand-in text. Recorded in @agent_summary_cond so compose_summary can
+# refuse to downgrade a finished label back to raw text on a later turn. The
+# flag is written before the no-change short-circuit: re-asserting the same
+# string must still correct the flag.
 set_summary() {
-    local win="$1" summary="$2" cur
+    local win="$1" summary="$2" cond="${3:-0}" cur
     [ -n "$summary" ] || return 0
+    if [ "$cond" = 1 ]; then
+        tmux set-option -w -t "$win" @agent_summary_cond 1 2>/dev/null || true
+    else
+        tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null || true
+    fi
     cur=$(tmux show-options -wqv -t "$win" @agent_summary 2>/dev/null || true)
     [ "$cur" = "$summary" ] && return 0
     tmux set-option -w -t "$win" @agent_summary "$summary" 2>/dev/null || true
@@ -247,17 +263,24 @@ compose_summary() {
     proj=$(project_name "$payload")
     short=$(cached_short "$raw")
     if [ -n "$short" ]; then
-        set_summary "$win" "${proj:+$proj/}$short"
+        set_summary "$win" "${proj:+$proj/}$short" 1
         return 0
     fi
-    set_summary "$win" "${proj:+$proj/}$(fit_words "$raw" 24)"
-    # Never spend a model call on the prompt standing in for a missing title.
-    # The agent writes its real title during the first turn, and that title
-    # hashes to a different key — condensing the prompt too bought one turn of
-    # prettier tab for a second call every session, off the weaker source. The
-    # cache read above still applies, so a prompt condensed by an older
-    # version (or a repeated prompt) is reused for free.
-    [ "$src" = "final" ] || return 0
+    # Raw text is only ever a stand-in for the label the condenser is about to
+    # write, so don't paint it over a label already condensed for this window.
+    # Both sources get condensed (see $src below), so the second one to arrive
+    # would otherwise flash the untrimmed title for a second or two mid-turn —
+    # which reads as the tab breaking, not refining. With no condenser (or a
+    # failing one) the flag never gets set and raw text still shows through.
+    if [ "$(tmux show-options -wqv -t "$win" @agent_summary_cond 2>/dev/null || true)" != 1 ]; then
+        set_summary "$win" "${proj:+$proj/}$(fit_words "$raw" 24)"
+    fi
+    # $src is condensed either way. The agent writes its own title only at the
+    # END of the first turn, so gating on `final` meant a whole turn of raw
+    # prompt text in the tab; condensing the `interim` prompt names the tab
+    # from the moment the first message is sent, for one extra call per
+    # session (the real title hashes to a different key). The cache read above
+    # keeps repeats — and every later turn — free.
     command -v copilot >/dev/null 2>&1 || return 0
     ( nohup bash "$0" condense "$win" "$proj" "$raw" >/dev/null 2>&1 & ) 2>/dev/null || true
 }
@@ -307,7 +330,15 @@ extract_summary() {
             ;;
     esac
 
-    title=$(printf '%s' "$title" | sanitize_summary)
+    # An agent-written title is already short and is displayed as-is if the
+    # condense fails; a prompt is a whole sentence whose first 60 chars can cut
+    # off the identifying words the condenser exists to find, so give it room.
+    # Display is unaffected — compose_summary trims to 24 chars either way.
+    if [ "$src" = "interim" ]; then
+        title=$(printf '%s' "$title" | sanitize_summary 200)
+    else
+        title=$(printf '%s' "$title" | sanitize_summary)
+    fi
     [ -n "$title" ] || return 0
     printf '%s\t%s' "$src" "$title"
 }
@@ -407,7 +438,7 @@ Title: $raw"
         fi
     fi
     [ -n "$short" ] || exit 0
-    set_summary "$win" "${proj:+$proj/}$short"
+    set_summary "$win" "${proj:+$proj/}$short" 1
     exit 0
 fi
 

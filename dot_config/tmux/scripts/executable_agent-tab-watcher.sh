@@ -251,6 +251,7 @@ EOF
         elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ]; }; then
             tmux set-option -uw -t "$win" @agent_state 2>/dev/null
             tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
+            tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
             changed=1
         fi
     done <<EOF
