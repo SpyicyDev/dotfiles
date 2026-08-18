@@ -17,7 +17,7 @@ main() {
   local current_session
   current_session="$(tmux display-message -p '#S')"
 
-  local fzf_command=(fzf --exit-0 --print-query --reverse --ansi --info=hidden)
+  local fzf_command=(fzf --print-query --reverse --ansi --info=hidden)
   local preview_script="$CURRENT_DIR/preview_session.sh"
   if [[ "${PREVIEW_DISABLED:-0}" != "1" && -x "$preview_script" ]]; then
     fzf_command+=(
@@ -33,6 +33,10 @@ main() {
       | sort -t $'\t' -k1,1nr \
       | cut -f2-
   } || true)"
+
+  if [[ -z "$list" ]]; then
+    fzf_command+=(--header 'No other sessions — type a name and press Enter to create one')
+  fi
 
   local out status
   set +e
