@@ -53,7 +53,7 @@ bind R new-window -a -c "#{pane_current_path}" \; kill-window -t -
 # running under one.
 bind N new-window -a -c "#{pane_current_path}" nu
 
-set -g status-position top
+set -g status-position bottom
 
 # List of plugins
 set -g @plugin 'tmux-plugins/tpm'
@@ -175,6 +175,12 @@ set -g @catppuccin_window_current_text "#{?#{==:#{@agent_state},needs-input},#[f
 # handlers must use explicit indices ([1]+) or they'll overwrite this one.
 run-shell -b "bash #{HOME}/.config/tmux/scripts/agent-tab-watcher.sh"
 set-hook -g after-select-window 'run-shell -b "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current #{window_id}"'
+# CuaNotch (notch glow indicator): instant visit acknowledgment — dismisses a
+# finished agent's green / subsides a needs-input blaze the moment its tab is
+# focused. Explicit [1] index to coexist with agent-tab-indicator above.
+set-hook -g 'after-select-window[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
+set-hook -g 'after-select-pane[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
+set-hook -g 'client-session-changed[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
 
 # Fork of tmux-plugins/tmux-resurrect. Its ONLY functional change is
 # strategies/nvim_session.sh: upstream looks for a `Session.vim` in the pane's
