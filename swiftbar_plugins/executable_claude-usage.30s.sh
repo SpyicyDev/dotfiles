@@ -295,12 +295,82 @@ usage_bar() {
   printf '%s' "$bar"
 }
 
+# Signed pacing delta in percentage points (actual used - expected used at
+# this point in the window). Mirrors the tmux script's pace_delta. Empty
+# output when not computable (no reset, window not started, etc.).
+calc_pace_delta() {
+  local used="$1" window_minutes="$2" resets_at="$3" ref="$4"
+  [[ "$used" =~ ^[0-9]+$ && "$window_minutes" =~ ^[0-9]+$ ]] || return 0
+  [[ "$resets_at" =~ ^[0-9]+$ && "$ref" =~ ^[0-9]+$ ]] || return 0
+
+  local duration time_until elapsed
+  duration=$(( window_minutes * 60 ))
+  (( duration > 0 )) || return 0
+  time_until=$(( resets_at - ref ))
+  (( time_until > 0 && time_until <= duration )) || return 0
+  elapsed=$(( duration - time_until ))
+  (( elapsed == 0 && used > 0 )) && return 0
+
+  awk -v a="$used" -v e="$elapsed" -v d="$duration" 'BEGIN {
+    expected = (e / d) * 100
+    delta = a - expected
+    if (delta < 0) { sign = "-"; delta = -delta } else { sign = "+" }
+    printf "%s%d", sign, int(delta + 0.5)
+  }'
+}
+
+# Linear projection of when this window's limit runs out, as an epoch.
+# Empty when not computable (nothing used yet, or too early in the window
+# for the rate to mean anything).
+calc_runout_epoch() {
+  local used="$1" window_minutes="$2" resets_at="$3" ref="$4"
+  [[ "$used" =~ ^[0-9]+$ && "$window_minutes" =~ ^[0-9]+$ ]] || return 0
+  [[ "$resets_at" =~ ^[0-9]+$ && "$ref" =~ ^[0-9]+$ ]] || return 0
+  (( used > 0 )) || return 0
+
+  local duration time_until elapsed min_elapsed
+  duration=$(( window_minutes * 60 ))
+  (( duration > 0 )) || return 0
+  time_until=$(( resets_at - ref ))
+  (( time_until > 0 && time_until <= duration )) || return 0
+  elapsed=$(( duration - time_until ))
+  min_elapsed=$(( duration / 100 ))
+  (( min_elapsed < 60 )) && min_elapsed=60
+  (( elapsed >= min_elapsed )) || return 0
+
+  if (( used >= 100 )); then
+    printf '%s' "$ref"
+    return 0
+  fi
+
+  local eta
+  eta="$(awk -v u="$used" -v e="$elapsed" 'BEGIN {
+    rate = u / e
+    if (rate <= 0) exit
+    printf "%d", int((100 - u) / rate + 0.5)
+  }')"
+  [[ "$eta" =~ ^[0-9]+$ ]] || return 0
+  printf '%s' $(( ref + eta ))
+}
+
 limit_row_color() {
-  local pct="$1" severity="$2"
+  local pct="$1" severity="$2" pace="$3"
   case "$severity" in
     warning)               printf '%s' "$YELLOW"; return 0 ;;
     exceeded|blocked|high) printf '%s' "$RED"; return 0 ;;
   esac
+  # Prefer pacing color (like tmux); fall back to absolute usage.
+  if [[ "$pace" =~ ^[+-][0-9]+$ ]]; then
+    local delta=${pace#+}
+    if (( delta <= 5 )); then
+      printf '%s' "$GREEN"
+    elif (( delta <= 15 )); then
+      printf '%s' "$YELLOW"
+    else
+      printf '%s' "$RED"
+    fi
+    return 0
+  fi
   if (( pct <= 49 )); then
     printf '%s' "$GREEN"
   elif (( pct <= 79 )); then
@@ -310,8 +380,17 @@ limit_row_color() {
   fi
 }
 
+window_minutes_for_kind() {
+  case "$1" in
+    session)                     printf '%s' 300 ;;
+    weekly_all|weekly_scoped)    printf '%s' 10080 ;;
+    *)                           printf '%s' '' ;;
+  esac
+}
+
 # One aligned row per entry in the endpoint's limits[] array:
-#   Fable    ██░░░░░░░░  14% · 86% left · resets Mon 9pm (6d6h)
+#   Fable    █░░░░░░░░░  14% (+2%) · lasts to reset · resets Mon 9pm (6d5h)
+#   Session  ███░░░░░░░  34% (+9%) · out in 2h10m (~6:30pm) · resets 8:09pm (4h28m)
 LIMIT_ROWS_EMITTED=0
 emit_limit_rows_from_raw() {
   LIMIT_ROWS_EMITTED=0
@@ -329,6 +408,7 @@ emit_limit_rows_from_raw() {
   [[ -n "$rows" ]] || return 0
 
   local kind pct severity resets_iso scope_name label epoch reset_label color line
+  local window_minutes pace pace_part runout runout_part runout_clock
   while IFS=$'\t' read -r kind pct severity resets_iso scope_name; do
     [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
     case "$kind" in
@@ -338,14 +418,36 @@ emit_limit_rows_from_raw() {
       *)             label="${scope_name:-$kind}" ;;
     esac
 
+    epoch=''
     reset_label='--'
     if epoch="$(iso_to_epoch "$resets_iso")"; then
       reset_label="$(format_reset_label "$epoch" "$now")"
     fi
 
-    color="$(limit_row_color "$pct" "$severity")"
-    line="$(printf '%-8.8s %s %3d%% · %d%% left · resets %s' \
-      "$label" "$(usage_bar "$pct")" "$pct" $(( pct > 100 ? 0 : 100 - pct )) "$reset_label")"
+    window_minutes="$(window_minutes_for_kind "$kind")"
+    pace="$(calc_pace_delta "$pct" "$window_minutes" "${epoch:-}" "$now")"
+    pace_part=''
+    [[ -n "$pace" ]] && pace_part=" (${pace}%)"
+
+    runout_part=''
+    if runout="$(calc_runout_epoch "$pct" "$window_minutes" "${epoch:-}" "$now")" && [[ -n "$runout" ]]; then
+      if [[ -n "$epoch" ]] && (( runout >= epoch )); then
+        runout_part=' · lasts to reset'
+      else
+        # Round the projected clock time to the hour — a linear projection
+        # doesn't deserve minute precision (matches the tmux reset view).
+        local runout_hr=$(( ((runout + 1800) / 3600) * 3600 ))
+        runout_clock="$(date -r "$runout_hr" "+%-l%p" 2>/dev/null | sed 's/AM/am/;s/PM/pm/')"
+        if (( runout - now >= 86400 )); then
+          runout_clock="$(date -r "$runout_hr" "+%a %-l%p" 2>/dev/null | sed 's/AM/am/;s/PM/pm/')"
+        fi
+        runout_part=" · out in $(format_time_until "$runout" "$now")${runout_clock:+ (~${runout_clock})}"
+      fi
+    fi
+
+    color="$(limit_row_color "$pct" "$severity" "$pace")"
+    line="$(printf '%-8.8s %s %3d%%%s%s · resets %s' \
+      "$label" "$(usage_bar "$pct")" "$pct" "$pace_part" "$runout_part" "$reset_label")"
     printf '%s | %s color=%s trim=false\n' "$line" "$MONO_FONT" "$color"
     LIMIT_ROWS_EMITTED=$(( LIMIT_ROWS_EMITTED + 1 ))
   done <<<"$rows"
