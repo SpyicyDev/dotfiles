@@ -1085,10 +1085,16 @@ load_cache_fields() {
   [[ -f "$CACHE_FILE" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
 
+  # Tab is IFS *whitespace*, so `IFS=$'\t' read` collapses runs of tabs and
+  # drops empty fields, shifting every later field left. That happens for real:
+  # the endpoint reports session_resets_at as null whenever no 5-hour window is
+  # open, which slid the weekly reset into CACHE_SESSION_RESETS and pushed the
+  # tail fields off the end. Use a non-whitespace separator (US, \037) so empty
+  # fields survive; @tsv escapes any literal tab in a value, so this is lossless.
   local parsed
-  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null || true)"
+  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   [[ -n "$parsed" ]] || return 0
-  IFS=$'\t' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES <<<"$parsed"
+  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES <<<"$parsed"
 }
 
 render_text_for_mode() {
@@ -1108,7 +1114,12 @@ render_text_for_mode() {
         resets_at="$CACHE_SESSION_RESETS"
         used="$CACHE_SESSION_USED"
         window_minutes="$CACHE_SESSION_WINDOW_MINUTES"
-        out="$(format_session_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
+        if [[ -z "$resets_at" && "$used" == "0" ]]; then
+          # No 5-hour window open, so there is no reset to count down to.
+          out='idle'
+        else
+          out="$(format_session_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
+        fi
         ;;
       weekly)
         resets_at="$CACHE_WEEKLY_RESETS"
@@ -2039,6 +2050,15 @@ refresh_cache() {
   weekly_text="${weekly_used}%${weekly_pace}"
   session_color="$(color_for_window "$session_used" "$session_window_minutes" "$session_resets_at" "$updated_at")"
   weekly_color="$(color_for_window "$weekly_used"  "$weekly_window_minutes"  "$weekly_resets_at"  "$updated_at")"
+
+  # Between 5-hour windows the endpoint reports utilization 0 with a null
+  # resets_at — there is no window, so pacing is undefined and the reset time is
+  # unknown. Say "idle" in gray instead of a bare green "0%", which is
+  # indistinguishable from a live-but-unpaced reading or a stalled fetch.
+  if [[ -z "$session_resets_at" ]] && (( session_used == 0 )); then
+    session_text='idle'
+    session_color='brightblack'
+  fi
 
   local tmp
   tmp="$(mktemp "${CACHE_DIR}/usage.json.tmp.XXXXXX")"

@@ -38,11 +38,12 @@ fi
 
 color_to_hex() {
   case "$1" in
-    green)  printf '%s' "$GREEN" ;;
-    yellow) printf '%s' "$YELLOW" ;;
-    red)    printf '%s' "$RED" ;;
-    \#*)    printf '%s' "$1" ;;
-    *)      printf '%s' "$GRAY" ;;
+    green)      printf '%s' "$GREEN" ;;
+    yellow)     printf '%s' "$YELLOW" ;;
+    red)        printf '%s' "$RED" ;;
+    brightblack) printf '%s' "$GRAY" ;;
+    \#*)        printf '%s' "$1" ;;
+    *)          printf '%s' "$GRAY" ;;
   esac
 }
 
@@ -192,10 +193,16 @@ state='missing'
 session_text='' weekly_text='' session_color='' weekly_color=''
 session_resets='' weekly_resets='' updated_at=0
 
+# Tab is IFS *whitespace*: `IFS=$'\t' read` collapses runs of tabs and drops
+# empty fields, shifting every later field left. session_resets_at is empty
+# whenever no 5-hour window is open, which slid weekly_resets_at into
+# session_resets and left updated_at blank (hence "No usage data yet" plus a
+# refresh attempt on every tick). Split on US (\037) instead so empty fields
+# survive; @tsv escapes any literal tab in a value, so the swap is lossless.
 if [[ -f "$CACHE_FILE" ]] && command -v jq >/dev/null 2>&1; then
-  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .updated_at//0] | @tsv' "$CACHE_FILE" 2>/dev/null || true)"
+  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .updated_at//0] | @tsv' "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   if [[ -n "$parsed" ]]; then
-    IFS=$'\t' read -r state session_text weekly_text session_color weekly_color session_resets weekly_resets updated_at <<<"$parsed"
+    IFS=$'\037' read -r state session_text weekly_text session_color weekly_color session_resets weekly_resets updated_at <<<"$parsed"
   fi
 fi
 
@@ -247,6 +254,9 @@ case "$state" in
     split_pace "$(strip_legacy_prefix "$weekly_text")"
     l2="W: $(printf '%4s' "${SPLIT_MAIN:---%}")"; p2="$SPLIT_PACE"
     m1="$TEXTC"; m2="$TEXTC"
+    # "idle" = no 5-hour window open (see codexbar-usage-status.sh). Dim the
+    # whole line so it doesn't read as a live measurement.
+    [[ "$l1" == 'S: idle' ]] && m1="$GRAY"
     c1="$(color_to_hex "$session_color")"
     c2="$(color_to_hex "$weekly_color")"
     ;;
@@ -408,12 +418,12 @@ emit_limit_rows_from_raw() {
       .severity // "normal",
       .resets_at // "",
       (.scope.model.display_name // "")
-    ] | @tsv' "$RAW_FILE" 2>/dev/null || true)"
+    ] | @tsv' "$RAW_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   [[ -n "$rows" ]] || return 0
 
   local kind pct severity resets_iso scope_name label epoch reset_label color line
   local window_minutes pace pace_part runout runout_part runout_clock
-  while IFS=$'\t' read -r kind pct severity resets_iso scope_name; do
+  while IFS=$'\037' read -r kind pct severity resets_iso scope_name; do
     [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
     case "$kind" in
       session)       label='Session' ;;
@@ -449,10 +459,18 @@ emit_limit_rows_from_raw() {
       fi
     fi
 
-    color="$(limit_row_color "$pct" "$severity" "$pace")"
-    line="$(printf '%-8.8s %s %3d%%%s%s · resets %s' \
-      "$label" "$(usage_bar "$pct")" "$pct" "$pace_part" "$runout_part" "$reset_label")"
-    printf '%s | %s color=%s trim=false\n' "$line" "$MONO_FONT" "$color"
+    if [[ -z "$epoch" ]]; then
+      # No resets_at means the window isn't open (the endpoint nulls it between
+      # 5-hour sessions). Pacing, run-out and reset time are all undefined —
+      # label that plainly instead of showing a green "0% · resets --".
+      line="$(printf '%-8.8s %s %3d%% · no active window' "$label" "$(usage_bar "$pct")" "$pct")"
+      printf '%s | %s color=%s trim=false\n' "$line" "$MONO_FONT" "$GRAY"
+    else
+      color="$(limit_row_color "$pct" "$severity" "$pace")"
+      line="$(printf '%-8.8s %s %3d%%%s%s · resets %s' \
+        "$label" "$(usage_bar "$pct")" "$pct" "$pace_part" "$runout_part" "$reset_label")"
+      printf '%s | %s color=%s trim=false\n' "$line" "$MONO_FONT" "$color"
+    fi
     LIMIT_ROWS_EMITTED=$(( LIMIT_ROWS_EMITTED + 1 ))
   done <<<"$rows"
 }
