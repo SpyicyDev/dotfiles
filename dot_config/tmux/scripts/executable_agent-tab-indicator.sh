@@ -3,7 +3,11 @@
 # lifecycle hooks so the Catppuccin tab bar reflects agent state.
 #
 # Options written (window scope; unset = no agent in window):
-#   @agent_state    idle | running | needs-input | done
+#   @agent_state    idle | running | needs-approval | needs-input | done
+#                   (the two needs-* states share every behavior — they differ
+#                   only in tint: red = blocked on your approval, yellow =
+#                   blocked on your answer. Match them with a needs-* glob,
+#                   never by listing one of them.)
 #   @agent_summary  "<project>/<ultra-short title>" shown as the tab name;
 #                   project = basename of the agent's cwd, title = the
 #                   conversation title condensed to its 2-4 identifying
@@ -47,9 +51,17 @@
 #                                      idle/done, so a late tool call can't
 #                                      resurrect a finished tab; skips stdin
 #                                      entirely — payloads can be huge
-#   needs-input  PermissionRequest / Notification(permission_prompt) /
-#                StopFailure         → attention; always asserted (focus ≠
-#                                      answer), discharged by the focus hook
+#   needs-approval  PermissionRequest → blocked on a permission decision (red)
+#   needs-input  Notification(permission_prompt) / StopFailure
+#                                    → blocked on an answer (yellow). Both
+#                                      attention states are always asserted
+#                                      (focus ≠ answer) and are discharged by
+#                                      the focus hook. needs-input never
+#                                      downgrades a standing needs-approval:
+#                                      Claude fires PermissionRequest AND a
+#                                      Notification for the same gate, and
+#                                      whichever lands second would otherwise
+#                                      decide the color.
 #   done         Stop                → turn finished; refresh @agent_summary;
 #                                      not tinted if a client is watching it
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
@@ -374,7 +386,7 @@ if [ "$mode" = "clear-current" ]; then
     fi
     [ -n "$win" ] || exit 0
     case "$(window_state "$win")" in
-        needs-input)
+        needs-*)
             # The user came to answer the prompt. Discharge the tint, but
             # stamp @agent_pending so the next heartbeat can restore
             # `running` once the answered turn resumes — the discharge
@@ -489,7 +501,7 @@ fi
 if [ "$mode" = "heartbeat" ]; then
     ( cat >/dev/null 2>&1 & ) 2>/dev/null
     case "$(window_state "$win")" in
-        running|needs-input) set_state "$win" running ;;
+        running|needs-*) set_state "$win" running ;;
         idle)
             # idle + @agent_pending = an answered permission prompt's turn
             # resuming (see clear-current). Single-use and age-gated, so a
@@ -557,10 +569,16 @@ case "$mode" in
         clear_pending "$win"
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
-    needs-input)
+    needs-approval)
         # Always assert — focusing a window is not answering its prompt. The
-        # focus hook (clear-current) discharges needs-input→idle once seen, so
+        # focus hook (clear-current) discharges needs-*→idle once seen, so
         # a prompt is never silently lost by switching away.
+        set_state "$win" needs-approval
+        ;;
+    needs-input)
+        # Same, except a permission gate already showing red outranks the
+        # generic notification that accompanies it (see header).
+        [ "$(window_state "$win")" = needs-approval ] && exit 0
         set_state "$win" needs-input
         ;;
     done)
@@ -583,7 +601,7 @@ case "$mode" in
         clear_state "$win"
         ;;
     *)
-        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-input|done|clear|clear-current> [claude|codex]" >&2
+        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|needs-input|done|clear|clear-current> [claude|codex]" >&2
         exit 1
         ;;
 esac

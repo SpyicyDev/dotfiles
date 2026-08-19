@@ -25,10 +25,19 @@
 # @agent_workflow flag the formats render as a distinct blinking gear.
 # (Workflows are a Claude feature; codex windows are never checked.)
 #
+# It also flags COMPUTER USE. cua-mcp-shim stamps every driver tool call into
+# ~/.local/share/cua-notch/activity.json with the owning agent's pid, which is
+# the same pane→pid map the workflow lookup already builds — so a window whose
+# agent has driven an app within CUA_LIVE seconds gets a per-window @agent_cua
+# flag, rendered as a blue robot. This is the tab-bar twin of CuaNotch's blue
+# glow segment: same source of truth, same meaning, same hue.
+#
 # It also drives the running-state animation: while ANY window is in state
-# running OR has @agent_workflow set, the global @agent_blink option toggles
-# each tick and the window formats alternate the glyph between two colors off
-# it. Nothing running → no toggling, no redraws.
+# running OR has @agent_workflow / @agent_cua set, the global @agent_blink
+# option toggles each tick and the window formats alternate the glyph between
+# its color and a dimmed copy of THE SAME hue (a brightness pulse, matching
+# CuaNotch's breathing glow — never a hue swap, which would make a state look
+# like a different state). Nothing running → no toggling, no redraws.
 #
 # Process matching is by `ps -o comm` basename — NOT #{pane_current_command}:
 # tmux reads the kernel p_comm, which for Claude Code is the version-named
@@ -127,6 +136,28 @@ session_has_running_workflow() {
     return 1
 }
 
+# Agent pids that have driven an app within CUA_LIVE seconds, space-delimited
+# (" 123 456 "). Mirrors CuaNotch's own liveWindow so the tab and the notch
+# light up and go dark together. Missing/garbage file → empty (never fatal).
+ACTIVITY="$HOME/.local/share/cua-notch/activity.json"
+CUA_LIVE=15
+live_cua_pids() {
+    [ -f "$ACTIVITY" ] || { printf ' '; return 0; }
+    /usr/bin/python3 - "$ACTIVITY" "$CUA_LIVE" <<'PY' 2>/dev/null || printf ' '
+import json, sys, time
+try:
+    with open(sys.argv[1]) as f:
+        sessions = json.load(f).get("sessions", {}) or {}
+except Exception:
+    print(" "); raise SystemExit(0)
+now, live = time.time(), float(sys.argv[2])
+pids = {int(d["agent_pid"]) for d in sessions.values()
+        if isinstance(d, dict) and d.get("agent_pid")
+        and now - float(d.get("ts") or 0) < live}
+print(" " + " ".join(str(p) for p in sorted(pids)) + " ")
+PY
+}
+
 # A failed tmux command is NOT proof the server died — it can also be a
 # transient hiccup (server mid-reload, EINTR, fd pressure). Exiting on the
 # first one is how the daemon silently disappears after days of uptime, taking
@@ -212,8 +243,18 @@ EOF
 $(tmux list-windows -a -F '#{window_id} #{@agent_workflow}' 2>/dev/null)
 EOF
 
+    # Same, for @agent_cua, plus this tick's live driver pids (one read).
+    cua_now=" "
+    while IFS=' ' read -r win rest; do
+        [ -n "$win" ] && [ -n "$rest" ] && cua_now="${cua_now}${win} "
+    done <<EOF
+$(tmux list-windows -a -F '#{window_id} #{@agent_cua}' 2>/dev/null)
+EOF
+    cua_pids=$(live_cua_pids)
+
     changed=0
     any_workflow=0
+    any_cua=0
     while IFS=' ' read -r win state; do
         [ -n "$win" ] || continue
         case "$present" in
@@ -228,9 +269,15 @@ EOF
             *" ${win} "*) had_wf=1 ;;
             *) had_wf=0 ;;
         esac
+        case "$cua_now" in
+            *" ${win} "*) had_cua=1 ;;
+            *) had_cua=0 ;;
+        esac
 
-        # Background-workflow detection (claude only; needs a live agent).
+        # Background-workflow + computer-use detection (both need a live agent
+        # and share the one pane→pid lookup; workflows are claude-only).
         wf=0
+        cua=0
         if [ "$has_agent" = 1 ]; then
             pid=""
             for kv in $win_pid; do
@@ -239,6 +286,14 @@ EOF
             if [ -n "$pid" ] && session_has_running_workflow "$pid"; then
                 wf=1; any_workflow=1
             fi
+            case "$cua_pids" in
+                *" ${pid} "*) [ -n "$pid" ] && { cua=1; any_cua=1; } ;;
+            esac
+        fi
+        if [ "$cua" = 1 ] && [ "$had_cua" = 0 ]; then
+            tmux set-option -w -t "$win" @agent_cua 1 2>/dev/null && changed=1
+        elif [ "$cua" = 0 ] && [ "$had_cua" = 1 ]; then
+            tmux set-option -uw -t "$win" @agent_cua 2>/dev/null && changed=1
         fi
         if [ "$wf" = 1 ] && [ "$had_wf" = 0 ]; then
             tmux set-option -w -t "$win" @agent_workflow 1 2>/dev/null && changed=1
@@ -252,6 +307,7 @@ EOF
             tmux set-option -uw -t "$win" @agent_state 2>/dev/null
             tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
             tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
+            tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
             changed=1
         fi
     done <<EOF
@@ -263,6 +319,7 @@ EOF
     blink_active=0
     case "$states" in *" running"*) blink_active=1 ;; esac
     [ "$any_workflow" = 1 ] && blink_active=1
+    [ "$any_cua" = 1 ] && blink_active=1
     if [ "$blink_active" = 1 ]; then
         if [ "$(tmux show-options -gqv @agent_blink 2>/dev/null)" = "1" ]; then
             tmux set-option -g @agent_blink 0 2>/dev/null
