@@ -11,6 +11,10 @@
 #                   (interim: the raw title until the condensation lands)
 #   @agent_summary_cond  1 while @agent_summary holds a condensed label, unset
 #                   while it holds raw stand-in text — see compose_summary
+#   @agent_pending  epoch stamp: a needs-input window the user focused (went
+#                   to answer its prompt). The next heartbeat consumes it to
+#                   restore `running` when the answered turn resumes; every
+#                   other lifecycle mode clears it so it can't go stale.
 #
 # Rendering happens entirely in tmux.conf: the Catppuccin window formats
 # read these options via #{?…} conditionals (background tint per state,
@@ -36,11 +40,13 @@
 #                                      restarts); a fresh session with no title
 #                                      yet shows "<project>/New Session"
 #   running      UserPromptSubmit    → turn started; refresh @agent_summary
-#   heartbeat    PostToolUse         → re-arm running mid-turn (after an answered
-#                                      permission prompt), but ONLY from
-#                                      running/needs-input so a late tool call
-#                                      can't resurrect a finished tab; skips
-#                                      stdin entirely — payloads can be huge
+#   heartbeat    PostToolUse         → re-arm running mid-turn: from
+#                                      running/needs-input, or from idle when
+#                                      @agent_pending marks an answered
+#                                      permission prompt — never from bare
+#                                      idle/done, so a late tool call can't
+#                                      resurrect a finished tab; skips stdin
+#                                      entirely — payloads can be huge
 #   needs-input  PermissionRequest / Notification(permission_prompt) /
 #                StopFailure         → attention; always asserted (focus ≠
 #                                      answer), discharged by the focus hook
@@ -48,11 +54,18 @@
 #                                      not tinted if a client is watching it
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
 #                                      which are followed by a new SessionStart)
-#   clear-current  focus hook        → attention states → idle once seen
+#   clear-current  focus hook        → attention states → idle once seen;
+#                                      needs-input also stamps @agent_pending
 #
 # "Seen-it" semantics: a tinted tab discharges to idle when you focus it
 # (clear-current); `done` additionally isn't tinted if its window is already
 # being watched. needs-input always tints so a prompt is never lost.
+# Answering a permission prompt usually REQUIRES focusing the window, and the
+# focus discharge destroys needs-input before any heartbeat can re-arm from
+# it — so heartbeat's needs-input path alone left the tab idle for the rest
+# of the turn (user-reported desync). The @agent_pending stamp bridges the
+# gap: focus-discharge of needs-input stamps it, the next heartbeat consumes
+# it and restores running.
 
 set -euo pipefail
 
@@ -111,9 +124,14 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_state 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_summary 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_pending 2>/dev/null || true
     if [ -n "$cur" ]; then
         tmux refresh-client -S 2>/dev/null || true
     fi
+}
+
+clear_pending() {
+    tmux set-option -uw -t "$1" @agent_pending 2>/dev/null || true
 }
 
 sanitize_summary() {
@@ -356,7 +374,16 @@ if [ "$mode" = "clear-current" ]; then
     fi
     [ -n "$win" ] || exit 0
     case "$(window_state "$win")" in
-        needs-input|done) set_state "$win" idle ;;
+        needs-input)
+            # The user came to answer the prompt. Discharge the tint, but
+            # stamp @agent_pending so the next heartbeat can restore
+            # `running` once the answered turn resumes — the discharge
+            # happens BEFORE any post-answer heartbeat, so heartbeat's own
+            # needs-input re-arm can never fire in this flow.
+            set_state "$win" idle
+            tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
+            ;;
+        done) set_state "$win" idle ;;
     esac
     exit 0
 fi
@@ -463,6 +490,20 @@ if [ "$mode" = "heartbeat" ]; then
     ( cat >/dev/null 2>&1 & ) 2>/dev/null
     case "$(window_state "$win")" in
         running|needs-input) set_state "$win" running ;;
+        idle)
+            # idle + @agent_pending = an answered permission prompt's turn
+            # resuming (see clear-current). Single-use and age-gated, so a
+            # stray late tool call can't resurrect a tab that merely sat
+            # idle; bare idle (no stamp) stays inert as before.
+            pend=$(tmux show-options -wqv -t "$win" @agent_pending 2>/dev/null || true)
+            if [ -n "$pend" ]; then
+                clear_pending "$win"
+                case "$pend" in *[!0-9]*) pend=0 ;; esac
+                if [ "$(( $(now_epoch) - pend ))" -lt 3600 ]; then
+                    set_state "$win" running
+                fi
+            fi
+            ;;
     esac
     exit 0
 fi
@@ -494,6 +535,7 @@ case "$mode" in
             [ "$src" = "compact" ] && exit 0
         fi
         set_state "$win" idle
+        clear_pending "$win"
         summary=$(extract_summary "$payload")
         if [ -n "$summary" ]; then
             compose_summary "$win" "$summary" "$payload"
@@ -512,6 +554,7 @@ case "$mode" in
         ;;
     running)
         set_state "$win" running
+        clear_pending "$win"
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     needs-input)
@@ -527,6 +570,7 @@ case "$mode" in
         else
             set_state "$win" "done"
         fi
+        clear_pending "$win"
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     clear)
