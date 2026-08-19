@@ -3,17 +3,37 @@
 Each tmux tab (window) reflects the state of the AI agent (Claude Code or
 Codex CLI) running inside it, rendered through the Catppuccin status bar:
 
-| State | Trigger | Tab appearance |
-|---|---|---|
-| *(none)* | no agent process in the window | stock Catppuccin tab |
-| `idle` | agent open, not working | mauve `󰚩` robot glyph, stock colors |
-| `running` | agent mid-turn | `󰚩` glyph blinking blue↔peach at 1 s (watcher toggles global `@agent_blink`), no bg change |
-| `needs-input` | permission prompt / turn failed | `●` glyph, yellow `#f9e2af` background |
-| `done` | turn finished | `●` glyph, green `#a6e3a1` background |
-| *background workflow* | a Claude Workflow still running after the turn ended | distinct `󰒓` gear glyph blinking teal↔mauve; green "done" tint suppressed to stock (it isn't really finished) |
-| any | agent has a conversation title | tab name = `project/short-title`, else `#W` |
+Each tab carries **three independent channels**:
 
-The workflow indicator is an orthogonal layer (`@agent_workflow`) over `@agent_state`, with glyph priority **needs-input > workflow > done > running > idle** — a blocked prompt still wins, but a finished-looking tab with a background workflow reads as still-working.
+| Channel | Surface | Says |
+|---|---|---|
+| **number chip** | `@catppuccin_window_*_color` | *motion* — is this window in flight? |
+| **tab body** | `@catppuccin_window_*_background` | *attention tier* — does it want you? |
+| **glyph slot** | `@catppuccin_window_*_text` | *the exception* — a job the chip can't describe |
+
+State by state (unselected tab):
+
+| State | Trigger | Chip | Body | Glyph |
+|---|---|---|---|---|
+| *(none)* | no agent process in the window | blue, solid | stock | — |
+| `idle` | agent open, not working | blue, solid | stock | — |
+| `running` | agent mid-turn | **mauve `#cba6f7` ↔ blue `#89b4fa`, 1 s** | stock | — |
+| `running` + cua | agent driving an app | **mauve ↔ blue** | stock | blue `󰍽` pulsing |
+| *background workflow* | a Claude Workflow still running after the turn ended | **mauve ↔ blue** | stock (green "done" tint suppressed — it isn't really finished) | teal `󰒓` pulsing |
+| `needs-input` | permission prompt / turn failed | crust (yellow digit) | yellow `#f9e2af` | — |
+| `needs-approval` | blocked on a permission decision | crust (red digit) | red `#f38ba8` | — |
+| `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
+| any | agent has a conversation title | — | — | tab name = `project/short-title`, else `#W` |
+
+**The selected tab never pulses**: solid peach `#fab387` for every ambient state (idle/running/cua/workflow). You are looking at it — the terminal itself is the progress indicator. Attention states still force the chip to crust even when selected, because the digit's fg *is* the bright body tint and needs a dark chip to read; focusing a prompt is not answering it.
+
+**Priorities.** Chip: attention (`needs-*`, `done`) beats motion — a permission prompt raised mid-workflow is a red tab with a *still* chip. `done` + workflow is untinted, so it pulses like any other in-flight window. Glyph: `󰒓` workflow > `󰍽` cua > nothing; on a tinted tab the glyph goes crust and stops pulsing (teal on yellow is unreadable, and a tab at maximum urgency doesn't need a second animation).
+
+There is deliberately **no "an agent lives here" marker** — the old mauve `󰚩` robot is gone, and so is the `●` that marked attention states (the body tint already says it, in three distinguishable hues; the same dot on all three added nothing but 2 cells). An idle agent tab is just a stock blue tab; presence stays legible from the tab *name*, which reads `project/short-title` for agent windows and `#W` (zsh, nvim…) for everything else.
+
+Blue is both catppuccin's resting chip accent and the computer-use hue. On the chip blue reads as "at rest", so the mauve↔blue pulse reads as working↔resting rather than as a third state — and computer use moves to the `󰍽` glyph. Glyphs still never blink between two hues (they'd read as another state mid-pulse); only the chip does, and only because its second hue means "nothing happening".
+
+Tabs are **not** width-stabilised: the glyph slot's 2 cells appear and vanish with the workflow/cua flags. Those flip once per workflow rather than once per turn, so reserving a blank on every agent window would pad the common case to pay for the rare one.
 
 **Seen-it semantics:** focusing a tinted tab discharges it to `idle`
 (`after-select-window` → `clear-current`). `done` additionally isn't tinted
@@ -152,9 +172,11 @@ tint is GC'd within ~1 s. Per-window state also means two agents in one
 window share a single state (last writer wins).
 
 **Liveness.** The daemon is the single point of failure for the blink, the
-workflow gear and the GC, and its death is silent — a frozen glyph color is
-the only tell (`@agent_blink` unset renders as the *second* color of each
-pair: peach for running, mauve for a workflow). Two guards: it no longer
+workflow gear and the GC, and its death is silent — a frozen pulse is the only
+tell, and it is now easy to *miss*: `@agent_blink` unset renders as the second
+color of each pair, and for the chip that is plain blue — i.e. a dead watcher
+makes every running tab look idle rather than looking broken. (A workflow gear
+freezes on dim teal.) Two guards: it no longer
 exits on the first failed tmux command (a transient failure is not a dead
 server — it tolerates a streak and quits only once `tmux list-sessions`
 confirms the server is gone), and `agent-tab-indicator.sh` re-asserts it on
@@ -194,8 +216,18 @@ expression, which would render a pastel digit on the blue/orange accent
 `@catppuccin_window_*_color` conditionals darken the accent to crust
 `#11111b` on attention states so the state-colored digit reads against it.
 
-The text options add the state glyph (mauve `󰚩` idle, blinking blue↔peach
-`󰚩` running, crust `●` on attention states), a readable fg on bright
+`@catppuccin_window_*_color` is also the number chip's *background*, which is
+what makes it the motion channel: `_default_color` resolves to
+`#{?#{@agent_blink},#cba6f7,#89b4fa}` whenever the window is in flight
+(`@agent_workflow` ‖ `@agent_cua` ‖ state `running`), and to plain `#89b4fa`
+otherwise. `_current_color` has no blink branch at all — that is the whole
+implementation of "the selected tab never pulses". Both keep the crust
+override on attention states, which is checked *first* so attention beats
+motion. Contrast holds on both phases: the unselected digit is surface0
+`#313244` on mauve (≈7:1) and on blue (≈6.5:1).
+
+The text options add the exception glyph (teal `󰒓` workflow, blue `󰍽` cua,
+nothing otherwise; crust and unpulsed on a tinted tab), a readable fg on bright
 backgrounds (crust `#11111b`), and the summary with `#W` fallback:
 `#{?#{n:#{@agent_summary}},#{@agent_summary},#W}`. The summary is
 pre-shortened by the indicator script, so there is no render-side
@@ -208,8 +240,9 @@ so stale summaries simply vanish.
 
 ## Troubleshooting
 
-- **Tab stuck in a state, or the glyph never blinks / the workflow gear never
-  appears** → the watcher is dead. All three symptoms have one cause; check
+- **Tab stuck in a state, running tabs never pulse (they just look idle) / the
+  workflow gear never appears** → the watcher is dead. All three symptoms have
+  one cause; check
   with `pgrep -lf agent-tab-watcher`. Any agent hook now respawns it
   automatically (see *Liveness* above); to force it, `tmux run-shell -b "bash
   ~/.config/tmux/scripts/agent-tab-watcher.sh"` or reload with `prefix r`.
