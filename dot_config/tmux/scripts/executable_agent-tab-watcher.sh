@@ -5,8 +5,8 @@
 #   1. presence with no events yet (agent just launched, or hooks untrusted —
 #      codex requires interactive trust approval for new hook entries), and
 #   2. cleanup when the agent dies without firing SessionEnd (SIGKILL,
-#      kill-pane SIGHUP, crash) — Claude's SessionEnd is best-effort and
-#      codex has no SessionEnd event at all.
+#      kill-pane SIGHUP, crash) — SessionEnd is best-effort for both agents
+#      (codex additionally clamps its SessionEnd hook timeout to 3s).
 #
 # Every POLL_SECONDS this daemon matches agent processes to tmux windows by
 # TTY and reconciles the per-window @agent_state option:
@@ -23,7 +23,8 @@
 # iff its runtime dir exists without that completion file. Per claude window we
 # map pane→pid→session (~/.claude/sessions/<pid>.json) and set a per-window
 # @agent_workflow flag the formats render as a distinct blinking gear.
-# (Workflows are a Claude feature; codex windows are never checked.)
+# (Workflows are a Claude feature; a codex pid has no ~/.claude/sessions
+# file, so codex windows fall through the lookup naturally.)
 #
 # It also flags COMPUTER USE. cua-mcp-shim stamps every driver tool call into
 # ~/.local/share/cua-notch/activity.json with the owning agent's pid, which is
@@ -176,8 +177,10 @@ while :; do
         continue
     fi
 
-    # One ps for all TTYs: agent TTYs, plus tty=pid for claude panes (workflow
-    # lookup needs the pid; codex panes are skipped — no workflows there).
+    # One ps for all TTYs: agent TTYs, plus tty=pid for every agent pane —
+    # claude pids feed the workflow lookup (codex pids simply miss in
+    # ~/.claude/sessions and fall through), and both kinds feed the
+    # computer-use pid match (@agent_cua), which is agent-agnostic.
     agent_ttys=" "
     tty_pid=" "
     while IFS=' ' read -r tty pid comm; do
@@ -185,7 +188,7 @@ while :; do
         if is_agent_comm "$comm"; then
             agent_ttys="${agent_ttys}${tty} "
             case "$(basename "$comm")" in
-                claude|[0-9]*) tty_pid="${tty_pid}${tty}=${pid} " ;;
+                claude|codex|[0-9]*) tty_pid="${tty_pid}${tty}=${pid} " ;;
             esac
         fi
     done <<EOF

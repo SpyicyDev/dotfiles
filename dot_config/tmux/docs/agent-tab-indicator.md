@@ -56,22 +56,35 @@ a finished tab stays `done`/green rather than escalating to yellow.
 **Codex** (`~/.codex/hooks.json` — native hooks; the legacy `notify` slot
 stays untouched for SkyComputerUseClient): `SessionStart` (matcher
 `startup|resume`) → `idle`, `UserPromptSubmit` → `running`, `PostToolUse` →
-`heartbeat`, `PermissionRequest` → `needs-input`, `Stop` → `done`. Codex has
-no SessionEnd; the watcher handles cleanup. **Codex requires interactive
-trust approval for new hook entries** — run `codex` and accept the "New
-hook — review required" prompt (or `/hooks` in the TUI). Until approved the
-hooks don't fire and codex windows only get watcher-driven `idle` presence.
-Codex also has no `Notification`/idle-prompt analog, so codex `needs-input`
-only appears when the approval policy actually surfaces a `PermissionRequest`
-(a fully-auto policy never shows the yellow tint).
+`heartbeat`, `PermissionRequest` → `needs-approval`, `Stop` → `done`,
+`SessionEnd` → `clear` (best-effort — codex clamps its SessionEnd hook
+timeout to 3s; the watcher still backstops cleanup). **Codex requires
+interactive trust approval for new or edited hook entries** — run `codex`
+and accept the "Hooks need review" prompt (or `/hooks` in the TUI). Until
+approved the hooks silently don't fire (even under `codex exec`) and codex
+windows only get watcher-driven `idle` presence. Codex 0.148 hook events:
+PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact,
+SessionStart, SessionEnd, UserPromptSubmit, SubagentStart, SubagentStop,
+Stop — no `Notification`/`StopFailure`, so codex `needs-input` never fires;
+its only blocked state is the red `needs-approval`.
 
 Subagent-context events (payload has `agent_id`) are ignored so a
-subagent's Stop can't flip the main agent's tab.
+subagent's Stop can't flip the main agent's tab. Codex background threads
+(subagents, review/guardian workers, the Memory Writing Agent) fire the
+same hooks from the same process — the script drops events whose
+`session_id` maps to a non-`user` `thread_source` in
+`~/.codex/state_5.sqlite`, plus any prompt opening with "You are a Memory
+Writing Agent" (codex 0.147's memory writer repainted tabs as "Memory
+Writing" through exactly that hole). Hooks that arrive with no `TMUX_PANE`
+are dropped outright — the old active-window fallback let pane-less codex
+contexts (ChatGPT-app threads) paint whatever tab the user was looking at.
 
 **Summary sources** (best first): Claude — last `ai-title` entry in the
 transcript tail (`transcript_path` from the payload), else `session_title`,
-else the submitted prompt; Codex — `thread_name` from
-`~/.codex/session_index.jsonl` keyed by `session_id`, else the prompt.
+else the submitted prompt; Codex — `threads.name` from
+`~/.codex/state_5.sqlite` keyed by `session_id` (0.148 stopped writing
+`session_index.jsonl`), else `threads.title` (the first user message,
+treated as interim), else the prompt.
 Sanitized (no `#`/`"`/`%`, one line, ≤60 chars). `extract_summary` tags its
 output `final\t<title>` (the agent's own conversation title) or
 `interim\t<title>` (the prompt, standing in until that title exists) — only

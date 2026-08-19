@@ -322,8 +322,9 @@ compose_summary() {
 # A tab is a safe delimiter: sanitize_summary maps tabs to spaces.
 #   claude: latest ai-title entry near the transcript tail (cheap: last 64KB),
 #           else session_title, else the prompt that started the turn.
-#   codex:  thread_name from ~/.codex/session_index.jsonl keyed by session_id,
-#           else the prompt.
+#   codex:  threads.name from ~/.codex/state_5.sqlite keyed by session_id
+#           (0.148 moved thread metadata off session_index.jsonl), else
+#           threads.title (first user message), else the prompt.
 extract_summary() {
     local payload="$1" title="" src="final"
     [ -n "$JQ" ] || return 0
@@ -347,11 +348,23 @@ extract_summary() {
             fi
             ;;
         codex)
-            local session_id index="$HOME/.codex/session_index.jsonl"
+            # codex ≥0.148 keeps thread metadata in sqlite (session_index.jsonl
+            # is no longer written): threads.name is the model-written thread
+            # title (lands after the first turn), threads.title is the first
+            # user message — a prompt-grade stand-in, so it condenses like one.
+            local session_id db="$HOME/.codex/state_5.sqlite"
             session_id=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
-            if [ -n "$session_id" ] && [ -f "$index" ]; then
-                title=$(grep -F "\"$session_id\"" "$index" | tail -1 \
-                    | "$JQ" -r '.thread_name // empty' 2>/dev/null || true)
+            case "$session_id" in *[!0-9a-fA-F-]*) session_id="" ;; esac
+            if [ -n "$session_id" ] && [ -f "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+                title=$(sqlite3 -readonly "$db" \
+                    "select coalesce(nullif(name,''),'') from threads where id='$session_id'" \
+                    2>/dev/null || true)
+                if [ -z "$title" ]; then
+                    title=$(sqlite3 -readonly "$db" \
+                        "select title from threads where id='$session_id'" \
+                        2>/dev/null || true)
+                    [ -n "$title" ] && src="interim"
+                fi
             fi
             if [ -z "$title" ]; then
                 title=$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null || true)
@@ -482,13 +495,14 @@ Title: $raw"
 fi
 
 # Everything below is an agent hook: resolve the agent's window from the
-# pane the hook inherited.
+# pane the hook inherited. No TMUX_PANE = the hook has no pane identity
+# (a ChatGPT-app codex thread, a background worker with a scrubbed env).
+# The old fallback resolved an untargeted display-message to the *currently
+# active* window, which painted a foreign agent's state and title onto
+# whatever tab the user happened to be looking at. No pane, no tab.
 pane="${TMUX_PANE:-}"
-if [ -n "$pane" ]; then
-    win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null || true)
-else
-    win=$(tmux display-message -p '#{window_id}' 2>/dev/null || true)
-fi
+[ -n "$pane" ] || exit 0
+win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null || true)
 [ -n "$win" ] || exit 0
 
 # Heartbeat is the hot path (every tool call): don't wait on stdin — the
@@ -527,6 +541,29 @@ payload=$(cat 2>/dev/null || true)
 if [ -n "$JQ" ] && [ -n "$payload" ]; then
     if [ -n "$("$JQ" -r '.agent_id // empty' <<<"$payload" 2>/dev/null || true)" ]; then
         exit 0
+    fi
+fi
+
+# Codex background threads (subagents, review/guardian workers, the Memory
+# Writing Agent) fire the same hooks as the interactive thread, from the same
+# process — same TMUX_PANE — under their own session_id. Under codex 0.147 the
+# memory writer's UserPromptSubmit repainted the user's tab title ("Memory
+# Writing"); 0.148 stopped hooking memory workers, but subagent threads remain.
+# Two guards: the thread registry marks non-user threads (thread_source), and
+# the memory writer's prompt opener is recognizable even before a row exists.
+# A session with no row yet is presumed interactive (rows land within the
+# first turn, and a wrong "interactive" guess only refreshes the tab early).
+if [ "$agent" = codex ] && [ -n "$JQ" ] && [ -n "$payload" ]; then
+    case "$("$JQ" -r '.prompt // empty' <<<"$payload" 2>/dev/null | head -c 40)" in
+        "You are a Memory Writing Agent"*) exit 0 ;;
+    esac
+    csid=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
+    case "$csid" in *[!0-9a-fA-F-]*) csid="" ;; esac
+    cdb="$HOME/.codex/state_5.sqlite"
+    if [ -n "$csid" ] && [ -f "$cdb" ] && command -v sqlite3 >/dev/null 2>&1; then
+        tsrc=$(sqlite3 -readonly "$cdb" \
+            "select coalesce(thread_source,'') from threads where id='$csid'" 2>/dev/null || true)
+        case "$tsrc" in ''|user) : ;; *) exit 0 ;; esac
     fi
 fi
 
