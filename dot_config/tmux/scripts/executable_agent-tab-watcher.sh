@@ -97,8 +97,12 @@ trap cleanup EXIT
 trap 'exit 0' INT TERM HUP
 
 is_agent_comm() {
-    local base
-    base="$(basename "$1")"
+    # ${1##*/}, not basename: this runs for every tty-owning process on every
+    # 1s tick (~60 fork+exec per tick, ~5M/day) — measured 109ms/tick vs
+    # 9.5ms for the builtin. ps `comm` is never "/" or a trailing-slash path,
+    # so the expansion is exactly equivalent here (and it doesn't choke on
+    # comm values like "-zsh", which basename parses as an option).
+    local base="${1##*/}"
     case "$base" in
         claude|codex) return 0 ;;
     esac
@@ -113,7 +117,7 @@ is_agent_comm() {
 # Runtime dir without its completion file = running (see header). Scoped to
 # the session's own project/<sid> dir so other panes' workflows don't leak in.
 session_has_running_workflow() {
-    local pid="$1" sf sid cwd proj base d wfid mt now
+    local pid="$1" sf sid cwd proj base d wfid mt sfb now
     [ -n "$pid" ] || return 1
     sf="$HOME/.claude/sessions/$pid.json"
     [ -f "$sf" ] || return 1
@@ -129,10 +133,17 @@ session_has_running_workflow() {
         [ -d "$d" ] || continue
         wfid=$(basename "$d")
         [ -f "$base/workflows/$wfid.json" ] && continue   # completion file → done
-        # Backstop against a crashed/stale runtime dir: the agent transcripts
-        # stream continuously while running, so a recent mtime means live.
+        # Backstop against a crashed/stale runtime dir. mtime is the only
+        # liveness signal, but transcripts go quiet during long stalls (API
+        # backoff, a tool with no timeout, a permission gate), so a 600s
+        # floor darkened the gear on workflows that were still running.
+        # Anchor to this session's own start instead: a dir older than the
+        # live session file belongs to a dead run, anything newer gets a
+        # generous hour before we call it stale.
         mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
-        [ -n "$mt" ] && [ $((now - mt)) -lt 600 ] && return 0
+        sfb=$(stat -f %B "$sf" 2>/dev/null || echo 0)
+        [ -n "$mt" ] && { [ "$mt" -ge "$sfb" ] || [ $((now - mt)) -lt 3600 ]; } \
+            && return 0
     done
     return 1
 }
@@ -144,6 +155,14 @@ ACTIVITY="$HOME/.local/share/cua-notch/activity.json"
 CUA_LIVE=15
 live_cua_pids() {
     [ -f "$ACTIVITY" ] || { printf ' '; return 0; }
+    # Cheap gate before starting an interpreter (~22ms, every second,
+    # forever): the shim rewrites this file on every driver call, so every
+    # session ts is <= its mtime — an untouched file cannot hold a live
+    # session, and the answer is the empty set without any python at all.
+    local _now _amt
+    printf -v _now '%(%s)T' -1
+    _amt=$(stat -f %m "$ACTIVITY" 2>/dev/null || echo 0)
+    [ $((_now - _amt)) -lt "$CUA_LIVE" ] || { printf ' '; return 0; }
     /usr/bin/python3 - "$ACTIVITY" "$CUA_LIVE" <<'PY' 2>/dev/null || printf ' '
 import json, sys, time
 try:
@@ -187,7 +206,7 @@ while :; do
         [ -n "$tty" ] && [ "$tty" != "??" ] || continue
         if is_agent_comm "$comm"; then
             agent_ttys="${agent_ttys}${tty} "
-            case "$(basename "$comm")" in
+            case "${comm##*/}" in
                 claude|codex|[0-9]*) tty_pid="${tty_pid}${tty}=${pid} " ;;
             esac
         fi

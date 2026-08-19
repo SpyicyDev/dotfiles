@@ -475,7 +475,12 @@ Title: $raw"
         fi
 
         if [ "$ok" = 1 ]; then
-            short=$(printf '%s' "$out" | grep -m1 . | sanitize_summary | cut -d' ' -f1-4)
+            # `|| true`: with set -e + pipefail, a completion that is empty or
+            # newlines-only makes grep -m1 exit 1 and kills the whole script
+            # here — before the negative cache entry below is written, so
+            # nothing throttles the next attempt and the condenser respawns
+            # in a loop (silently: the child is detached to /dev/null).
+            short=$(printf '%s' "$out" | grep -m1 . | sanitize_summary | cut -d' ' -f1-4 || true)
             short=$(fit_words "$short" 24)
             valid_short "$short" || short=""
         else
