@@ -183,7 +183,12 @@ session_has_running_workflow() {
 # (" 123 456 "). Mirrors CuaNotch's own liveWindow so the tab and the notch
 # light up and go dark together. Missing/garbage file → empty (never fatal).
 ACTIVITY="$HOME/.local/share/cua-notch/activity.json"
-CUA_LIVE=15
+# 60s, matching CuaNotch's liveWindow AND the shim's LOCK_TTL: a drive is in
+# progress for as long as the shim holds its window lock, and an agent that
+# thinks for 25s between two clicks is still driving. At 15 the tab glyph
+# dropped out and came back on every model turn while the notch stayed lit —
+# the two surfaces must light up and go dark together. Change both or neither.
+CUA_LIVE=60
 live_cua_pids() {
     [ -f "$ACTIVITY" ] || { printf ' '; return 0; }
     # Cheap gate before starting an interpreter (~22ms, every second,
