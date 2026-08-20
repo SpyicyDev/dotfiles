@@ -117,7 +117,7 @@ is_agent_comm() {
 # Runtime dir without its completion file = running (see header). Scoped to
 # the session's own project/<sid> dir so other panes' workflows don't leak in.
 session_has_running_workflow() {
-    local pid="$1" sf sid cwd proj base d wfid mt sfb now
+    local pid="$1" sf sid cwd proj base d wfid mt now
     [ -n "$pid" ] || return 1
     sf="$HOME/.claude/sessions/$pid.json"
     [ -f "$sf" ] || return 1
@@ -131,19 +131,25 @@ session_has_running_workflow() {
     now=$(date +%s 2>/dev/null || echo 0)
     for d in "$base"/subagents/workflows/wf_*/; do
         [ -d "$d" ] || continue
-        wfid=$(basename "$d")
+        # ${d%/} then ##*/, not basename: these paths are cwd-munged and
+        # start with a dash ("-Users-mackhaymond-..."), which basename would
+        # parse as options if the path were ever relative. Same family as
+        # the "-zsh" comm bug below.
+        wfid="${d%/}"; wfid="${wfid##*/}"
         [ -f "$base/workflows/$wfid.json" ] && continue   # completion file → done
         # Backstop against a crashed/stale runtime dir. mtime is the only
         # liveness signal, but transcripts go quiet during long stalls (API
-        # backoff, a tool with no timeout, a permission gate), so a 600s
-        # floor darkened the gear on workflows that were still running.
-        # Anchor to this session's own start instead: a dir older than the
-        # live session file belongs to a dead run, anything newer gets a
-        # generous hour before we call it stale.
+        # backoff, a tool with no timeout, a permission gate), so the old
+        # 600s floor darkened the gear on workflows that were still running
+        # (worst measured quiet gap on this machine: 394s). An hour gives
+        # 9x that margin and still SELF-HEALS: a plain age test, on purpose.
+        # Anchoring "live" to the session's own start instead would mean a
+        # dir created this session never expires, so one crashed run would
+        # pin the gear — and since done+workflow renders the tab untinted,
+        # that would suppress this window's green for the rest of the
+        # session. CuaNotch's runningWorkflows() must keep the same rule.
         mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
-        sfb=$(stat -f %B "$sf" 2>/dev/null || echo 0)
-        [ -n "$mt" ] && { [ "$mt" -ge "$sfb" ] || [ $((now - mt)) -lt 3600 ]; } \
-            && return 0
+        [ -n "$mt" ] && [ $((now - mt)) -lt 3600 ] && return 0
     done
     return 1
 }
