@@ -159,6 +159,43 @@ window_state() {
     tmux show-options -wqv -t "$1" @agent_state 2>/dev/null || true
 }
 
+# Tools that ASK rather than ACT.
+#
+# PermissionRequest is NOT only about permission: Claude Code routes
+# AskUserQuestion through the same structural event. Captured from a scratch
+# session driven into a question (2026-08-20):
+#   mode=needs-approval evt=PermissionRequest tool=AskUserQuestion
+# so every question painted the tab RED — user-reported. A question has no
+# side effect and carries no risk; it wants a choice, not consent. Spending
+# the loudest signal we have on the least urgent thing trains you to discount
+# red, so these route to needs-input (yellow) instead.
+#
+# KEEP THIS NAME IN SYNC with QUESTION_TOOLS in ~/.local/bin/cua-notch-agent-hook:
+# CuaNotch makes the identical distinction, and a future ask-shaped tool has to
+# be added on BOTH surfaces (the shared name is the grep handle). A tool absent
+# from the set defaults to red, which is the safe direction.
+QUESTION_TOOLS="askuserquestion"
+is_question_payload() {
+    local p="$1" tool msg norm
+    { [ -n "$JQ" ] && [ -n "$p" ]; } || return 1
+    tool=$("$JQ" -r '.tool_name // .tool // empty' <<<"$p" 2>/dev/null || true)
+    if [ -n "$tool" ]; then
+        norm=$(printf '%s' "$tool" | tr 'A-Z' 'a-z' | tr -d ' _-')
+        case " $QUESTION_TOOLS " in *" $norm "*) return 0 ;; esac
+        return 1
+    fi
+    # No structural tool name — a Notification. No question arrives that way
+    # today (verified), but the branch is gated anyway so a future one can't
+    # go red behind our backs. Compare with spacing stripped: Claude renders
+    # the tool into prose as "Ask User Question", so a literal match on the
+    # camel-case name would silently fail.
+    msg=$("$JQ" -r '.message // empty' <<<"$p" 2>/dev/null || true)
+    [ -n "$msg" ] || return 1
+    norm=$(printf '%s' "$msg" | tr 'A-Z' 'a-z' | tr -d ' _-')
+    case "$norm" in *askuserquestion*) return 0 ;; esac
+    return 1
+}
+
 set_state() {
     # Write + redraw only on change; heartbeat fires on every tool call and
     # must not churn the status line. Writes are best-effort: the window can
@@ -671,7 +708,17 @@ case "$mode" in
         # Always assert — focusing a window is not answering its prompt. The
         # focus hook (clear-current) discharges needs-*→idle once seen, so
         # a prompt is never silently lost by switching away.
-        set_state "$win" needs-approval
+        #
+        # ...unless the "permission request" is actually a QUESTION (see
+        # is_question_payload): that is a yellow ask, not a red one. It still
+        # loses to a standing gate — if both are somehow live, the one that
+        # wants consent outranks the one that wants an opinion.
+        if is_question_payload "$payload"; then
+            [ "$(window_state "$win")" = needs-approval ] && exit 0
+            set_state "$win" needs-input
+        else
+            set_state "$win" needs-approval
+        fi
         ;;
     needs-input)
         # Same, except a live permission gate (red) outranks a StopFailure

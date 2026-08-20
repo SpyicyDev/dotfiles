@@ -68,7 +68,7 @@ payload on stdin. Hook processes are children of the agent, so
 | `SessionStart` | `idle` (skips `source=compact` — fires mid-turn; a fresh session shows `project/New Session` until the first turn titles it) |
 | `UserPromptSubmit` | `running` |
 | `PostToolUse` | `heartbeat` (re-arms `running` *only* from `running`/`needs-input`, so a late tool call can't resurrect a finished tab; never reads stdin — `tool_response` can be huge) |
-| `PermissionRequest`, `Notification` (matcher `permission_prompt`) | `needs-approval` |
+| `PermissionRequest`, `Notification` (matcher `permission_prompt`) | `needs-approval` — **unless `tool_name` is a question tool, then `needs-input`** (see below) |
 | `StopFailure` | `needs-input` |
 | `Stop` | `done` |
 | `SessionEnd` | `clear` (skips reasons `clear`/`resume` — a new SessionStart follows) |
@@ -84,10 +84,37 @@ the "look over here" that Claude suppresses while the terminal is focused.
 They used to map to `needs-approval` and `needs-input` respectively, so one
 gate painted red or amber depending on which event landed first and on whether
 you happened to be looking at the window. A permission gate is unambiguously an
-approval, so both are red now. Yellow `needs-input` is left to `StopFailure` —
-the turn itself failed (529, overloaded) and wants a retry, which is a
-genuinely different ask. The downgrade guard stays: it now only covers a
-`StopFailure` landing on a live gate, but red must still win.
+approval, so both are red now. The downgrade guard stays: red must still win
+when two asks are somehow live at once.
+
+**But `PermissionRequest` is not only about permission** (fixed 2026-08-20,
+user-reported: a tab went red "when it asked a question"). Claude Code routes
+**`AskUserQuestion`** through the same structural event — captured from a
+scratch session driven into a question:
+
+```
+mode=needs-approval  evt=PermissionRequest  tool=AskUserQuestion
+```
+
+So the previous day's rule was right about the *events* and wrong about the
+*tool*. `tool_name` is what separates "approve this action" from "answer this
+question": a question has no side effect and carries no risk, it wants a
+choice. Painting it red spends the loudest signal on the least urgent thing,
+which teaches you to discount red. `is_question_payload` routes
+`AskUserQuestion` to yellow `needs-input`; everything else stays red, and a
+question still loses to a standing gate.
+
+Yellow therefore means two things now — *the turn failed, retry* (`StopFailure`)
+and *answer a question* — united by "wants your words, not your consent".
+
+`QUESTION_TOOLS` is deliberately the same identifier used in
+`~/.local/bin/cua-notch-agent-hook`, which makes the identical distinction: it
+is the grep handle tying the two surfaces together, and a future ask-shaped
+tool must be added to **both**. A tool absent from the set defaults to red,
+which is the safe direction. The Notification branch is gated the same way even
+though no question arrives that way today — matching on the message with
+spacing stripped, since Claude renders the tool into prose as "Ask User
+Question" and a literal camel-case match would silently fail.
 
 **Codex** (`~/.codex/hooks.json` — native hooks; the legacy `notify` slot
 stays untouched for SkyComputerUseClient): `SessionStart` (matcher
