@@ -51,6 +51,7 @@ Two per-window tmux user options are the single source of truth:
 - `@agent_state` — `idle | running | needs-input | done` (unset = no agent)
 - `@agent_summary` — short conversation title
 - `@agent_workflow` — `1` while a background Claude Workflow is in flight (else unset); set by the watcher, orthogonal to `@agent_state`
+- `@agent_rollout` — codex only: the thread's rollout path, stashed by the indicator so the watcher can tell a live turn from an interrupted one
 
 Three components maintain and render them:
 
@@ -209,9 +210,27 @@ that Claude Code maintains itself. A `running` window whose session reads
   *whole* turn, because `heartbeat` re-arms `running` only from
   `running`/`needs-input` — never from bare `idle` — so nothing would put it
   back. 3 s of latency on a tab that used to stay stuck indefinitely.
-- **Claude only.** A codex pid has no `~/.claude/sessions` file, so codex
-  windows read as unknown and are left alone; unknown status values are
-  deliberately no-ops too. Known
+- **Codex too, by a different route** (added 2026-08-20). Confirmed the same
+  bug there by experiment: interrupting a streaming codex turn left the tab at
+  `running` for 12 s+ while the pane read "Conversation interrupted" — codex
+  fires no hook on abort either. It has no `~/.claude/sessions` equivalent and
+  no pid→thread mapping the watcher could follow, so the signal comes from its
+  **rollout stream**, which records turn boundaries explicitly: `task_started`
+  opens a turn, `task_complete` closes it, and an interrupt writes
+  `turn_aborted` (51/41/8 across the on-disk corpus). Live iff the most recent
+  of the three is `task_started`. `agent-tab-indicator.sh` stashes the thread's
+  `rollout_path` in `@agent_rollout` — it already reads that row on every codex
+  hook to check `thread_source`, so the path costs one extra column — and the
+  watcher tails **256 KB** of it, never the whole file (rollouts reach 27 MB
+  here; p90 791 KB). Unknown status values and a missing/unset path are
+  deliberate no-ops.
+- **The last-marker scan is `awk`, not bash string ops.** The obvious
+  `${chunk##*"$marker"}` idiom for finding a last occurrence is O(n²) on a
+  256 KB string and hung the function outright on the first large rollout it
+  met. One linear pass instead: 13 ms on a 6.4 MB file.
+- **Cost.** The tail read happens only for a codex window *already* showing
+  `running`, so a long live turn pays one read per tick until it ends — the
+  price of having no status file to poll. Claude's path stays fork-free. Known
 limitation: a one-shot `claude -p` exits right after `Stop`, so its `done`
 tint is GC'd within ~1 s. Per-window state also means two agents in one
 window share a single state (last writer wins).

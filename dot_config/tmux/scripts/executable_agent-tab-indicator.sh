@@ -179,6 +179,7 @@ clear_state() {
     tmux set-option -uw -t "$win" @agent_summary 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_pending 2>/dev/null || true
+    tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null || true
     if [ -n "$cur" ]; then
         tmux refresh-client -S 2>/dev/null || true
     fi
@@ -608,9 +609,22 @@ if [ "$agent" = codex ] && [ -n "$JQ" ] && [ -n "$payload" ]; then
     case "$csid" in *[!0-9a-fA-F-]*) csid="" ;; esac
     cdb="$HOME/.codex/state_5.sqlite"
     if [ -n "$csid" ] && [ -f "$cdb" ] && command -v sqlite3 >/dev/null 2>&1; then
-        tsrc=$(sqlite3 -readonly "$cdb" \
-            "select coalesce(thread_source,'') from threads where id='$csid'" 2>/dev/null || true)
+        # Same one query also yields rollout_path, which the WATCHER needs to
+        # tell a live codex turn from an interrupted one (codex fires no hook
+        # on abort either, so `running` sticks exactly as it did for claude).
+        # Claude publishes a status field in ~/.claude/sessions/<pid>.json;
+        # codex has no such file and no pid→thread mapping the watcher could
+        # follow, so the hook — which knows session_id — stashes the path here
+        # for it. Tab-separated: rollout paths contain no tabs.
+        crow=$(sqlite3 -readonly -separator "$(printf '\t')" "$cdb" \
+            "select coalesce(thread_source,''),coalesce(rollout_path,'') from threads where id='$csid'" \
+            2>/dev/null || true)
+        tsrc="${crow%%	*}"
+        croll="${crow#*	}"
         case "$tsrc" in ''|user) : ;; *) exit 0 ;; esac
+        if [ -n "$croll" ] && [ "$croll" != "$crow" ]; then
+            tmux set-option -w -t "$win" @agent_rollout "$croll" 2>/dev/null || true
+        fi
     fi
 fi
 

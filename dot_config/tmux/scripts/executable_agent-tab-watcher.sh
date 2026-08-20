@@ -153,6 +153,39 @@ session_status() {
     [[ $raw =~ \"status\":\"([^\"]+)\" ]] && printf '%s' "${BASH_REMATCH[1]}"
 }
 
+# Codex's answer to the same question, from its rollout stream: "busy" | "idle"
+# | "" (unknown). Codex has no ~/.claude/sessions equivalent and no pid→thread
+# mapping we could follow, so agent-tab-indicator.sh stashes the thread's
+# rollout_path in @agent_rollout (it already queries that row on every codex
+# hook) and this reads the tail of it.
+#
+# The stream records turn boundaries explicitly: event_msg task_started opens a
+# turn, task_complete closes it, and an INTERRUPT writes turn_aborted (verified
+# against the on-disk corpus: 51 starts, 41 completes, 8 aborts). So the turn is
+# live iff the most recent of the three is task_started — real state, not an
+# inference from how recently the file was touched.
+#
+# Bounded tail, never the whole file: rollouts run to 27MB here (p90 791KB).
+# If no marker falls in the tail the answer is "" and the caller does nothing,
+# which is the same conservative failure as not looking at all.
+#
+# awk, NOT bash string ops. The obvious `${chunk##*"$marker"}` trick to find a
+# last occurrence is O(n^2) on a 256KB string — it hung this function outright
+# on the first large rollout it met. One linear pass instead; records are
+# JSONL, one event per line, so the last line carrying any of the three
+# markers decides. A truncated first line from the byte-oriented tail is
+# harmless.
+CODEX_TAIL_BYTES=262144
+codex_status() {
+    local rp="$1"
+    [ -n "$rp" ] && [ -f "$rp" ] || return 0
+    tail -c "$CODEX_TAIL_BYTES" "$rp" 2>/dev/null | awk '
+        /"type":"task_started"/                        { last = "busy" }
+        /"type":"task_complete"/ || /"type":"turn_aborted"/ { last = "idle" }
+        END { printf "%s", last }
+    '
+}
+
 # True if the claude session owning PID has a background Workflow in flight.
 # Runtime dir without its completion file = running (see header). Scoped to
 # the session's own project/<sid> dir so other panes' workflows don't leak in.
@@ -342,6 +375,16 @@ $(tmux list-windows -a -F '#{window_id} #{@agent_cua}' 2>/dev/null)
 EOF
     cua_pids=$(live_cua_pids)
 
+    # win=<rollout path> for codex windows (see codex_status). Paths live under
+    # ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl and contain no
+    # spaces, so the flat "win=value" encoding used elsewhere holds.
+    roll_map=" "
+    while IFS=' ' read -r win rest; do
+        [ -n "$win" ] && [ -n "$rest" ] && roll_map="${roll_map}${win}=${rest} "
+    done <<EOF
+$(tmux list-windows -a -F '#{window_id} #{@agent_rollout}' 2>/dev/null)
+EOF
+
     changed=0
     any_workflow=0
     any_cua=0
@@ -409,8 +452,24 @@ EOF
         # back. Three consecutive idle ticks costs 3s of latency on a fix for
         # a tab that was previously stuck for the rest of the session, and
         # makes the race require three impossible coincidences in a row.
-        if [ "$state" = "running" ] && [ "$has_agent" = 1 ] && [ -n "$pid" ] \
-           && [ "$(session_status "$pid")" = "idle" ]; then
+        agent_idle=0
+        if [ "$state" = "running" ] && [ "$has_agent" = 1 ]; then
+            st=""
+            [ -n "$pid" ] && st=$(session_status "$pid")        # claude
+            if [ -z "$st" ]; then                               # codex
+                rp=""
+                for kv in $roll_map; do
+                    case "$kv" in "${win}="*) rp="${kv#*=}"; break ;; esac
+                done
+                # Only reached for a codex window ALREADY showing running, so
+                # the tail read is bounded to that case; a long live turn pays
+                # one read per tick until it ends, which is the price of having
+                # no status file to poll.
+                [ -n "$rp" ] && st=$(codex_status "$rp")
+            fi
+            [ "$st" = "idle" ] && agent_idle=1
+        fi
+        if [ "$agent_idle" = 1 ]; then
             n=0
             for kv in $idle_streak; do
                 case "$kv" in "${win}="*) n="${kv#*=}"; break ;; esac
@@ -431,6 +490,7 @@ EOF
             tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
             tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
             tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
+            tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null
             changed=1
         fi
     done <<EOF
