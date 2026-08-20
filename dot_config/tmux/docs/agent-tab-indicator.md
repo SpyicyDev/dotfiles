@@ -176,12 +176,42 @@ version-named and `#{pane_current_command}` reports that, so formats can't
 detect presence). Reconciles:
 
 - agent present, no state → seed `idle`
+- state `running` but the session says otherwise → back to `idle` (see below)
 - no agent, state **or** summary set → unset both options (covers SIGKILL,
   `kill-pane`, crashes — SessionEnd is best-effort and codex has none; the
   summary is read separately so an orphaned title written by a slow
   condenser after the agent died is still reaped)
 
-Hook-set states are never overridden while the agent lives. Known
+Hook-set states are never overridden while the agent lives, with one
+exception:
+
+**Stuck `running`** (fixed 2026-08-20, reported from the field: a tab pulsing
+for a session that wasn't doing anything, "when I hit esc a few times to
+interrupt"). **Interrupting a turn fires no hook at all** — there is no
+interrupt/abort event in the wired set, and Esc produces neither `Stop` nor
+`StopFailure` — so `@agent_state` stayed `running` and the tab pulsed until the
+*next* completed turn. The same stuck state arrives from a missed `Stop`, a
+hook that failed to run, or the deliberate `SessionStart(compact)` skip.
+
+Rather than hunt the cause, the watcher reconciles against ground truth:
+`~/.claude/sessions/<pid>.json` carries a **`status`** field (`busy` | `idle`)
+that Claude Code maintains itself. A `running` window whose session reads
+`idle` goes back to `idle`. Notes:
+
+- **Only `running`.** Attention states are "always asserted, discharged by
+  focus" by design, and a session sitting on an open permission gate *also*
+  reads `idle` — clearing those from here would silently drop live prompts,
+  which is the one thing this indicator must never do. Verified: `needs-approval`,
+  `needs-input` and `done` all survive on an idle session.
+- **Three consecutive idle ticks, not one.** At turn start the hook and
+  Claude's own status write race, so a single tick can legitimately see
+  `running` against a stale `idle`. Acting on that would clear the tab for the
+  *whole* turn, because `heartbeat` re-arms `running` only from
+  `running`/`needs-input` — never from bare `idle` — so nothing would put it
+  back. 3 s of latency on a tab that used to stay stuck indefinitely.
+- **Claude only.** A codex pid has no `~/.claude/sessions` file, so codex
+  windows read as unknown and are left alone; unknown status values are
+  deliberately no-ops too. Known
 limitation: a one-shot `claude -p` exits right after `Stop`, so its `done`
 tint is GC'd within ~1 s. Per-window state also means two agents in one
 window share a single state (last writer wins).

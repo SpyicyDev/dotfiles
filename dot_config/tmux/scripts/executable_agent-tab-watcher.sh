@@ -130,6 +130,29 @@ is_agent_comm() {
     [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
+# Claude Code's own view of whether the session is mid-turn, echoed as
+# "busy" | "idle" | "" (unknown/not a claude session).
+#
+# ~/.claude/sessions/<pid>.json carries a "status" field that Claude maintains
+# itself, and it is the only GROUND TRUTH here — every other signal we have is
+# an inference from hooks, and hooks only tell us about transitions they
+# actually fire. Interrupting a turn with Esc fires NOTHING: no Stop, no
+# StopFailure (there is no interrupt/abort event in the wired set at all), so
+# @agent_state sat at `running` and the tab pulsed for a session doing nothing
+# — reported from the field, reproduced with tab main:3 showing running while
+# its session file read idle for 156s. Same stuck state arrives from a missed
+# Stop, a hook that failed to run, or the deliberate SessionStart(compact)
+# skip, so reconciling against status fixes the whole class rather than one
+# cause. Builtin read, no fork; unknown values are left alone deliberately.
+session_status() {
+    local sf raw
+    [ -n "$1" ] || return 0
+    sf="$HOME/.claude/sessions/$1.json"
+    [ -f "$sf" ] || return 0
+    raw="$(<"$sf")"
+    [[ $raw =~ \"status\":\"([^\"]+)\" ]] && printf '%s' "${BASH_REMATCH[1]}"
+}
+
 # True if the claude session owning PID has a background Workflow in flight.
 # Runtime dir without its completion file = running (see header). Scoped to
 # the session's own project/<sid> dir so other panes' workflows don't leak in.
@@ -228,6 +251,10 @@ FAIL_LIMIT=5
 fail_streak=0
 server_gone() { ! tmux list-sessions >/dev/null 2>&1; }
 
+# Consecutive-idle counters for the stuck-`running` reconcile, carried across
+# ticks as " @win=N @win=N " (see the hysteresis note in the loop).
+idle_streak=" "
+
 while :; do
     # window_id<space>pane_tty for every pane.
     if ! panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null); then
@@ -318,6 +345,9 @@ EOF
     changed=0
     any_workflow=0
     any_cua=0
+    # Rebuilt each tick; a window that stops reading idle drops out, so the
+    # streak only ever counts CONSECUTIVE observations.
+    idle_streak_next=" "
     while IFS=' ' read -r win state; do
         [ -n "$win" ] || continue
         case "$present" in
@@ -364,6 +394,36 @@ EOF
             tmux set-option -uw -t "$win" @agent_workflow 2>/dev/null && changed=1
         fi
 
+        # Un-stick a `running` tab whose session says it is idle (see
+        # session_status). ONLY `running` is reconciled: the attention states
+        # are "always asserted, discharged by focus" on purpose, and a session
+        # sitting on an open permission gate also reads idle — clearing those
+        # from here would silently drop live prompts, the one thing this
+        # indicator must never do.
+        #
+        # HYSTERESIS, not a single reading. At turn start the hook and Claude's
+        # own status write race, so one tick can legitimately see
+        # state=running with a stale idle status. Acting on that would clear
+        # the tab for the WHOLE turn — heartbeat re-arms running only from
+        # running/needs-input, never from bare idle, so nothing would put it
+        # back. Three consecutive idle ticks costs 3s of latency on a fix for
+        # a tab that was previously stuck for the rest of the session, and
+        # makes the race require three impossible coincidences in a row.
+        if [ "$state" = "running" ] && [ "$has_agent" = 1 ] && [ -n "$pid" ] \
+           && [ "$(session_status "$pid")" = "idle" ]; then
+            n=0
+            for kv in $idle_streak; do
+                case "$kv" in "${win}="*) n="${kv#*=}"; break ;; esac
+            done
+            n=$((n + 1))
+            if [ "$n" -ge 3 ]; then
+                tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+                state=idle
+            else
+                idle_streak_next="${idle_streak_next}${win}=${n} "
+            fi
+        fi
+
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
         elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ]; }; then
@@ -376,6 +436,8 @@ EOF
     done <<EOF
 $states
 EOF
+
+    idle_streak="$idle_streak_next"
 
     # Blink driver: toggle while anything is running or has a workflow in
     # flight; redraw covers both the toggle and any reconcile changes above.
