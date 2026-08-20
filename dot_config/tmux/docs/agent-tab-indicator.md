@@ -355,6 +355,18 @@ CuaNotch's `runningWorkflows()` carries the identical rule — **this is one of
 two places**, alongside `session_has_running_workflow`; change them together or
 the tab and the notch disagree about the same workflow.
 
+> **Copy across surfaces, point within one.** A rule the tab bar and CuaNotch
+> both enforce is stated *in full on both sides*, on purpose: whoever edits
+> CuaNotch.swift's color block needs the rule in front of them, not a pointer
+> into another repo they won't open. What keeps those copies honest is the
+> marker — every one says "this is one of two places, change both" and names
+> its twin. Don't "fix" that duplication by collapsing it to a pointer.
+> Duplication *within* one document is the opposite case: collapse it. The
+> approval-routing rule rotted in two spots (2026-08-20) precisely because
+> those restatements were incidental — a wiring bullet that happened to mention
+> the mapping — with no marker and no owner. Marked copies across surfaces have
+> not rotted; unmarked copies inside one file did.
+
 One divergence is inherent and not a staleness-rule regression: the tab reaches
 a session only through `~/.claude/sessions/<pid>.json` (pane → pid → sid/cwd),
 so if that file is missing or lacks `sessionId`/`cwd` — pty wrapper, pid churn
