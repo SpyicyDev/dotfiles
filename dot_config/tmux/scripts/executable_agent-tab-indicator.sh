@@ -51,17 +51,29 @@
 #                                      idle/done, so a late tool call can't
 #                                      resurrect a finished tab; skips stdin
 #                                      entirely — payloads can be huge
-#   needs-approval  PermissionRequest → blocked on a permission decision (red)
-#   needs-input  Notification(permission_prompt) / StopFailure
-#                                    → blocked on an answer (yellow). Both
-#                                      attention states are always asserted
-#                                      (focus ≠ answer) and are discharged by
-#                                      the focus hook. needs-input never
-#                                      downgrades a standing needs-approval:
-#                                      Claude fires PermissionRequest AND a
-#                                      Notification for the same gate, and
-#                                      whichever lands second would otherwise
-#                                      decide the color.
+#   needs-approval  PermissionRequest, and Notification(permission_prompt)
+#                                    → blocked on a permission decision (red).
+#                                      BOTH events describe the SAME gate —
+#                                      PermissionRequest is the structural one
+#                                      (always fires, carries the tool name),
+#                                      the Notification is the "look over here"
+#                                      that Claude suppresses while the
+#                                      terminal is focused. They mapped to
+#                                      different colors until 2026-08-19, so
+#                                      one gate painted amber or red depending
+#                                      on which event landed (and on focus);
+#                                      a permission gate is unambiguously an
+#                                      approval, so both are red now.
+#   needs-input  StopFailure         → blocked on an answer (yellow): the turn
+#                                      itself failed (529, overloaded) and
+#                                      wants you to retry — NOT a tool gate.
+#                                      Both attention states are always
+#                                      asserted (focus ≠ answer) and are
+#                                      discharged by the focus hook.
+#                                      needs-input still never downgrades a
+#                                      standing needs-approval (the guard now
+#                                      only covers a StopFailure landing on a
+#                                      live gate, but red must still win).
 #   done         Stop                → turn finished; refresh @agent_summary;
 #                                      not tinted if a client is watching it
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
@@ -618,8 +630,8 @@ case "$mode" in
         set_state "$win" needs-approval
         ;;
     needs-input)
-        # Same, except a permission gate already showing red outranks the
-        # generic notification that accompanies it (see header).
+        # Same, except a live permission gate (red) outranks a StopFailure
+        # landing on top of it (see header).
         [ "$(window_state "$win")" = needs-approval ] && exit 0
         set_state "$win" needs-input
         ;;

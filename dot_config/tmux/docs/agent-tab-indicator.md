@@ -67,13 +67,26 @@ payload on stdin. Hook processes are children of the agent, so
 | `SessionStart` | `idle` (skips `source=compact` — fires mid-turn; a fresh session shows `project/New Session` until the first turn titles it) |
 | `UserPromptSubmit` | `running` |
 | `PostToolUse` | `heartbeat` (re-arms `running` *only* from `running`/`needs-input`, so a late tool call can't resurrect a finished tab; never reads stdin — `tool_response` can be huge) |
-| `PermissionRequest`, `Notification` (matcher `permission_prompt`), `StopFailure` | `needs-input` |
+| `PermissionRequest`, `Notification` (matcher `permission_prompt`) | `needs-approval` |
+| `StopFailure` | `needs-input` |
 | `Stop` | `done` |
 | `SessionEnd` | `clear` (skips reasons `clear`/`resume` — a new SessionStart follows) |
 
 Note: only `permission_prompt` notifications tint the tab — Claude's
 `idle_prompt` (fired after ~60 s of waiting) is deliberately *not* wired, so
 a finished tab stays `done`/green rather than escalating to yellow.
+
+**One gate, one color** (fixed 2026-08-19): `PermissionRequest` and
+`Notification`/`permission_prompt` describe the *same* permission gate —
+the first is structural (always fires, carries the tool name), the second is
+the "look over here" that Claude suppresses while the terminal is focused.
+They used to map to `needs-approval` and `needs-input` respectively, so one
+gate painted red or amber depending on which event landed first and on whether
+you happened to be looking at the window. A permission gate is unambiguously an
+approval, so both are red now. Yellow `needs-input` is left to `StopFailure` —
+the turn itself failed (529, overloaded) and wants a retry, which is a
+genuinely different ask. The downgrade guard stays: it now only covers a
+`StopFailure` landing on a live gate, but red must still win.
 
 **Codex** (`~/.codex/hooks.json` — native hooks; the legacy `notify` slot
 stays untouched for SkyComputerUseClient): `SessionStart` (matcher
@@ -223,6 +236,14 @@ two opposite failures:
 CuaNotch's `runningWorkflows()` carries the identical rule — **this is one of
 two places**, alongside `session_has_running_workflow`; change them together or
 the tab and the notch disagree about the same workflow.
+
+One divergence is inherent and not a staleness-rule regression: the tab reaches
+a session only through `~/.claude/sessions/<pid>.json` (pane → pid → sid/cwd),
+so if that file is missing or lacks `sessionId`/`cwd` — pty wrapper, pid churn
+— `session_has_running_workflow` returns "no workflow" and the tab goes
+gear-dark while the notch still shows teal (it takes sid and cwd straight from
+`agents.json` and never needs the pid mapping). Accepted: the tab has no other
+route from a pane to a session.
 
 ### 3. Rendering (`tmux.conf`, Catppuccin v0.2.0)
 
