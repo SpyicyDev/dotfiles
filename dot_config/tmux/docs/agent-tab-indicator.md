@@ -440,8 +440,18 @@ so stale summaries simply vanish.
 
 - **Tab stuck in a state, running tabs never pulse (they just look idle) / the
   workflow gear never appears** → the watcher is dead. All three symptoms have
-  one cause; check
-  with `pgrep -lf agent-tab-watcher`. Any agent hook now respawns it
+  one cause. Check the **pidfile**, not a process count:
+  `PF="${TMPDIR:-/tmp}/agent-tab-watcher.$(id -u).pid"; kill -0 "$(cat $PF)" &&
+  echo "heartbeat $(( $(date +%s) - $(stat -f %m $PF) ))s old"` — under ~2 s
+  means the loop is *turning*, not merely resident.
+  **Do not count `pgrep -f agent-tab-watcher` and conclude there are two
+  daemons.** A forked subshell inherits its parent's argv, so every command
+  substitution in the loop appears as an extra match while it runs — which
+  reads as a singleton failure that isn't one (caught doing exactly this on
+  2026-08-20: the "second daemon" had the first as its ppid and `ps` showed it
+  as a bare `(bash)`). Match count is *correlated* with daemon count, not equal
+  to it. If you must look at processes, discard any whose `ps -o ppid=` is the
+  watcher. Any agent hook now respawns it
   automatically (see *Liveness* above); to force it, `tmux run-shell -b "bash
   ~/.config/tmux/scripts/agent-tab-watcher.sh"` or reload with `prefix r`.
   Confirm it is driving the animation: `for i in 1 2 3 4; do tmux show -gv
