@@ -20,7 +20,7 @@ State by state (unselected tab):
 | `running` | agent mid-turn | **pink `#f5c2e7` ↔ blue `#89b4fa`, 1 s** | stock | — |
 | `running` + cua | agent driving an app | **pink ↔ blue** | stock | blue `󰍽` pulsing |
 | *background workflow* | a Claude Workflow still running after the turn ended | **pink ↔ blue** | stock (green "done" tint suppressed — it isn't really finished) | teal `󰒓` pulsing |
-| `needs-input` | permission prompt / turn failed | crust (yellow digit) | yellow `#f9e2af` | — |
+| `needs-input` | a question to answer / turn failed | crust (yellow digit) | yellow `#f9e2af` | — |
 | `needs-approval` | blocked on a permission decision | crust (red digit) | red `#f38ba8` | — |
 | `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
 | any | agent has a conversation title | — | — | tab name = `project/short-title`, else `#W` |
