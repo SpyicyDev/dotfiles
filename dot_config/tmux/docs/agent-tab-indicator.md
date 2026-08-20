@@ -194,10 +194,35 @@ writes the completion file `…/workflows/wf_<id>.json` when it finishes — so 
 workflow is in flight iff its runtime dir exists *without* that completion
 file. Each tick the watcher maps each claude window pane → pid →
 `~/.claude/sessions/<pid>.json` → sessionId/cwd → that session's workflow
-dirs, and sets/clears the per-window `@agent_workflow` flag (with a 600 s
-recency backstop on the agent transcript mtime against a crashed-mid-run
-dir). The blink driver also toggles while any workflow is in flight, not just
-while a window is `running`.
+dirs, and sets/clears the per-window `@agent_workflow` flag. The blink driver
+also toggles while any workflow is in flight, not just while a window is
+`running`.
+
+**Staleness rule** (changed 2026-08-19): a runtime dir counts as live iff one
+of its transcripts (`agent-*.jsonl` / `journal.jsonl`) moved in the **last
+hour** — a plain age test, deliberately. mtime is the only liveness signal
+there is, and it lies in both directions, so the hour is a compromise between
+two opposite failures:
+
+- The old floor was 600 s, which darkened the gear on workflows that were
+  still running — transcripts go quiet during API backoff, a tool with no
+  timeout, or a subagent sitting on a permission gate. Worst quiet gap measured
+  on this machine: **394 s**, so 600 s was a near miss. An hour gives 9× that.
+- Anchoring "live" to the session's own start instead (transcript newer than
+  `~/.claude/sessions/<pid>.json`'s birth time) was tried and reverted: it
+  short-circuits permanently for any dir created during the session, so one
+  crashed run would pin the gear until the agent process died. That is not
+  merely a stray glyph — `done` + workflow renders the tab **untinted** by
+  design, so a pinned gear suppresses that window's green for the rest of the
+  session, and every later finished turn reads as still-working. It fails in
+  the direction that hides work, which is the exact signal the gear exists to
+  protect. A bounded 1 h wrong beats an unbounded one, and a plain age test
+  self-heals without depending on how Claude Code happens to renew session
+  files.
+
+CuaNotch's `runningWorkflows()` carries the identical rule — **this is one of
+two places**, alongside `session_has_running_workflow`; change them together or
+the tab and the notch disagree about the same workflow.
 
 ### 3. Rendering (`tmux.conf`, Catppuccin v0.2.0)
 
