@@ -17,9 +17,9 @@ State by state (unselected tab):
 |---|---|---|---|---|
 | *(none)* | no agent process in the window | blue, solid | stock | — |
 | `idle` | agent open, not working | blue, solid | stock | — |
-| `running` | agent mid-turn | **mauve `#cba6f7` ↔ blue `#89b4fa`, 1 s** | stock | — |
-| `running` + cua | agent driving an app | **mauve ↔ blue** | stock | blue `󰍽` pulsing |
-| *background workflow* | a Claude Workflow still running after the turn ended | **mauve ↔ blue** | stock (green "done" tint suppressed — it isn't really finished) | teal `󰒓` pulsing |
+| `running` | agent mid-turn | **pink `#f5c2e7` ↔ blue `#89b4fa`, 1 s** | stock | — |
+| `running` + cua | agent driving an app | **pink ↔ blue** | stock | blue `󰍽` pulsing |
+| *background workflow* | a Claude Workflow still running after the turn ended | **pink ↔ blue** | stock (green "done" tint suppressed — it isn't really finished) | teal `󰒓` pulsing |
 | `needs-input` | permission prompt / turn failed | crust (yellow digit) | yellow `#f9e2af` | — |
 | `needs-approval` | blocked on a permission decision | crust (red digit) | red `#f38ba8` | — |
 | `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
@@ -31,7 +31,7 @@ State by state (unselected tab):
 
 There is deliberately **no "an agent lives here" marker** — the old mauve `󰚩` robot is gone, and so is the `●` that marked attention states (the body tint already says it, in three distinguishable hues; the same dot on all three added nothing but 2 cells). An idle agent tab is just a stock blue tab; presence stays legible from the tab *name*, which reads `project/short-title` for agent windows and `#W` (zsh, nvim…) for everything else.
 
-Blue is both catppuccin's resting chip accent and the computer-use hue. On the chip blue reads as "at rest", so the mauve↔blue pulse reads as working↔resting rather than as a third state — and computer use moves to the `󰍽` glyph. Glyphs still never blink between two hues (they'd read as another state mid-pulse); only the chip does, and only because its second hue means "nothing happening".
+Blue is both catppuccin's resting chip accent and the computer-use hue. On the chip blue reads as "at rest", so the pink↔blue pulse reads as working↔resting rather than as a third state — and computer use moves to the `󰍽` glyph. Glyphs still never blink between two hues (they'd read as another state mid-pulse); only the chip does, and only because its second hue means "nothing happening".
 
 Tabs are **not** width-stabilised: the glyph slot's 2 cells appear and vanish with the workflow/cua flags. Those flip once per workflow rather than once per turn, so reserving a blank on every agent window would pad the common case to pay for the rare one.
 
@@ -218,13 +218,24 @@ expression, which would render a pastel digit on the blue/orange accent
 
 `@catppuccin_window_*_color` is also the number chip's *background*, which is
 what makes it the motion channel: `_default_color` resolves to
-`#{?#{@agent_blink},#cba6f7,#89b4fa}` whenever the window is in flight
+`#{?#{@agent_blink},#f5c2e7,#89b4fa}` whenever the window is in flight
 (`@agent_workflow` ‖ `@agent_cua` ‖ state `running`), and to plain `#89b4fa`
 otherwise. `_current_color` has no blink branch at all — that is the whole
 implementation of "the selected tab never pulses". Both keep the crust
 override on attention states, which is checked *first* so attention beats
 motion. Contrast holds on both phases: the unselected digit is surface0
-`#313244` on mauve (≈7:1) and on blue (≈6.5:1).
+`#313244` on pink (8.2:1) and on blue (6.5:1).
+
+**Why pink and not mauve** (changed 2026-08-19): the first cut pulsed mauve
+`#cba6f7` ↔ blue and read as too subtle — mauve and blue have near-identical
+relative luminance (0.467 vs 0.449) and sit in the same blue-violet family, so
+the pulse moved *hue only*. Pink is L 0.638: a 1.42:1 brightness step on top of
+a ~100° hue swing, so the chip visibly lightens as well as shifts. It is also
+the only mocha hue still free — lavender/sky/sapphire are the blue family
+(mauve's failure, worse) and rosewater/flamingo/maroon are the red family.
+Pink sits 27° from needs-approval red `#f38ba8`, which sounds close but cannot
+collide: attention states force the chip to crust, so a red chip and a pink
+chip never exist on the same surface (and pink is far lighter, 0.638 vs 0.404).
 
 The text options add the exception glyph (teal `󰒓` workflow, blue `󰍽` cua,
 nothing otherwise; crust and unpulsed on a tinted tab), a readable fg on bright

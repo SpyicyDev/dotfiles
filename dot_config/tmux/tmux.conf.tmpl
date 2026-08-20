@@ -148,7 +148,7 @@ set -g @catppuccin_window_current_fill "number"
 # language; CuaNotch's glow renders the SAME state in the same hue, saturated
 # for light instead of pastel-on-dark (see the memory note / CuaNotch.swift):
 #   idle/ready      grey   #6c7086  ·  notch: no glow at all
-#   working         mauve  #cba6f7  ·  notch violet #9E66FF   (subtle)
+#   working         pink   #f5c2e7  ·  notch magenta #FF4FD1  (subtle)
 #   computer use    blue   #89b4fa  ·  notch blue   #408CFF   (full)
 #   needs approval  red    #f38ba8  ·  notch red    #FF4740   (full)
 #   waiting input   yellow #f9e2af  ·  notch amber  #FF9E26   (full)
@@ -162,7 +162,7 @@ set -g @catppuccin_window_current_fill "number"
 #
 # ONE EXCEPTION to "same hue everywhere": blue #89b4fa is BOTH catppuccin's
 # resting chip accent and the computer-use hue. On the chip, blue therefore
-# reads as "at rest", so the working pulse mauve↔blue reads as working↔resting
+# reads as "at rest", so the working pulse pink↔blue reads as working↔resting
 # rather than as a third state — and computer use is carried by the 󰍽 glyph in
 # the state's blue instead. That is why cua lives in the glyph slot and not in
 # the chip.
@@ -191,10 +191,23 @@ set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#{?#
 # #11111b on attention states so the state-colored digit reads against it.
 #
 # $color is ALSO the motion channel: an UNSELECTED tab whose window is in
-# flight (running || cua || workflow) pulses its number chip mauve #cba6f7 ↔
+# flight (running || cua || workflow) pulses its number chip pink #f5c2e7 ↔
 # blue #89b4fa at 1 s, driven by the same global @agent_blink the watcher
 # already toggles. Blue is the resting accent, so the pulse reads as
-# working↔resting. Priority: attention beats motion — needs-*/done force crust
+# working↔resting.
+#
+# PINK, not mauve (2026-08-19 — mauve read as too subtle, and the numbers say
+# why): mauve #cba6f7 and blue #89b4fa have near-identical relative luminance
+# (0.467 vs 0.449) and sit in the same blue-violet family, so the pulse moved
+# hue only and barely registered. Pink is L 0.638 — a 1.42:1 BRIGHTNESS step
+# on top of a ~100° hue swing, so the chip visibly lightens as well as shifts.
+# It is also the only mocha hue left: lavender/sky/sapphire are the blue
+# family (mauve's failure, worse), rosewater/flamingo/maroon are the red
+# family. Pink sits 27° off needs-approval red #f38ba8, which sounds close but
+# cannot collide — attention states force the chip to CRUST, so a red chip and
+# a pink chip never exist on the same surface (and pink is far lighter, 0.638
+# vs 0.404). Digit contrast improves too: 8.2:1 on pink vs 6.2:1 on mauve.
+# Priority: attention beats motion — needs-*/done force crust
 # regardless, because the digit's own fg is the bright body tint and needs a
 # dark chip to read at all. (A permission prompt raised while a background
 # workflow runs is therefore a red tab with a still chip and a gear glyph.)
@@ -202,7 +215,7 @@ set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#{?#
 # The SELECTED tab never pulses: it is solid peach for every ambient state —
 # you are looking at it, the terminal itself is the progress indicator, and a
 # blinking chip under your cursor is just noise.
-set -g @catppuccin_window_default_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#{?#{@agent_blink},#cba6f7,#89b4fa},#11111b},#{?#{m:needs-*,#{@agent_state}},#11111b,#{?#{@agent_workflow},#{?#{@agent_blink},#cba6f7,#89b4fa},#{?#{@agent_cua},#{?#{@agent_blink},#cba6f7,#89b4fa},#{?#{==:#{@agent_state},running},#{?#{@agent_blink},#cba6f7,#89b4fa},#89b4fa}}}}}"
+set -g @catppuccin_window_default_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#11111b},#{?#{m:needs-*,#{@agent_state}},#11111b,#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{@agent_cua},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{==:#{@agent_state},running},#{?#{@agent_blink},#f5c2e7,#89b4fa},#89b4fa}}}}}"
 set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#fab387,#11111b},#{?#{m:needs-*,#{@agent_state}},#11111b,#fab387}}"
 
 # Tab text: the glyph slot, then the summary. The slot is EXCEPTIONS ONLY —
