@@ -228,6 +228,15 @@ set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#{?#{@age
 #   󰍽 (nf-md-mouse U+F037D) blue #89b4fa — the agent is driving an app through
 #                           cua-driver (see the palette note above for why cua
 #                           lives here and not in the chip).
+# The slot is EXCLUSIVE and the gear wins: a session both driving an app and
+# running a workflow shows only 󰒓. Deliberate, and deliberately asymmetric with
+# CuaNotch, where a workflow is an OVERLAY that composes with the state and the
+# popup row shows both (blue dot + teal gear). The gear is the one that must
+# survive — it is the ONLY carrier of "a fleet is still out" and it outlives the
+# turn, so dropping it lets a finished-looking tab hide live work; the mouse
+# only refines a chip that is already pulsing "in flight". Both glyphs (4 cells)
+# was considered and rejected: double the width jitter for a rare pair, and the
+# notch popup is the detail surface for precisely this case.
 # agent-tab-watcher.sh toggles the global @agent_blink each second while
 # anything is running/driving/workflowing; each pulsing glyph alternates
 # between its hue and a ~68% BRIGHTNESS copy of that same hue (dim blue
