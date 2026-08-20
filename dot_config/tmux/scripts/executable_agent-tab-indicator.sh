@@ -116,8 +116,18 @@ ensure_watcher() {
     if [ -f "$pidfile" ]; then
         read -r pid < "$pidfile" 2>/dev/null || pid=""
     fi
+    # `kill -0` alone answers "some process exists", not "the watcher is
+    # alive": the daemon only unlinks its pidfile on a clean EXIT, and pids
+    # here wrap in ~15 min, so a stale file usually points at an unrelated
+    # live process. That reads as HEALTHY and the watchdog never fires —
+    # the one failure it exists to catch, silently. Confirm identity before
+    # believing it. This costs one ps against the "no forks in the healthy
+    # case" goal, but hooks fire a few times per turn, not 86400 times a day
+    # like the watcher's own tick, so it is the cheap place to pay.
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        return 0
+        case "$(ps -o command= -p "$pid" 2>/dev/null)" in
+            *"/agent-tab-watcher.sh") return 0 ;;
+        esac
     fi
     tmux run-shell -b "bash $HOME/.config/tmux/scripts/agent-tab-watcher.sh" 2>/dev/null || true
 }
@@ -656,6 +666,11 @@ case "$mode" in
         ;;
     *)
         echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|needs-input|done|clear|clear-current> [claude|codex]" >&2
-        exit 1
+        # exit 0, not 1: codex treats a hook's exit status as a GATE (see the
+        # header), so a typo'd mode in hooks.json would block every codex
+        # event rather than just failing to paint a tab. A silently inert
+        # indicator is a far better failure than a wedged agent; the usage
+        # line still goes to stderr for anyone running this by hand.
+        exit 0
         ;;
 esac

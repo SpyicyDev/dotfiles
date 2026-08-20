@@ -64,8 +64,25 @@ command -v tmux >/dev/null 2>&1 || exit 0
 # finds none and starts another). Reap any prior instance, then claim the
 # pidfile, and only clean it up on exit if it's still ours.
 PIDFILE="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.pid"
+SELF="$HOME/.config/tmux/scripts/agent-tab-watcher.sh"
+
+# A PID IS NOT AN IDENTITY. cleanup() only unlinks the pidfile on a normal
+# EXIT, so a SIGKILLed watcher leaves a live-looking pid behind — and pid
+# churn on this machine is ~1000/10s, so the space wraps in ~15 minutes. By
+# the next `prefix r` that number is very likely some unrelated process, and
+# `kill -0` says only "a process exists", not "it is mine". This used to
+# SIGTERM whatever answered. Exactly the hazard the -fx sweep below documents
+# ("killing a bystander is not [harmless]") — the pidfile path just had no
+# equivalent guard. One ps, at startup only; the loop never forks for this.
+is_watcher_pid() {
+    local cmd
+    cmd="$(ps -o command= -p "$1" 2>/dev/null)"
+    [ "$cmd" = "bash $SELF" ] || [ "$cmd" = "/bin/bash $SELF" ] || [ "$cmd" = "$SELF" ]
+}
+
 prev=$(cat "$PIDFILE" 2>/dev/null || true)
-if [ -n "$prev" ] && [ "$prev" != "$$" ] && kill -0 "$prev" 2>/dev/null; then
+if [ -n "$prev" ] && [ "$prev" != "$$" ] && kill -0 "$prev" 2>/dev/null \
+   && is_watcher_pid "$prev"; then
     kill "$prev" 2>/dev/null || true
 fi
 # Belt to the pidfile's braces: also sweep for stragglers whose pidfile we
@@ -78,8 +95,8 @@ fi
 # `pgrep -f agent-tab-watcher` also matches any shell, editor or grep whose
 # argv merely mentions this path, and we kill what we match. Missing a stray
 # spawned some other way is harmless (the pidfile still covers the normal
-# case); killing a bystander is not.
-SELF="$HOME/.config/tmux/scripts/agent-tab-watcher.sh"
+# case); killing a bystander is not. ($SELF is defined with is_watcher_pid
+# above, which applies the same exactness to the pidfile path.)
 if command -v pgrep >/dev/null 2>&1; then
     for stray in $(pgrep -fx "bash $SELF" 2>/dev/null; pgrep -fx "/bin/bash $SELF" 2>/dev/null; pgrep -fx "$SELF" 2>/dev/null); do
         if [ "$stray" != "$$" ] && [ "$stray" != "$PPID" ]; then
@@ -117,18 +134,26 @@ is_agent_comm() {
 # Runtime dir without its completion file = running (see header). Scoped to
 # the session's own project/<sid> dir so other panes' workflows don't leak in.
 session_has_running_workflow() {
-    local pid="$1" sf sid cwd proj base d wfid mt now
+    local pid="$1" sf sid cwd proj base d wfid mt now raw
     [ -n "$pid" ] || return 1
     sf="$HOME/.claude/sessions/$pid.json"
     [ -f "$sf" ] || return 1
-    sid=$(grep -o '"sessionId":"[^"]*"' "$sf" 2>/dev/null | head -1 | cut -d'"' -f4)
-    cwd=$(grep -o '"cwd":"[^"]*"' "$sf" 2>/dev/null | head -1 | cut -d'"' -f4)
+    # Bash builtins, not `grep -o | head -1 | cut`: this runs for EVERY claude
+    # window on EVERY 1s tick, and it cannot be moved behind the cheap
+    # [ -d ] gate below because that path is built from sid+cwd. The pipeline
+    # form cost 8 processes and ~4.7ms per call (measured, 200 iterations)
+    # against 0.045ms here — ~105x, and with 4 live windows it was ~2.8M
+    # spawns/day for a function that returns "no workflow" almost always.
+    # Same family as the basename fix below; bigger in absolute terms.
+    raw="$(<"$sf")"
+    [[ $raw =~ \"sessionId\":\"([^\"]+)\" ]] && sid="${BASH_REMATCH[1]}"
+    [[ $raw =~ \"cwd\":\"([^\"]+)\" ]] && cwd="${BASH_REMATCH[1]}"
     { [ -n "$sid" ] && [ -n "$cwd" ]; } || return 1
     # Claude munges the project dir name from cwd: '/' and '.' both become '-'.
     proj="${cwd//\//-}"; proj="${proj//./-}"
     base="$HOME/.claude/projects/$proj/$sid"
     [ -d "$base/subagents/workflows" ] || return 1
-    now=$(date +%s 2>/dev/null || echo 0)
+    printf -v now '%(%s)T' -1
     for d in "$base"/subagents/workflows/wf_*/; do
         [ -d "$d" ] || continue
         # ${d%/} then ##*/, not basename: these paths are cwd-munged and
@@ -180,7 +205,12 @@ now, live = time.time(), float(sys.argv[2])
 pids = {int(d["agent_pid"]) for d in sessions.values()
         if isinstance(d, dict) and d.get("agent_pid")
         and now - float(d.get("ts") or 0) < live}
-print(" " + " ".join(str(p) for p in sorted(pids)) + " ")
+# Emit a SINGLE space when the set is empty, matching the early-return paths.
+# " " + "" + " " gave two, and the consumer's `*" ${pid} "*` test matches that
+# with an empty pid — so an unset pid would have read as "driving an app" if
+# its [ -n "$pid" ] guard were ever dropped. Don't leave a guard load-bearing
+# in a caller when the producer can just not lie.
+print((" " + " ".join(str(p) for p in sorted(pids)) + " ") if pids else " ")
 PY
 }
 
