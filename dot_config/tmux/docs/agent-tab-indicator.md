@@ -210,6 +210,29 @@ which settles the same race from the other side. Verified end to end: a
 `SIGSTOP`ped watcher is reaped and replaced on the next hook event, and a
 healthy one is left alone across repeated hooks.
 
+**Two rules if you add another guard here.** Both were learned by getting them
+wrong first, on this daemon and on CuaNotch's probe queue the same evening:
+
+1. *A liveness guard must settle who wins, not merely detect and restart.* Both
+   first attempts created a second actor without retiring the first — here, a
+   respawn stacked on a stopped-but-unreaped daemon (two of them toggle
+   `@agent_blink` per tick and cancel out); there, a released in-flight flag
+   while the blocked worker was still alive to wake up and publish a stale
+   snapshot over a fresher one. The naive insurance converts a stuck-and-
+   obvious failure into a subtly-wrong-and-invisible one, which is strictly
+   worse than the bug it was written to fix.
+2. *Validate with a forced failure, not with reasoning.* Reasoning about the
+   happy path is what produced the bug, so it cannot be what confirms the fix.
+   `SIGSTOP` the watcher, wait out the grace, fire a hook, and check that the
+   old pid is gone AND that exactly one successor exists — then check that a
+   healthy watcher survives repeated hooks unchanged. Rule 1's failure is
+   invisible to any test that only asserts "something is running afterwards".
+
+More generally: every move of work off a visible path — the fork reductions
+above, a background probe queue — converts a loud failure into a quiet one, and
+correctness on the happy path is exactly what those failures preserve. Budget a
+heartbeat or a timeout on the new path as part of the move, not later.
+
 Two further guards: it no longer
 exits on the first failed tmux command (a transient failure is not a dead
 server — it tolerates a streak and quits only once `tmux list-sessions`
