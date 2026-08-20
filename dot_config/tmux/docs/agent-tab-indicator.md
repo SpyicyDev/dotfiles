@@ -364,8 +364,17 @@ the tab and the notch disagree about the same workflow.
 > Duplication *within* one document is the opposite case: collapse it. The
 > approval-routing rule rotted in two spots (2026-08-20) precisely because
 > those restatements were incidental — a wiring bullet that happened to mention
-> the mapping — with no marker and no owner. Marked copies across surfaces have
-> not rotted; unmarked copies inside one file did.
+> the mapping — with no marker and no owner.
+>
+> Honest caveat on that reasoning: the marked copies have not rotted, but they
+> are *days* old, and line 436 rotted in about one. So this is a design intent,
+> not a track record — and when the markers were audited (2026-08-20) two of
+> four were missing on the CuaNotch side, including one written two hours
+> earlier by the person then arguing markers were doing the work. The marker is
+> not a property these pairs *have*; it is one somebody has to remember. If a
+> future audit finds them rotted anyway, the answer is probably a check that
+> fails loudly — a test asserting the two constants match — rather than more
+> prose.
 
 One divergence is inherent and not a staleness-rule regression: the tab reaches
 a session only through `~/.claude/sessions/<pid>.json` (pane → pid → sid/cwd),
