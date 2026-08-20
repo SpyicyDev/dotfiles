@@ -111,7 +111,7 @@ JQ="$(command -v jq || true)"
 # the daemon outlives this short-lived hook process. PIDFILE path must match
 # the watcher's.
 ensure_watcher() {
-    local pidfile pid=""
+    local pidfile pid="" now beat
     pidfile="${TMPDIR:-/tmp}/agent-tab-watcher.${UID:-$(id -u)}.pid"
     if [ -f "$pidfile" ]; then
         read -r pid < "$pidfile" 2>/dev/null || pid=""
@@ -126,7 +126,27 @@ ensure_watcher() {
     # like the watcher's own tick, so it is the cheap place to pay.
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         case "$(ps -o command= -p "$pid" 2>/dev/null)" in
-            *"/agent-tab-watcher.sh") return 0 ;;
+            *"/agent-tab-watcher.sh")
+                # ...and that it is still TURNING, not merely resident. The
+                # daemon restamps this file every tick, so a stale mtime means
+                # a wedged loop: alive to every liveness test we have, but no
+                # longer reconciling, and invisible because a frozen blink now
+                # renders as plain blue (= idle). 30s is 30 ticks of grace.
+                # Kill it so the respawn below isn't refused by the singleton.
+                now=$(date +%s 2>/dev/null || echo 0)
+                beat=$(stat -f %m "$pidfile" 2>/dev/null || echo 0)
+                if [ $((now - beat)) -lt 30 ]; then
+                    return 0
+                fi
+                # TERM then CONT: a wedge that is STOPPED rather than blocked
+                # leaves the TERM merely pending, so it would sit there
+                # holding the singleton while the respawn piles a second
+                # daemon on top — two of them toggle @agent_blink per tick
+                # and cancel out, which is the exact symptom this file exists
+                # to avoid. CONT wakes it to process the pending signal.
+                kill "$pid" 2>/dev/null || true
+                kill -CONT "$pid" 2>/dev/null || true
+                ;;
         esac
     fi
     tmux run-shell -b "bash $HOME/.config/tmux/scripts/agent-tab-watcher.sh" 2>/dev/null || true

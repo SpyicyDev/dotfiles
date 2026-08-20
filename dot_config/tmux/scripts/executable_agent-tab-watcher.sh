@@ -391,5 +391,22 @@ EOF
         tmux refresh-client -S 2>/dev/null
     fi
 
+    # HEARTBEAT. Being alive is not the same as turning: every check on this
+    # daemon (the pidfile, ensure_watcher's kill -0 + ps) proves a PROCESS
+    # exists, and none of them prove the LOOP is still going round. A tmux
+    # call or the python in live_cua_pids wedging would leave a healthy-
+    # looking watcher that has quietly stopped reconciling, and since the
+    # working chip went pink↔blue a frozen blink renders as plain blue —
+    # i.e. identical to idle, so the surface lies rather than merely going
+    # quiet. Restamping the pidfile each tick makes the mtime a liveness
+    # clock that ensure_watcher can test. Builtin redirect: no fork.
+    #
+    # Reading it back first also settles a race the startup guard can't: if
+    # a newer instance has claimed the file, WE are the stale one and should
+    # go, rather than both of us toggling @agent_blink and cancelling out.
+    read -r _owner < "$PIDFILE" 2>/dev/null || _owner="$$"
+    [ "$_owner" = "$$" ] || exit 0
+    echo $$ > "$PIDFILE"
+
     sleep "$POLL_SECONDS"
 done

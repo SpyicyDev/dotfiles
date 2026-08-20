@@ -191,7 +191,26 @@ workflow gear and the GC, and its death is silent — a frozen pulse is the only
 tell, and it is now easy to *miss*: `@agent_blink` unset renders as the second
 color of each pair, and for the chip that is plain blue — i.e. a dead watcher
 makes every running tab look idle rather than looking broken. (A workflow gear
-freezes on dim teal.) Two guards: it no longer
+freezes on dim teal.) That is why the guards below matter more than they used
+to: the surface no longer reports the failure, so something else has to.
+
+**Heartbeat.** Being alive is not the same as turning. Every liveness test
+here — the pidfile, `ensure_watcher`'s `kill -0`, the `ps` identity check —
+proves a *process* exists; none prove the *loop* is still going round, and a
+tmux call or the `live_cua_pids` python wedging would leave a healthy-looking
+daemon that quietly stopped reconciling. So the loop restamps its pidfile every
+tick (builtin redirect, no fork), making the mtime a liveness clock;
+`ensure_watcher` treats a stamp older than **30 s** as a wedge and reaps the
+daemon before respawning. The kill is `TERM` then `CONT`, because a wedge that
+is *stopped* rather than blocked leaves the TERM merely pending — it would hold
+the singleton while the respawn stacked a second daemon on top, and two
+daemons toggling `@agent_blink` per tick cancel each other out. The loop also
+re-reads the pidfile each tick and exits if a newer instance has claimed it,
+which settles the same race from the other side. Verified end to end: a
+`SIGSTOP`ped watcher is reaped and replaced on the next hook event, and a
+healthy one is left alone across repeated hooks.
+
+Two further guards: it no longer
 exits on the first failed tmux command (a transient failure is not a dead
 server — it tolerates a streak and quits only once `tmux list-sessions`
 confirms the server is gone), and `agent-tab-indicator.sh` re-asserts it on
