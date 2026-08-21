@@ -32,13 +32,13 @@ This is a single-laptop-first tiling window manager setup optimized for seamless
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_space_move.sh` | `~/code/various_scripts/yabai_space_move.sh` | Executable script | Push/pull spaces between displays |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_displays.sh` | `~/code/various_scripts/yabai_displays.sh` | Executable script | Hotplug handler: dock/undock logic |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_mode.sh` | `~/code/various_scripts/yabai_skhd_mode.sh` | Executable script | Toggle space layout (bsp ↔ stack) |
-| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_toggle_float.sh` | `~/code/various_scripts/yabai_toggle_float.sh` | Executable script | Toggle the focused window's float (`hyper+t`); both stack & bsp; respects pinned homes |
+| `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_toggle_float.sh` | `~/code/various_scripts/yabai_toggle_float.sh` | Executable script | Toggle the focused window's float (`hyper+t`); both stack & bsp; refuses to *float* a pinned app on its home space, always allows *un*-floating |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_float_borders.sh` | `~/code/various_scripts/yabai_float_borders.sh` | Executable script | Draw a JankyBorders border around floating windows (drives the `borders` daemon whitelist; runs only while something floats) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_next.sh` | `~/code/various_scripts/yabai_skhd_stack_next.sh` | Executable script | **`hyper+z`, layout-aware:** STACK → next stack layer; BSP → mirror tree horizontally (`--mirror x-axis`) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_skhd_stack_prev.sh` | `~/code/various_scripts/yabai_skhd_stack_prev.sh` | Executable script | **`hyper+x`, layout-aware:** STACK → previous stack layer; BSP → mirror tree vertically (`--mirror y-axis`) |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_mouse_follow.sh` | `~/code/various_scripts/yabai_mouse_follow.sh` | Executable script | Warp cursor to newly focused display |
 | `…/code/various_scripts/executable_yabai_heal.sh` | `~/code/various_scripts/yabai_heal.sh` | Executable script | **Debounced self-heal** — coalesce `space_destroyed` / `mission_control_exit` into one `yabai_workspace_refresh` (single-flight mkdir lock + settle) |
-| `…/code/various_scripts/executable_yabai_startup_reconcile.sh` | `~/code/various_scripts/yabai_startup_reconcile.sh` | Executable script | **Login-race fix** — backgrounded at startup; re-loads the SA + polls (re-apply rules / re-pin Arc) until pinned apps reach their home spaces, so they land correctly without a manual restart. Single-flighted |
+| `…/code/various_scripts/executable_yabai_startup_reconcile.sh` | `~/code/various_scripts/yabai_startup_reconcile.sh` | Executable script | **Login-race + stray-float fix** — backgrounded at startup; re-loads the SA + polls (re-apply rules / re-pin Arc / un-float misclassified pinned windows) until pinned apps are on their home spaces **and tiled**, so they land correctly without a manual restart. Single-flighted |
 | `/Users/mackhaymond/.local/share/chezmoi/code/various_scripts/executable_yabai_screen_flash.sh` | `~/code/various_scripts/yabai_screen_flash.sh` | Executable script | **DISABLED (dormant)** — was the external-display focus border flash; the signal was removed 2026-06-04 |
 | `…/code/various_scripts/yabai_screen_flash.js` | `~/code/various_scripts/yabai_screen_flash.js` | JXA helper | **DISABLED (dormant)** — drew the border overlay for `yabai_screen_flash.sh` |
 | `…/code/various_scripts/executable_yabai_reorder_spaces.sh` | `~/code/various_scripts/yabai_reorder_spaces.sh` | Executable script | Keep labeled spaces in canonical order per display |
@@ -85,7 +85,7 @@ MASTER_DISPLAY_UUID=37D8832A-2D66-02CA-B9F7-8F30A301B230
 These applications do not participate in yabai's tiling; they float freely:
 
 **System utilities:** System Settings, Calculator, BetterTouchTool, Karabiner-Elements  
-**Monitoring:** Activity Monitor, DaisyDisk, iStat Menus (also disables border)  
+**Monitoring:** Activity Monitor, DaisyDisk, iStat Menus  
 **Other:** Mail, Finder, Steam, BetterZip, Python REPL windows, DevPod, Setapp, Permute, TI-Nspire, LiveMath Maker, Antidote
 
 #### App-to-Space Pinning Rules
@@ -154,6 +154,13 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 
 **Startup reconciliation** (`yabai_startup_reconcile.sh`, run **backgrounded** right after the startup `rule --apply`): fixes the **login race** where pinned apps land on the wrong space. At login, macOS restores app windows around when yabai starts, so windows created before the signals registered get no `window_created`/`application_launched` event, and the one-shot `rule --apply` can run *before* those windows exist (or before `--load-sa` finishes — window→space moves need the scripting addition). The reconcile re-loads the scripting addition once (`sudo -n`), then **polls until stable** — repeatedly re-applying the `space=` rules + re-pinning Arc until every *running* pinned app is on its home space, or a hard cap (`YABAI_RECONCILE_CAP`, default ~90 s). This self-truncates on a fast login (exits in ≈0.2 s once everything's home) and self-extends for slow-launching apps (Electron: ChatGPT, Claude, Notion Calendar, Messages), so it's more robust than a fixed ramp that could miss an app finishing after the last pass. Backgrounded so it never blocks startup; single-flighted (mkdir lock, like `yabai_heal.sh`) so repeated restarts don't stack overlapping polls; idempotent. Supersedes the old workaround of manually restarting yabai after login.
 
+The same poll also fixes a **second startup failure — a pinned app landing *floating*** (added 2026-08-21, after Claude came up floating on `ai` while ChatGPT tiled normally on the same space). yabai classifies every window it finds **before** the config runs (`window_manager_begin()` precedes `exec_config_file()`), so no rule can influence that pass, and it flags `WINDOW_FLOAT` on any window it momentarily cannot move — which a window still settling after a restore can be. Nothing clears that flag afterwards: `rule --apply` re-pins the *space* and leaves the window floating. Two traps make this harder than it looks, both verified live:
+
+- **`manage=on` on the `space=` rules is NOT the fix.** It does suppress the misclassification for windows created while yabai is already running (the FLOAT classification is skipped for `WINDOW_RULE_MANAGED`), but it cannot help at startup — the rules don't exist yet during discovery — and it makes `rule --apply` (fired at startup *and* on every `application_launched`) take the un-float path below from whatever space happens to be active. That trades a floating window for a corrupted cross-space stack.
+- **yabai re-tiles an un-floated window onto the ACTIVE space, not the window's own space** (`window_manager_make_window_floating()` ends in `space_manager_tile_window_on_space(sm, window, space_manager_active_space())`). Un-floating a window that lives on a background space silently registers it in the active space's view — two windows on different spaces sharing one stack, and the window that owned that view pushed out. Observed: Claude on `ai` un-floated while `terminal` was active came back as stack-index 1 and 2 of the *same* view as WezTerm, with ChatGPT ejected to 0.
+
+So `unfloat_pins()` un-floats with `--toggle float` and then **bounces the window through another space and back** — `send_window_to_space()` untiles it from whatever view holds it and re-tiles it on the *destination*, so a round trip lands it in its own tree. The bounce is a no-op when the un-float already landed correctly, so it runs unconditionally; the scratch space is neither home nor the space the user is looking at (`agent` preferred — nothing of the user's lives there), so it is never visible, and it does not change the active space. An un-float attempted while the window still can't be moved is dropped silently by yabai, so the result is verified before bouncing and the poll retries until it takes — which is also why `pins_settled()` now requires pinned windows to be **home *and* tiled**. Finally, un-floating changes the float set without emitting `window_created`/`window_destroyed`, so it calls `yabai_float_borders.sh sync` afterwards — the same gap `yabai_toggle_float.sh` covers after `hyper+t`.
+
 > **Debugging signals:** there is no `yabai -m query --signals` in this yabai version (it errors `unknown command`). The authoritative list of registered signals is the `signal --add` lines in `yabairc` — grep them there.
 
 #### Environment Variables Exported
@@ -164,7 +171,7 @@ AXIdentifier; Little Arc stays managed. See the "Arc window pinning" design note
 | `YABAI_DISPLAYS` | `${HOME}/code/various_scripts/yabai_displays.sh` | `display_added` / `display_removed` signals |
 | `YABAI_MOUSE_FOLLOW` | `${HOME}/code/various_scripts/yabai_mouse_follow.sh` | `display_changed` signal |
 | `YABAI_HEAL` | `${HOME}/code/various_scripts/yabai_heal.sh` | `space_destroyed` / `mission_control_exit` signals (debounced self-heal) |
-| `YABAI_STARTUP_RECONCILE` | `${HOME}/code/various_scripts/yabai_startup_reconcile.sh` | Backgrounded once at yabai startup (login-race fix: polls — re-apply rules + Arc re-pin — until pinned apps are home, capped by `YABAI_RECONCILE_CAP` ≈90 s) |
+| `YABAI_STARTUP_RECONCILE` | `${HOME}/code/various_scripts/yabai_startup_reconcile.sh` | Backgrounded once at yabai startup (login-race + stray-float fix: polls — re-apply rules + Arc re-pin + un-float misclassified pinned windows — until pinned apps are home and tiled, capped by `YABAI_RECONCILE_CAP` ≈90 s) |
 | `YABAI_FLOAT_BORDERS` | `${HOME}/code/various_scripts/yabai_float_borders.sh` | `window_created` / `window_destroyed` signals + a startup sync + the hyper+t toggle — draws a JankyBorders border around floating windows (daemon runs only while something floats) |
 
 ### 3.2 Skhd Hotkey Daemon (skhdrc)
@@ -290,7 +297,7 @@ Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, a
 | `hyper - z` | Z | `yabai_skhd_stack_next.sh` | **Stack:** focus next stack layer (wrap to first). **Bsp:** mirror tree horizontally (`space --mirror x-axis`) |
 | `hyper - x` | X | `yabai_skhd_stack_prev.sh` | **Stack:** focus previous stack layer (wrap to last). **Bsp:** mirror tree vertically (`space --mirror y-axis`) |
 | `hyper - m` | M | `yabai -m window --toggle zoom-fullscreen` | Toggle maximize — zoom the focused window to fill its space |
-| `hyper - t` | T | `yabai_toggle_float.sh` | Toggle the focused window's float (works in **both** stack & bsp). Refuses on a pinned app on its home space + Arc on main/school; manage=off apps are not guarded |
+| `hyper - t` | T | `yabai_toggle_float.sh` | Toggle the focused window's float (works in **both** stack & bsp). **Directional guard:** refuses to *float* a pinned app on its home space (or Arc on main/school), but always allows *un*-floating one — that's the manual way back from a window yabai flagged FLOAT on its own. manage=off apps are not guarded |
 | `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen (global; **no-op on WezTerm** by design — see the "WezTerm is not fullscreenable" note) |
 | `hyper + fn - b` | Fn+B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
 
@@ -401,9 +408,9 @@ All WezTerm keybindings forward to tmux prefix (`Ctrl+S`) chords, delegating win
 | `yabai_displays.sh` | `added` \| `removed` | Hotplug handler: dock = refresh cache (non-destructive); undock = pull home safety net |
 | `yabai_workspace_refresh.sh` | (none; on-demand) | Reconcile canonical labels on all displays; refresh display topology cache |
 | `yabai_heal.sh` | (none; signal handler) | Debounced self-heal — single-flight (mkdir lock) + settle, then `yabai_workspace_refresh.sh`. Bound to `space_destroyed` / `mission_control_exit` |
-| `yabai_startup_reconcile.sh` | (none; backgrounded at startup) | Login-race fix — re-loads the SA (`sudo -n`) + **polls until stable** (re-apply rules + Arc re-pin until every running pinned app is home, ~90 s cap) so restored windows reach their pinned spaces without a manual yabai restart. Single-flighted (mkdir lock) |
+| `yabai_startup_reconcile.sh` | (none; backgrounded at startup) | Login-race + stray-float fix — re-loads the SA (`sudo -n`) + **polls until stable** (re-apply rules + Arc re-pin + un-float misclassified pinned windows, until every running pinned app is home **and tiled**, ~90 s cap) so restored windows reach their pinned spaces without a manual yabai restart. Single-flighted (mkdir lock) |
 | `yabai_skhd_mode.sh` | (none) | Toggle focused space layout (bsp ↔ stack) |
-| `yabai_toggle_float.sh` | (none) | Toggle the focused window's float (`hyper+t`); works in both stack & bsp; refuses on a pinned app on its home space + Arc on main/school (manage=off apps not guarded); calls `yabai_float_borders.sh sync` after toggling |
+| `yabai_toggle_float.sh` | (none) | Toggle the focused window's float (`hyper+t`); works in both stack & bsp; **directional guard** — refuses to float a pinned app on its home space + Arc on main/school, always allows un-floating (manage=off apps not guarded); calls `yabai_float_borders.sh sync` after toggling |
 | `yabai_float_borders.sh` | `sync` | Reconcile the JankyBorders daemon to the current floating-window set — start it (subtle white, round, width 2) when ≥1 window floats, live-update its app `whitelist`, kill it when none. **Single-flight (mkdir lock + 0.15 s settle, mirrors `yabai_heal.sh`)** so concurrent syncs can't spawn duplicate daemons (`borders` is not a process-level singleton); a daemon count ≠ 1 is self-healed to one. Wired to `window_created`/`window_destroyed` + startup + the hyper+t toggle. No-op if `borders` isn't installed |
 | `yabai_skhd_stack_next.sh` | (none) | **Layout-aware (`hyper+z`):** STACK space → focus next stack layer (wrap to first); BSP space → mirror tree horizontally (`space --mirror x-axis`) |
 | `yabai_skhd_stack_prev.sh` | (none) | **Layout-aware (`hyper+x`):** STACK space → focus previous stack layer (wrap to last); BSP space → mirror tree vertically (`space --mirror y-axis`) |
@@ -854,7 +861,7 @@ git push origin main
 | `hyper - v` | V | Toggle split orientation (h ↔ v) | bsp; `window --toggle split` |
 | `hyper - n` | N | Rotate tree 90° clockwise | bsp; `space --rotate 90` (repeat cycles 90/180/270/0) |
 | `hyper - m` | M | Toggle maximize (zoom-fullscreen) | `window --toggle zoom-fullscreen` |
-| `hyper - t` | T | Toggle window float | Both stack & bsp; `yabai_toggle_float.sh` — refuses on pinned-on-home + Arc on main/school |
+| `hyper - t` | T | Toggle window float | Both stack & bsp; `yabai_toggle_float.sh` — refuses to *float* pinned-on-home + Arc on main/school; *un*-floating always allowed |
 | `hyper + fn - m` | Fn+M | Toggle native fullscreen | Global; no-op on WezTerm by design |
 | `hyper + fn - b` | Fn+B | Toggle space layout (bsp ↔ stack) | |
 | `hyper - a` / `hyper - s` | A / S | *(reserved by BetterTouchTool)* | Not skhd binds — never assign |

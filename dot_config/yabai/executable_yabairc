@@ -32,7 +32,9 @@ yabai -m rule --add app="^BetterTouchTool$" manage=off
 yabai -m rule --add app="^Karabiner-Elements$" manage=off
 yabai -m rule --add app="^python$" manage=off
 yabai -m rule --add app="^DaisyDisk$" manage=off
-yabai -m rule --add app="^iStat Menus$" manage=off border=off
+# (no `border=off`: yabai 7 dropped the key and logs `unknown key 'border'` for it.
+#  Borders here come from the JankyBorders daemon, not yabai -- see yabai_float_borders.sh.)
+yabai -m rule --add app="^iStat Menus$" manage=off
 yabai -m rule --add app="^Steam$" manage=off
 yabai -m rule --add app="^Activity Monitor$" manage=off
 yabai -m rule --add app="^Mail$" manage=off 

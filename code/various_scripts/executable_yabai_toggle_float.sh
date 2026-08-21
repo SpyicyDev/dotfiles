@@ -5,9 +5,19 @@
 # / back into the stack) and a bsp space (out of / back into the tree) -- no
 # per-layout branching needed.
 #
-# REFUSES on pinned apps: a `space=` app sitting on its home space, or an Arc main
-# window on main/school, is left alone (no toggle) so a curated pinned layout can't
-# be knocked loose. This mirrors the guard in yabai_send_window.sh verbatim.
+# REFUSES TO FLOAT a pinned app: a `space=` app sitting on its home space, or an Arc
+# main window on main/school, is left tiled (no toggle) so a curated pinned layout
+# can't be knocked loose. This is the guard in yabai_send_window.sh, but DIRECTIONAL
+# -- it applies only to the tiled -> floating direction. Un-floating a pinned window
+# is always allowed, because that direction can only ever repair the layout, and
+# refusing it left the one case with no manual way out: yabai can flag a window
+# FLOAT on its own at startup (see yabai_startup_reconcile.sh), and a two-way guard
+# meant hyper+t could not put it back. Observed 2026-08-21 with Claude on `ai`.
+#
+# Un-floating from here is also the safe direction for a yabai quirk that bites the
+# reconcile script: yabai re-tiles an un-floated window onto the ACTIVE space rather
+# than the window's own space. This script only ever acts on the FOCUSED window, and
+# a focused window is by definition on the active space, so the two always agree.
 #
 # NOT guarded: manage=off apps (System Settings, Finder, etc.). yabai exposes no
 # per-window "managed" flag -- a manage=off window reports is-floating=true exactly
@@ -29,10 +39,14 @@ app=$(printf '%s' "$info" | jq -r '.app // ""' 2>/dev/null)
 cur=$(printf '%s' "$info" | jq -r '.space // empty' 2>/dev/null)
 [ -z "$cur" ] && exit 0
 
+# Which way is this press going? Only tiled -> floating is guarded below; a window
+# that is ALREADY floating is always allowed back into the layout.
+floating=$(printf '%s' "$info" | jq -r '."is-floating" // false' 2>/dev/null)
+
 # Apps pinned to a home space (mirrors the `space=` rules in yabairc). If the
 # focused window is one of these AND it is already on its home space, it is bound
-# to that space -- leave it. (Unpinned windows -- browsers, Finder, etc. -- have no
-# home and are always toggleable.)
+# to that space -- leave it tiled. (Unpinned windows -- browsers, Finder, etc. --
+# have no home and are always toggleable.)
 home=""
 case "$app" in
   wezterm-gui|WezTerm) home=terminal ;;
@@ -45,7 +59,7 @@ case "$app" in
 esac
 yabai_is_agent_app "$app" && home="$YABAI_AGENT_LABEL"
 
-if [ -n "$home" ]; then
+if [ "$floating" != "true" ] && [ -n "$home" ]; then
   cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)
   [ "$cur_label" = "$home" ] && exit 0
 fi
@@ -53,7 +67,7 @@ fi
 # Arc's two MAIN browser windows are pinned to main/school, so protect an Arc
 # window on main or school -- the same home-space guard the other pinned apps get
 # (pure yabai, no AXIdentifier; also shields a rare Little Arc on main/school).
-if [ "$app" = "Arc" ]; then
+if [ "$floating" != "true" ] && [ "$app" = "Arc" ]; then
   cur_label=$(yabai -m query --spaces --space "$cur" 2>/dev/null | jq -r '.label // ""' 2>/dev/null)
   case "$cur_label" in
     main|school) exit 0 ;;
