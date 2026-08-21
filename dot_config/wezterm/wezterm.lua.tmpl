@@ -78,7 +78,45 @@ config.audible_bell = "Disabled"
 config.adjust_window_size_when_changing_font_size = false
 config.check_for_updates = false      -- brew handles wezterm@nightly updates
 
+-- ── CMD+Q guard ────────────────────────────────────────────────────────
+-- CMD+Q is a WezTerm default key assignment (QuitApplication), so binding it
+-- here intercepts it before the app quits. It now takes QUIT_PRESSES presses in
+-- quick succession: any gap longer than QUIT_RESET_SECS resets the count to
+-- zero. State lives in wezterm.GLOBAL so it survives config reloads. This only
+-- guards the KEY -- the Dock/menu "Quit WezTerm" item still quits at once --
+-- and it says nothing about the tmux server this window attaches to, which
+-- keeps running either way.
+local QUIT_PRESSES = 5
+local QUIT_RESET_SECS = 1.5
+
+local quit_guard = wezterm.action_callback(function(window, pane)
+    local count = (wezterm.GLOBAL.quit_presses or 0) + 1
+
+    if count >= QUIT_PRESSES then
+        wezterm.GLOBAL.quit_presses = 0
+        window:perform_action(wezterm.action.QuitApplication, pane)
+        return
+    end
+
+    wezterm.GLOBAL.quit_presses = count
+    -- Each press invalidates the pending reset by bumping the token, so the
+    -- countdown runs from the LAST press rather than the first.
+    local token = (wezterm.GLOBAL.quit_token or 0) + 1
+    wezterm.GLOBAL.quit_token = token
+    wezterm.time.call_after(QUIT_RESET_SECS, function()
+        if wezterm.GLOBAL.quit_token == token then
+            wezterm.GLOBAL.quit_presses = 0
+        end
+    end)
+
+    wezterm.log_info(
+        ("CMD+Q ignored: %d of %d presses"):format(count, QUIT_PRESSES))
+end)
+
 config.keys = {
+    { key = "q", mods = "CMD", action = quit_guard },
+    { key = "q", mods = "CMD|SHIFT", action = quit_guard },
+
     {
         key = "t",
         mods = "CMD",
