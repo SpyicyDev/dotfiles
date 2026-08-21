@@ -32,7 +32,11 @@ yabai -m rule --add app="^BetterTouchTool$" manage=off
 yabai -m rule --add app="^Karabiner-Elements$" manage=off
 yabai -m rule --add app="^python$" manage=off
 yabai -m rule --add app="^DaisyDisk$" manage=off
-# (no `border=off`: yabai 7 dropped the key and logs `unknown key 'border'` for it.
+# (no `border=off`: yabai 6 removed window borders and every related rule key. An
+#  unknown key does not just log -- parse_rule() fails, so handle_domain_rule() calls
+#  rule_destroy() INSTEAD of rule_add() and the WHOLE rule is discarded. This app was
+#  therefore silently not manage=off from the yabai 6 upgrade until 2026-08-21:
+#  `yabai -m rule --list` showed 26 rules with no iStat Menus among them.
 #  Borders here come from the JankyBorders daemon, not yabai -- see yabai_float_borders.sh.)
 yabai -m rule --add app="^iStat Menus$" manage=off
 yabai -m rule --add app="^Steam$" manage=off

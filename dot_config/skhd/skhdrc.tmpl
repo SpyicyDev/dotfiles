@@ -105,8 +105,9 @@ hyper - n : yabai -m space --rotate 90
 # toggle maximize (zoom focused window to fill its space)
 hyper - m : yabai -m window --toggle zoom-fullscreen
 
-# toggle the focused window's float (works in BOTH stack and bsp). Refuses on a
-# pinned app on its home space + Arc on main/school (see yabai_toggle_float.sh).
+# toggle the focused window's float (works in BOTH stack and bsp). Refuses to FLOAT a
+# pinned app on its home space + Arc on main/school; un-floating one is always allowed,
+# so a window yabai flagged FLOAT by itself can be put back (see yabai_toggle_float.sh).
 hyper - t : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_toggle_float.sh
 
 # toggle fullscreen

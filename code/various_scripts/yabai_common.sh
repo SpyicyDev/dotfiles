@@ -30,7 +30,7 @@ YABAI_LABELS="terminal main school todo schedule mail calendar messages ai agent
 #   - yabairc            (the `space=agent` rule, via YABAI_AGENT_APPS_RE)
 #   - yabai_workspace_refresh.sh   (labeling the space by whoever is running)
 #   - yabai_send_window{,_external}.sh / yabai_toggle_float.sh  (pinned-home guard)
-#   - yabai_startup_reconcile.sh   (the login-race home map)
+#   - yabai_startup_reconcile.sh   (the login-race home map, via yabai_home_map_json)
 # Add an app HERE and every consumer picks it up. Names are yabai's `.app` field
 # (the app's display name), `|`-separated.
 YABAI_AGENT_LABEL="agent"
@@ -40,6 +40,57 @@ YABAI_AGENT_APPS="Conductor|Claudia|OpenChamber|OpenCode|Jean|T3 Code (Alpha)"
 # parens of names like "T3 Code (Alpha)" escaped so they aren't read as a group.
 # shellcheck disable=SC2034
 YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$"
+
+# --- pinned apps: app -> home space label ---------------------------------------
+# The single SHELL-side source of the pinned-app home map, in the same `|`-delimited
+# no-eval-no-regex shape as YABAI_AGENT_APPS (so names with spaces need no quoting
+# care). yabairc's `space=` rules are the one unavoidable mirror -- yabai cannot read
+# a shell map -- and Arc is deliberately absent here: its two main windows are pinned
+# by Hammerspoon's arcSync(), not by a `space=` rule.
+#
+# Consumed by: yabai_startup_reconcile.sh (the login-race + stray-float home map).
+# yabai_send_window{,_external}.sh and yabai_toggle_float.sh still carry their own
+# `case` copies; folding those in is a worthwhile follow-up, not a silent one.
+YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:schedule|Spark Mail:mail|Notion Calendar:calendar|Messages:messages|ChatGPT:ai|Claude:ai"
+
+# The same map as a JSON object, with the coding-agent apps folded in, for the jq
+# consumers. Emits nothing on failure so callers can test for an empty result.
+yabai_home_map_json() {
+  jq -n --arg pinned "$YABAI_PINNED_HOMES" \
+        --arg agents "$YABAI_AGENT_APPS" --arg agentlabel "$YABAI_AGENT_LABEL" '
+    ($pinned | split("|") | map(split(":") | { (.[0]): .[1] }) | add) as $pin
+    | ($agents | split("|") | map({ (.): $agentlabel }) | add) as $agent_home
+    | $pin + $agent_home' 2>/dev/null
+}
+
+# `yabai -m query --spaces` intermittently returns a bare "[" -- observed 2026-08-20
+# and again 2026-08-21, persisting for minutes -- while `--windows` and the INDEXED
+# form `--spaces --space <selector>` keep working throughout. A caller that polls on
+# the bulk form silently degrades to doing nothing until its time cap, so: retry
+# briefly, then rebuild the array one canonical label at a time.
+#
+# The fallback covers LABELED spaces only, which is all any consumer here wants (an
+# unlabeled space is one this workspace model does not manage). Emits nothing if even
+# that fails, so callers can test for an empty result.
+yabai_spaces_json() {
+  local out label one parts="" _try
+  for _try in 1 2 3; do
+    out=$(yabai -m query --spaces 2>/dev/null)
+    if printf '%s' "$out" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+      printf '%s' "$out"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  for label in $YABAI_LABELS; do
+    one=$(yabai -m query --spaces --space "$label" 2>/dev/null) || continue
+    printf '%s' "$one" | jq -e 'type == "object" and has("index")' >/dev/null 2>&1 || continue
+    parts="$parts$one,"
+  done
+  [ -n "$parts" ] || return 1
+  printf '[%s]' "${parts%,}" | jq -c '.' 2>/dev/null
+}
 
 # True if $1 is one of the coding-agent apps. Substring match on a `|`-delimited
 # list (no eval, no regex) so app names with spaces/parens need no quoting care.

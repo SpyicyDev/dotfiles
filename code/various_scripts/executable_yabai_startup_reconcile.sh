@@ -15,9 +15,9 @@
 # runs (main.c: window_manager_begin() precedes exec_config_file()), so no rule can
 # influence that pass. A window it momentarily cannot move is flagged FLOAT for good
 # (window_manager.c: `if (... || !window_can_move(window) || ...) window_set_flag(
-# window, WINDOW_FLOAT)`) -- i.e. any window whose AX position/size attributes are
-# not settable at the instant yabai looks, which a window still settling after a
-# restore can be. Nothing clears the flag afterwards: `rule --apply` re-pins the SPACE but
+# window, WINDOW_FLOAT)`) -- i.e. any window whose AX position attribute is not
+# settable at the instant yabai looks, which a window still settling after a restore
+# can be. Nothing clears the flag afterwards: `rule --apply` re-pins the SPACE but
 # leaves the window floating, so it sits unmanaged on that space indefinitely.
 # Observed 2026-08-21: Claude floating on `ai` after a yabai restart, while ChatGPT
 # on the same space tiled normally. `manage=on` on the space= rules does NOT fix
@@ -44,8 +44,12 @@ HS="/opt/homebrew/bin/hs"
 
 CAP_SECONDS="${YABAI_RECONCILE_CAP:-90}"   # hard stop so a never-launching app can't poll forever
 
-# shellcheck source=/dev/null  # required sibling: the agent app list (YABAI_AGENT_*)
-. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+# Required siblings, resolved by directory rather than $HOME so a chezmoi checkout or
+# a test copy runs against its own copies: yabai_common.sh (the agent app list and the
+# pinned-home map) and yabai_float_borders.sh (called after an un-float).
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/yabai_common.sh"
 LOCK="${TMPDIR:-/tmp}/yabai_startup_reconcile.lock"
 
 # Single-flight (mirrors yabai_heal.sh): one reconcile at a time. A concurrent
@@ -64,35 +68,78 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 
-# Pinned app -> home space label, as JSON. Mirrors the `space=` rules in yabairc and
-# the pinned-home guards in yabai_toggle_float.sh / yabai_send_window.sh; the agent
-# apps come from yabai_common.sh so that half can never drift. The single copy in
-# this file -- both pins_settled() and unfloat_pins() read it.
-pin_home_map() {
-  jq -n --arg agents "$YABAI_AGENT_APPS" --arg agentlabel "$YABAI_AGENT_LABEL" '
-    ($agents | split("|") | map({ (.): $agentlabel }) | add) as $agent_home
-    | { "wezterm-gui":"terminal", "WezTerm":"terminal", "Todoist":"todo",
-        "Granola":"schedule", "Spark Mail":"mail", "Notion Calendar":"calendar",
-        "Messages":"messages", "ChatGPT":"ai", "Claude":"ai" } + $agent_home' 2>/dev/null
-}
+# The pinned app -> home space map (JSON) comes from yabai_common.sh, which is where
+# this codebase keeps lists that more than one script needs. Computed ONCE at startup,
+# not per pass: it is a pure function of two constants, and the poll can run ~45 times.
+PIN_HOMES=$(yabai_home_map_json)
 
-# Are all RUNNING pinned apps on their home space AND tiled? Arc is handled by arcSync
-# and is excluded here; windows on an UNLABELED space (e.g. native-fullscreen) are
-# ignored -- yabai never tiles those, so a floating one is correct, not a defect.
-# Returns 0 (settled) when no pinned-app window sits on a wrong labeled space or
-# floats on a labeled one.
+# A window this script may un-float. yabai floats plenty of windows ON PURPOSE and
+# every one of them must be left alone -- a pinned app's non-standard second window
+# (settings sheet, save panel, palette), a sticky window, a scratchpad window, a
+# minimized or hidden one (which also reports can-move=false, so an un-float would be
+# dropped anyway), and a native-fullscreen window. This mirrors the eligibility filter
+# yabai_workspace_refresh.sh's space_for_app() already applies for the same reason.
+#
+# The filter is shared with pins_settled() BY CONSTRUCTION: if a window is ineligible
+# here it must not count as unsettled there either, or the poll spins to the cap every
+# 2s on a window this function will never touch.
+#
+# Deliberately NOT filtered on `can-move`: a window yabai cannot move right now is the
+# transient case this whole script exists for (that is what makes yabai flag FLOAT in
+# the first place), and it usually becomes movable a second later. Such a window stays
+# a candidate, its un-float is silently dropped, the verify catches that, and the poll
+# retries it -- bounded by MAX_ATTEMPTS so it cannot hold the loop open forever.
+JQ_ELIGIBLE='
+  select(.subrole == "AXStandardWindow")
+  | select(."root-window")
+  | select(."is-minimized" == false and ."is-hidden" == false)
+  | select(."is-sticky" == false and ."is-native-fullscreen" == false)
+  | select((.scratchpad // "") == "")'
+
+# ~20s of retries at the loop's 2s cadence -- long enough for a slow Electron window to
+# become movable, short enough that a permanently stuck one does not cost the full cap.
+MAX_ATTEMPTS=10
+
+# Space index -> label, plus the label of the FOCUSED space. Focused, not merely
+# visible: yabai re-tiles an un-floated window onto space_manager_active_space(),
+# which resolves to the space of the focused window's display -- i.e. the has-focus
+# space, the one place an un-float lands correctly with no repair.
+JQ_SPACE_MAPS='
+  ($s | map({ (.index|tostring): (.label // "") }) | add) as $lbl
+  | (($s | map(select(."has-focus")) | first | .label) // "") as $focused'
+
+# Are all RUNNING pinned apps on their home space AND not flagged FLOAT? Arc is handled
+# by arcSync and is excluded; windows on an UNLABELED space (e.g. a native-fullscreen
+# one) are ignored -- yabai never tiles those, so a floating one is correct.
+#
+# The float half is NOT re-derived here. unfloat_pins() runs first each pass and leaves
+# PENDING_FLOATS = how many windows it still intends to retry; anything it decided to
+# skip for good (ineligible, or floating on a bsp space it must not rebuild) is
+# deliberately NOT counted. Deriving that twice is how the predicate and the repair
+# drift apart, and a window the repair will never touch keeping the poll hot -- and
+# `rule --apply` + arcSync firing every 2s -- for the whole cap is the expensive kind
+# of drift. One decision point, in unfloat_pins; this just reads the tally.
+#
+# Takes the windows/spaces blobs so the poll queries yabai once per pass rather than
+# once per predicate.
 pins_settled() {
-  local win spaces home off
-  win=$(yabai -m query --windows 2>/dev/null) || return 1
-  spaces=$(yabai -m query --spaces 2>/dev/null) || return 1
-  home=$(pin_home_map) && [ -n "$home" ] || return 1
-  off=$(jq -n --argjson w "$win" --argjson s "$spaces" --argjson home "$home" '
+  local off
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+  [ "${PENDING_FLOATS:-0}" = "0" ] || return 1
+  off=$(jq -n --argjson w "$1" --argjson s "$2" --argjson home "$PIN_HOMES" '
     ($s | map({ (.index|tostring): (.label // "") }) | add) as $lbl
     | [ $w[]
         | select($home[.app] != null)
-        | { want: $home[.app], have: ($lbl[(.space|tostring)] // ""), float: ."is-floating" }
-        | select(.have != "")
-        | select(.have != .want or .float) ]
+        # Only windows yabai would ever move. An Electron app publishes hidden helper
+        # windows with an EMPTY subrole and can-move=false -- Claude Desktop ships two,
+        # parked on whatever space it launched from. `rule --apply` cannot move them, so
+        # counting them meant this poll could NEVER settle and burned its whole cap,
+        # re-running rule --apply + arcSync every 2s, at every login. (Pre-dates the
+        # un-float work; found 2026-08-21 when two such windows appeared mid-test.)
+        | select(.subrole == "AXStandardWindow")
+        | select(."root-window")
+        | { want: $home[.app], have: ($lbl[(.space|tostring)] // "") }
+        | select(.have != "" and .have != .want) ]
     | length' 2>/dev/null) || return 1
   [ "${off:-1}" = "0" ]
 }
@@ -110,13 +157,29 @@ pins_settled() {
 # (Claude on `ai` un-floated while `terminal` was active -> WezTerm and Claude came
 # back as stack-index 1 and 2 of the same view, ChatGPT ejected to 0).
 #
-# The repair is to bounce the window through another space afterwards:
-# window_manager_send_window_to_space() untiles it from whatever view currently holds
-# it and re-tiles it on the DESTINATION space, so a round trip lands it in its own
-# tree. It is a no-op in the case where the un-float already landed correctly (the
-# window's space happened to be active), so it runs unconditionally -- no branch to
-# get wrong. The scratch space is picked to be neither home nor the space the user is
-# looking at, so the bounce never flashes a window onto their screen.
+# The repair is to REBUILD THE HOME SPACE'S VIEW afterwards -- `--layout bsp` then back
+# to `--layout stack` re-derives the tree from actual window->space membership, which
+# both re-homes the window and drops the stale registration from the other view.
+# Verified live 2026-08-21: with `terminal` active, a corrupted `todo` (Todoist sharing
+# WezTerm's view at stack-index 1/2) came back correct -- Todoist alone on `todo`,
+# WezTerm alone on `terminal` -- by flipping `todo` ALONE, addressed by label.
+#
+# The obvious alternative -- bounce the window through another space and back, so
+# send_window_to_space() re-tiles it on the destination -- was implemented first and is
+# WRONG here. It needs the scripting addition, which may not be loaded yet at login
+# (`window --space` then fails SILENTLY and exit-0, so the failure is undetectable and
+# the window is left cross-registered); yabai REFUSES to move a window into a
+# native-fullscreen space, which strands WezTerm off `terminal` whenever
+# yabai_terminal_follow.sh has moved that label onto a fullscreen Space; the outbound
+# leg hands focus to another window when the source space is visible
+# (window_manager.c:2099); and it parks the window somewhere
+# yabai_workspace_refresh.sh's label-follows-app logic can see and re-label it. The
+# flip touches no window and needs no scripting addition.
+#
+# It costs one thing: a flip re-derives a bsp tree from scratch, losing hand-tuned
+# splits. So a window whose home space is bsp AND not the active space is SKIPPED
+# rather than repaired -- left floating, which is the benign failure. Every space in
+# this config is `stack` (yabairc sets `layout stack`), so that path is currently dead.
 #
 # This is also why `manage=on` on the yabairc space= rules is the wrong fix: it does
 # suppress the misclassification for windows created while yabai is already running
@@ -126,54 +189,80 @@ pins_settled() {
 # application_launched -- take the un-float path above from whatever space happens to
 # be active. That trades a floating window for a corrupted cross-space stack.
 unfloat_pins() {
-  local win spaces home active floaters id sp scratch
-  win=$(yabai -m query --windows 2>/dev/null) || return 0
-  spaces=$(yabai -m query --spaces 2>/dev/null) || return 0
-  home=$(pin_home_map) && [ -n "$home" ] || return 0
+  local floaters id label layout focused attempts changed=0 pending=0
 
-  floaters=$(jq -r -n --argjson w "$win" --argjson s "$spaces" --argjson home "$home" '
-    ($s | map({ (.index|tostring): (.label // "") }) | add) as $lbl
-    | $w[]
-    | select($home[.app] != null)
-    | select(."is-floating")
-    | select(($lbl[(.space|tostring)] // "") != "")
-    | "\(.id) \(.space)"' 2>/dev/null) || return 0
+  PENDING_FLOATS=0
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 0
+
+  # id, home LABEL (never an index -- indices renumber, and yabai_workspace_refresh.sh
+  # / yabai_reorder_spaces.sh / yabai_displays.sh can all renumber them mid-poll; the
+  # siblings compare by label for exactly this reason), the home space's layout, and
+  # whether that space is the focused one.
+  floaters=$(jq -r -n --argjson w "$1" --argjson s "$2" --argjson home "$PIN_HOMES" "
+    $JQ_SPACE_MAPS
+    | (\$s | map({ (.index|tostring): (.type // \"\") }) | add) as \$type
+    | \$w[]
+    | select(\$home[.app] != null)
+    | select(.\"is-floating\")
+    | $JQ_ELIGIBLE
+    | { l: (\$lbl[(.space|tostring)] // \"\"), t: (\$type[(.space|tostring)] // \"\") }
+      as \$sp
+    | select(\$sp.l != \"\")
+    | \"\(.id) \(\$sp.l) \(\$sp.t) \(if \$sp.l == \$focused then 1 else 0 end)\"
+    " 2>/dev/null) || return 0
   [ -n "$floaters" ] || return 0
 
-  active=$(printf '%s' "$spaces" | jq -r '.[] | select(."has-focus") | .index' 2>/dev/null)
+  while read -r id label layout focused; do
+    [ -n "$id" ] && [ -n "$label" ] || continue
 
-  printf '%s\n' "$floaters" | while read -r id sp; do
-    [ -n "$id" ] && [ -n "$sp" ] || continue
+    # Decide repairability BEFORE touching anything: un-floating a window we then
+    # cannot re-home would leave the corruption instead of the float.
+    [ "$focused" = "1" ] || [ "$layout" = "stack" ] || continue
 
-    yabai -m window "$id" --toggle float >/dev/null 2>&1 || continue
-    # An un-float attempted too early is dropped silently, and bouncing a window that
-    # is still floating would only shuffle it between spaces -- so confirm it took.
-    [ "$(yabai -m query --windows --window "$id" 2>/dev/null \
-         | jq -r '."is-floating"' 2>/dev/null)" = "false" ] || continue
+    # Give up on a window that keeps refusing, so one stubborn case cannot keep the
+    # poll hot -- and the active space thrashing -- for the whole 90s cap.
+    attempts="ATTEMPT_${id}"
+    eval "attempts=\${$attempts:-0}"
+    [ "$attempts" -ge "$MAX_ATTEMPTS" ] && continue
+    eval "ATTEMPT_${id}=$((attempts + 1))"
 
-    # Never home (a same-space move is a no-op: send_window_to_space returns early
-    # when src == dst) and never the space the user is looking at. `agent` is tried
-    # first because it is the designated background space -- nothing of the user's
-    # lives there, so a sub-second visit is the least likely to ever be seen.
-    scratch=$(printf '%s' "$spaces" | jq -r \
-      --arg h "$sp" --arg a "${active:-}" --arg pref "$YABAI_AGENT_LABEL" '
-      [ .[] | select((.label // "") != "") ]
-      | (map(select(.label == $pref)) + .)
-      | map(.index | tostring)
-      | map(select(. != $h and . != $a))
-      | first // empty' 2>/dev/null)
-    [ -n "$scratch" ] || continue
+    yabai -m window "$id" --toggle float >/dev/null 2>&1 || { pending=$((pending + 1)); continue; }
+    # An un-float attempted too early is dropped SILENTLY and exit-0 (the force=false
+    # path returns without a daemon_fail), so the exit status proves nothing -- and a
+    # `--toggle` acts on a snapshot that may be stale by now, e.g. because the user
+    # just pressed hyper+t. Confirm the post-state, and undo an accidental float.
+    case "$(yabai -m query --windows --window "$id" 2>/dev/null \
+            | jq -r '."is-floating"' 2>/dev/null)" in
+      false) : ;;
+      true)  yabai -m window "$id" --toggle float >/dev/null 2>&1 || true
+             pending=$((pending + 1)); continue ;;
+      *)     pending=$((pending + 1)); continue ;;
+    esac
+    changed=1
 
-    yabai -m window "$id" --space "$scratch" >/dev/null 2>&1 || continue
-    yabai -m window "$id" --space "$sp"      >/dev/null 2>&1 || true
-  done
+    # Rebuild the home view unless the un-float already landed there (home == the
+    # focused space => yabai tiled it correctly and a flip would only churn the view
+    # the user is looking at). Cheap and idempotent on a stack space; a bsp home space
+    # never reaches here -- it was skipped above.
+    [ "$focused" = "1" ] && continue
+    yabai -m space "$label" --layout bsp   >/dev/null 2>&1 || continue
+    yabai -m space "$label" --layout stack >/dev/null 2>&1 || true
+  done <<EOF
+$floaters
+EOF
 
-  # The float set just changed, and an un-float emits no window_created/destroyed --
-  # the same gap yabai_toggle_float.sh covers after hyper+t. Without this the borders
-  # daemon keeps the stale whitelist yabairc's startup `sync` gave it and draws a
-  # floating-window border around a window that is now tiled. Only reached when there
-  # was at least one floating pinned window, and sync is a no-op if borders is absent.
-  "$HOME/code/various_scripts/yabai_float_borders.sh" sync >/dev/null 2>&1 || true
+  # What pins_settled() reads: windows still floating that this function intends to
+  # retry. Skipped-for-good cases were never counted, so they cannot hold the poll open.
+  PENDING_FLOATS=$pending
+
+  # An un-float changes the float set but emits no window_created/destroyed -- the same
+  # gap yabai_toggle_float.sh covers after hyper+t. Without this the borders daemon
+  # keeps the stale whitelist yabairc's startup `sync` gave it and draws a floating-
+  # window border around a window that is now tiled. Gated on an actual change: the
+  # sync forks a full query + a 0.15s settle, and on a stubborn window the poll would
+  # otherwise fire ~45 of them, most of which lose that script's own single-flight lock.
+  [ "$changed" = "1" ] || return 0
+  "$SCRIPT_DIR/yabai_float_borders.sh" sync >/dev/null 2>&1 || true
 }
 
 # Ensure the scripting addition is loaded (window->space moves need it). `-n` so a
@@ -189,8 +278,20 @@ deadline=$(( $(date +%s) + CAP_SECONDS ))
 while :; do
   yabai -m rule --apply >/dev/null 2>&1 || true
   "$HS" -c "arcSync()" >/dev/null 2>&1 || true
-  unfloat_pins
-  pins_settled && break
+
+  # One pair of queries per pass, shared by both predicates below (they used to query
+  # yabai twice each -- 4 round trips a pass, ~45 passes at the cap).
+  win=$(yabai -m query --windows 2>/dev/null) || win=""
+  # Not a bare `yabai -m query --spaces`: that call intermittently returns "[" for
+  # minutes at a time, and without the fallback both predicates below go blind and the
+  # poll burns its whole cap doing nothing (seen exactly that way while testing this).
+  spaces=$(yabai_spaces_json) || spaces=""
+
+  unfloat_pins "$win" "$spaces"
+  # unfloat_pins mutates what pins_settled reads, so re-read rather than reuse the
+  # blobs above -- otherwise a pass that just healed everything still reports unsettled
+  # and the poll always costs one extra 2s sleep.
+  pins_settled "$(yabai -m query --windows 2>/dev/null)" "$spaces" && break
   [ "$(date +%s)" -ge "$deadline" ] && break
   sleep 2
 done
