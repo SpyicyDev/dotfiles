@@ -100,6 +100,9 @@ mode="${1:-}"
 agent="${2:-}"
 
 JQ="$(command -v jq || true)"
+# Shared with CuaNotch's cua-notch-agent-hook: the one implementation of "is
+# background work from this session still out?". See its header.
+BG_PENDING="$HOME/.local/share/cua-notch/agent-bg-pending"
 
 # Watchdog for the companion daemon. agent-tab-watcher.sh is spawned exactly
 # once, from tmux.conf, so if it ever dies mid-session (stray pkill, OOM, a
@@ -727,6 +730,28 @@ case "$mode" in
         set_state "$win" needs-input
         ;;
     done)
+        # A turn that ended WAITING on work it launched has not finished, and
+        # this tab must not say it has. Mack's call, 2026-08-21, after the tab
+        # went green while CuaNotch went amber for the same session at the same
+        # moment: a pending background agent or a live workflow keeps the tab
+        # running. The rule lives in agent-bg-pending, which the notch's hook
+        # calls too — a duplicated ALGORITHM is not something check-invariants
+        # can compare the way it compares duplicated constants, so there is
+        # exactly one copy of it and two callers.
+        bg_pending=0
+        if [ -n "$JQ" ] && [ -n "$payload" ] && [ -x "$BG_PENDING" ]; then
+            bg_tp=$("$JQ" -r '.transcript_path // empty' <<<"$payload" 2>/dev/null || true)
+            bg_sid=$("$JQ" -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
+            bg_cwd=$("$JQ" -r '.cwd // empty' <<<"$payload" 2>/dev/null || true)
+            if [ -n "$bg_tp" ] && "$BG_PENDING" "$bg_tp" "$bg_sid" "$bg_cwd"; then
+                bg_pending=1
+            fi
+        fi
+        if [ "$bg_pending" -eq 1 ]; then
+            set_state "$win" running
+            compose_summary "$win" "$(extract_summary "$payload")" "$payload"
+            exit 0
+        fi
         # Don't tint a window someone is actively watching — they saw it finish.
         if [ "$watched" -gt 0 ]; then
             set_state "$win" idle
