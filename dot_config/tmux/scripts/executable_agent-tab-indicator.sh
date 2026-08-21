@@ -3,11 +3,21 @@
 # lifecycle hooks so the Catppuccin tab bar reflects agent state.
 #
 # Options written (window scope; unset = no agent in window):
-#   @agent_state    idle | running | needs-approval | needs-input | done
-#                   (the two needs-* states share every behavior — they differ
-#                   only in tint: red = blocked on your approval, yellow =
-#                   blocked on your answer. Match them with a needs-* glob,
-#                   never by listing one of them.)
+#   @agent_state    idle | running | needs-input | failed | done
+#                   REPALETTED 2026-08-21 (Mack's call): yellow means
+#                   SOMETHING IS WAITING ON YOU — approvals and questions
+#                   alike, one state — and red means SOMETHING BROKE. Red used
+#                   to mean "wants your consent", which fired many times an
+#                   hour; a color that constant is wallpaper, not an alarm.
+#                   Failures are rare, so red is worth something again.
+#                   It also deleted the hardest thing here: approvals and
+#                   questions come through the same events and only one of the
+#                   two events describing a gate can name which it is, which
+#                   painted a question red twice in two days. Nothing left to
+#                   tell apart. `needs-approval` is retired as a STATE (it
+#                   survives only as the mode name settings.json passes).
+#                   Both tinted states want dark text — match them together,
+#                   never by listing one.
 #   @agent_summary  "<project>/<ultra-short title>" shown as the tab name;
 #                   project = basename of the agent's cwd, title = the
 #                   conversation title condensed to its 2-4 identifying
@@ -52,53 +62,33 @@
 #                                      resurrect a finished tab; skips stdin
 #                                      entirely — payloads can be huge
 #   needs-approval  PermissionRequest, and Notification(permission_prompt)
-#                                    → blocked on a permission decision (red).
-#                                      BOTH events describe the SAME gate —
-#                                      PermissionRequest is the structural one
+#                → sets needs-input (YELLOW). Both events describe the SAME
+#                                      gate: PermissionRequest is structural
 #                                      (always fires, carries the tool name),
-#                                      the Notification is the "look over here"
-#                                      that Claude suppresses while the
-#                                      terminal is focused. They mapped to
-#                                      different colors until 2026-08-19, so
-#                                      one gate painted amber or red depending
-#                                      on which event landed (and on focus);
-#                                      a permission gate is unambiguously an
-#                                      approval, so both are red now.
-#                                      EXCEPT A QUESTION (AskUserQuestion),
-#                                      which Claude also routes through these
-#                                      two events and which is yellow. Only
-#                                      the PermissionRequest can prove it is
-#                                      one — the Notification names no tool —
-#                                      so the first event LATCHES @agent_ask
-#                                      and the second inherits it. Without
-#                                      that latch the tab went yellow then red
-#                                      seven seconds later, on one gate
-#                                      (2026-08-21, user-reported).
-#   @agent_ask      1 while the standing gate is a question rather than a
-#                   consent request. Set by the event that can prove it, read
-#                   by the one that cannot. Cleared at TURN boundaries only
-#                   (running/done/clear) — never by focus, because looking at
-#                   a question does not answer it.
-#   needs-input  StopFailure         → blocked on an answer (yellow): the turn
-#                                      itself failed (529, overloaded) and
-#                                      wants you to retry — NOT a tool gate.
-#                                      Both attention states are always
-#                                      asserted (focus ≠ answer) and are
-#                                      discharged by the focus hook.
-#                                      needs-input still never downgrades a
-#                                      standing needs-approval (the guard now
-#                                      only covers a StopFailure landing on a
-#                                      live gate, but red must still win).
+#                                      the Notification is the "look over
+#                                      here" that Claude suppresses while the
+#                                      terminal is focused, and it names
+#                                      nothing. That asymmetry is why sorting
+#                                      approvals from questions kept failing,
+#                                      and why they no longer are: one state,
+#                                      and the tab name says which session.
+#   failed       StopFailure         → the TURN ITSELF died (529, overloaded).
+#                                      Red. Nothing is waiting on an answer;
+#                                      something broke. Asserted like the
+#                                      other attention state (focus ≠ fixed)
+#                                      and discharged by the focus hook.
 #   done         Stop                → turn finished; refresh @agent_summary;
 #                                      not tinted if a client is watching it
 #   clear        SessionEnd          → remove state (skipped for clear/resume,
 #                                      which are followed by a new SessionStart)
 #   clear-current  focus hook        → attention states → idle once seen;
 #                                      needs-input also stamps @agent_pending
+#                                      so the answered turn resumes as running
 #
 # "Seen-it" semantics: a tinted tab discharges to idle when you focus it
 # (clear-current); `done` additionally isn't tinted if its window is already
-# being watched. needs-input always tints so a prompt is never lost.
+# being watched. needs-input and failed always tint, so neither a prompt nor
+# a dead turn is ever lost.
 # Answering a permission prompt usually REQUIRES focusing the window, and the
 # focus discharge destroys needs-input before any heartbeat can re-arm from
 # it — so heartbeat's needs-input path alone left the tab idle for the rest
@@ -177,56 +167,6 @@ window_state() {
     tmux show-options -wqv -t "$1" @agent_state 2>/dev/null || true
 }
 
-# Tools that ASK rather than ACT.
-#
-# PermissionRequest is NOT only about permission: Claude Code routes
-# AskUserQuestion through the same structural event. Captured from a scratch
-# session driven into a question (2026-08-20):
-#   mode=needs-approval evt=PermissionRequest tool=AskUserQuestion
-# so every question painted the tab RED — user-reported. A question has no
-# side effect and carries no risk; it wants a choice, not consent. Spending
-# the loudest signal we have on the least urgent thing trains you to discount
-# red, so these route to needs-input (yellow) instead.
-#
-# KEEP THIS NAME IN SYNC with QUESTION_TOOLS in ~/.local/bin/cua-notch-agent-hook:
-# CuaNotch makes the identical distinction, and a future ask-shaped tool has to
-# be added on BOTH surfaces (the shared name is the grep handle). A tool absent
-# from the set defaults to red, which is the safe direction.
-QUESTION_TOOLS="askuserquestion"
-is_question_payload() {
-    local p="$1" tool msg norm
-    { [ -n "$JQ" ] && [ -n "$p" ]; } || return 1
-    tool=$("$JQ" -r '.tool_name // .tool // empty' <<<"$p" 2>/dev/null || true)
-    if [ -n "$tool" ]; then
-        norm=$(printf '%s' "$tool" | tr 'A-Z' 'a-z' | tr -d ' _-')
-        case " $QUESTION_TOOLS " in *" $norm "*) return 0 ;; esac
-        return 1
-    fi
-    # No structural tool name — a Notification. FALSIFIED 2026-08-21: this
-    # said "no question arrives that way today (verified)", and one does. A
-    # question gate fires the PermissionRequest (which names the tool, and is
-    # classified correctly) and then, about seven seconds later, the generic
-    # permission Notification — same gate, no tool name, and a message that
-    # does not contain the tool either. So this test returns false for the
-    # SECOND half of a gate it got right the first time, and the tab flipped
-    # yellow → red while the question was still standing. Measured on both
-    # surfaces: notch=input 15:14:45, notch=approval 15:14:52.
-    #
-    # The message check below is kept — it costs nothing and would catch a
-    # differently-worded future notification — but it is no longer what makes
-    # questions work. That is the @agent_ask latch in the needs-approval
-    # branch: a gate that cannot name itself does not get to overrule the
-    # event that could.
-    #
-    # Compare with spacing stripped: Claude renders the tool into prose as
-    # "Ask User Question", so a literal match on the camel-case name would
-    # silently fail.
-    msg=$("$JQ" -r '.message // empty' <<<"$p" 2>/dev/null || true)
-    [ -n "$msg" ] || return 1
-    norm=$(printf '%s' "$msg" | tr 'A-Z' 'a-z' | tr -d ' _-')
-    case "$norm" in *askuserquestion*) return 0 ;; esac
-    return 1
-}
 
 set_state() {
     # Write + redraw only on change; heartbeat fires on every tool call and
@@ -258,24 +198,8 @@ clear_pending() {
     tmux set-option -uw -t "$1" @agent_pending 2>/dev/null || true
 }
 
-window_ask() {
-    tmux show-options -wqv -t "$1" @agent_ask 2>/dev/null || true
-}
 
-# The question latch is about the GATE, not about the tab's tint, so focusing
-# the window must NOT clear it — the gate is still standing after you look at
-# it. Only a turn boundary (a new tool call, or the turn ending) means the
-# question is behind us.
-clear_ask() {
-    tmux set-option -uw -t "$1" @agent_ask 2>/dev/null || true
-}
 
-# The tool a payload names, or empty. An event that names nothing cannot be
-# trusted to reclassify a gate another event already identified.
-payload_tool() {
-    { [ -n "$JQ" ] && [ -n "$1" ]; } || return 0
-    "$JQ" -r '.tool_name // .tool // empty' <<<"$1" 2>/dev/null || true
-}
 
 sanitize_summary() {
     # One line, no format-significant characters, bounded length. The value
@@ -530,7 +454,7 @@ if [ "$mode" = "clear-current" ]; then
     fi
     [ -n "$win" ] || exit 0
     case "$(window_state "$win")" in
-        needs-*)
+        needs-*|failed)
             # The user came to answer the prompt. Discharge the tint, but
             # stamp @agent_pending so the next heartbeat can restore
             # `running` once the answered turn resumes — the discharge
@@ -651,7 +575,7 @@ win=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null || true)
 if [ "$mode" = "heartbeat" ]; then
     ( cat >/dev/null 2>&1 & ) 2>/dev/null
     case "$(window_state "$win")" in
-        running|needs-*) set_state "$win" running ;;
+        running|needs-*|failed) set_state "$win" running ;;
         idle)
             # idle + @agent_pending = an answered permission prompt's turn
             # resuming (see clear-current). Single-use and age-gated, so a
@@ -753,42 +677,26 @@ case "$mode" in
     running)
         set_state "$win" running
         clear_pending "$win"
-        clear_ask "$win"
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     needs-approval)
-        # Always assert — focusing a window is not answering its prompt. The
-        # focus hook (clear-current) discharges needs-*→idle once seen, so
-        # a prompt is never silently lost by switching away.
-        #
-        # ...unless the "permission request" is actually a QUESTION (see
-        # is_question_payload): that is a yellow ask, not a red one. It still
-        # loses to a standing gate — if both are somehow live, the one that
-        # wants consent outranks the one that wants an opinion.
-        if is_question_payload "$payload"; then
-            [ "$(window_state "$win")" = needs-approval ] && exit 0
-            # Latch it: this GATE is a question, and the follow-up
-            # Notification about the same gate arrives unable to say so.
-            tmux set-option -w -t "$win" @agent_ask 1 2>/dev/null || true
-            set_state "$win" needs-input
-        elif [ -z "$(payload_tool "$payload")" ] && [ "$(window_ask "$win")" = 1 ]; then
-            # THE SAME GATE, RE-ANNOUNCING ITSELF WITH LESS INFORMATION.
-            # An event that cannot name what it is asking for must not
-            # overrule the one that could — the PermissionRequest already
-            # identified this gate structurally, seconds ago. This is the
-            # mirror of the rule right below it (a live gate outranks a
-            # StopFailure landing on top of it); the missing half was that a
-            # nameless notification must not UPGRADE a standing question.
-            set_state "$win" needs-input
-        else
-            set_state "$win" needs-approval
-        fi
-        ;;
-    needs-input)
-        # Same, except a live permission gate (red) outranks a StopFailure
-        # landing on top of it (see header).
-        [ "$(window_state "$win")" = needs-approval ] && exit 0
+        # MODE NAME IS HISTORICAL — it is the argument ~/.claude/settings.json
+        # passes, and it now means "blocked on the user", approval or question
+        # alike. Always assert: focusing a window is not answering its prompt.
+        # The focus hook (clear-current) discharges attention states → idle
+        # once seen, so a prompt is never silently lost by switching away.
+        # Approvals and questions are ONE yellow state since 2026-08-21.
+        # They arrive through the same events, and of the two events that
+        # describe a single gate only one can name which kind it is — so
+        # telling them apart painted a question red twice in two days. There
+        # is nothing left to get wrong: both mean "waiting on you", and the
+        # tab name still says which session.
         set_state "$win" needs-input
+        ;;
+    failed)
+        # The turn itself died (529, overloaded). RED, and red now means
+        # exactly this — nothing is waiting on an answer, something broke.
+        set_state "$win" failed
         ;;
     done)
         # A turn that ended WAITING on work it launched has not finished, and
@@ -808,7 +716,6 @@ case "$mode" in
                 bg_pending=1
             fi
         fi
-        clear_ask "$win"
         if [ "$bg_pending" -eq 1 ]; then
             set_state "$win" running
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
@@ -833,7 +740,7 @@ case "$mode" in
         clear_state "$win"
         ;;
     *)
-        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|needs-input|done|clear|clear-current> [claude|codex]" >&2
+        echo "Usage: agent-tab-indicator.sh <idle|running|heartbeat|needs-approval|failed|done|clear|clear-current> [claude|codex]" >&2
         # exit 0, not 1: codex treats a hook's exit status as a GATE (see the
         # header), so a typo'd mode in hooks.json would block every codex
         # event rather than just failing to paint a tab. A silently inert
