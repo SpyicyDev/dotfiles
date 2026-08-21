@@ -64,6 +64,21 @@
 #                                      on which event landed (and on focus);
 #                                      a permission gate is unambiguously an
 #                                      approval, so both are red now.
+#                                      EXCEPT A QUESTION (AskUserQuestion),
+#                                      which Claude also routes through these
+#                                      two events and which is yellow. Only
+#                                      the PermissionRequest can prove it is
+#                                      one — the Notification names no tool —
+#                                      so the first event LATCHES @agent_ask
+#                                      and the second inherits it. Without
+#                                      that latch the tab went yellow then red
+#                                      seven seconds later, on one gate
+#                                      (2026-08-21, user-reported).
+#   @agent_ask      1 while the standing gate is a question rather than a
+#                   consent request. Set by the event that can prove it, read
+#                   by the one that cannot. Cleared at TURN boundaries only
+#                   (running/done/clear) — never by focus, because looking at
+#                   a question does not answer it.
 #   needs-input  StopFailure         → blocked on an answer (yellow): the turn
 #                                      itself failed (529, overloaded) and
 #                                      wants you to retry — NOT a tool gate.
@@ -187,11 +202,25 @@ is_question_payload() {
         case " $QUESTION_TOOLS " in *" $norm "*) return 0 ;; esac
         return 1
     fi
-    # No structural tool name — a Notification. No question arrives that way
-    # today (verified), but the branch is gated anyway so a future one can't
-    # go red behind our backs. Compare with spacing stripped: Claude renders
-    # the tool into prose as "Ask User Question", so a literal match on the
-    # camel-case name would silently fail.
+    # No structural tool name — a Notification. FALSIFIED 2026-08-21: this
+    # said "no question arrives that way today (verified)", and one does. A
+    # question gate fires the PermissionRequest (which names the tool, and is
+    # classified correctly) and then, about seven seconds later, the generic
+    # permission Notification — same gate, no tool name, and a message that
+    # does not contain the tool either. So this test returns false for the
+    # SECOND half of a gate it got right the first time, and the tab flipped
+    # yellow → red while the question was still standing. Measured on both
+    # surfaces: notch=input 15:14:45, notch=approval 15:14:52.
+    #
+    # The message check below is kept — it costs nothing and would catch a
+    # differently-worded future notification — but it is no longer what makes
+    # questions work. That is the @agent_ask latch in the needs-approval
+    # branch: a gate that cannot name itself does not get to overrule the
+    # event that could.
+    #
+    # Compare with spacing stripped: Claude renders the tool into prose as
+    # "Ask User Question", so a literal match on the camel-case name would
+    # silently fail.
     msg=$("$JQ" -r '.message // empty' <<<"$p" 2>/dev/null || true)
     [ -n "$msg" ] || return 1
     norm=$(printf '%s' "$msg" | tr 'A-Z' 'a-z' | tr -d ' _-')
@@ -227,6 +256,25 @@ clear_state() {
 
 clear_pending() {
     tmux set-option -uw -t "$1" @agent_pending 2>/dev/null || true
+}
+
+window_ask() {
+    tmux show-options -wqv -t "$1" @agent_ask 2>/dev/null || true
+}
+
+# The question latch is about the GATE, not about the tab's tint, so focusing
+# the window must NOT clear it — the gate is still standing after you look at
+# it. Only a turn boundary (a new tool call, or the turn ending) means the
+# question is behind us.
+clear_ask() {
+    tmux set-option -uw -t "$1" @agent_ask 2>/dev/null || true
+}
+
+# The tool a payload names, or empty. An event that names nothing cannot be
+# trusted to reclassify a gate another event already identified.
+payload_tool() {
+    { [ -n "$JQ" ] && [ -n "$1" ]; } || return 0
+    "$JQ" -r '.tool_name // .tool // empty' <<<"$1" 2>/dev/null || true
 }
 
 sanitize_summary() {
@@ -705,6 +753,7 @@ case "$mode" in
     running)
         set_state "$win" running
         clear_pending "$win"
+        clear_ask "$win"
         compose_summary "$win" "$(extract_summary "$payload")" "$payload"
         ;;
     needs-approval)
@@ -718,6 +767,18 @@ case "$mode" in
         # wants consent outranks the one that wants an opinion.
         if is_question_payload "$payload"; then
             [ "$(window_state "$win")" = needs-approval ] && exit 0
+            # Latch it: this GATE is a question, and the follow-up
+            # Notification about the same gate arrives unable to say so.
+            tmux set-option -w -t "$win" @agent_ask 1 2>/dev/null || true
+            set_state "$win" needs-input
+        elif [ -z "$(payload_tool "$payload")" ] && [ "$(window_ask "$win")" = 1 ]; then
+            # THE SAME GATE, RE-ANNOUNCING ITSELF WITH LESS INFORMATION.
+            # An event that cannot name what it is asking for must not
+            # overrule the one that could — the PermissionRequest already
+            # identified this gate structurally, seconds ago. This is the
+            # mirror of the rule right below it (a live gate outranks a
+            # StopFailure landing on top of it); the missing half was that a
+            # nameless notification must not UPGRADE a standing question.
             set_state "$win" needs-input
         else
             set_state "$win" needs-approval
@@ -747,6 +808,7 @@ case "$mode" in
                 bg_pending=1
             fi
         fi
+        clear_ask "$win"
         if [ "$bg_pending" -eq 1 ]; then
             set_state "$win" running
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
