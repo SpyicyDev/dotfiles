@@ -27,7 +27,7 @@
 # file, so codex windows fall through the lookup naturally.)
 #
 # It also flags COMPUTER USE. cua-mcp-shim stamps every driver tool call into
-# ~/.local/share/cua-notch/activity.json with the owning agent's pid, which is
+# ~/Library/Application Support/CuaNotch/activity.json with the owning agent's pid, which is
 # the same pane→pid map the workflow lookup already builds — so a window whose
 # agent has driven an app within CUA_LIVE seconds gets a per-window @agent_cua
 # flag, rendered as a blue robot. This is the tab-bar twin of CuaNotch's blue
@@ -238,7 +238,7 @@ session_has_running_workflow() {
 # Agent pids that have driven an app within CUA_LIVE seconds, space-delimited
 # (" 123 456 "). Mirrors CuaNotch's own liveWindow so the tab and the notch
 # light up and go dark together. Missing/garbage file → empty (never fatal).
-ACTIVITY="$HOME/.local/share/cua-notch/activity.json"
+ACTIVITY="$HOME/Library/Application Support/CuaNotch/activity.json"
 # 60s, matching CuaNotch's liveWindow AND the shim's LOCK_TTL: a drive is in
 # progress for as long as the shim holds its window lock, and an agent that
 # thinks for 25s between two clicks is still driving. At 15 the tab glyph

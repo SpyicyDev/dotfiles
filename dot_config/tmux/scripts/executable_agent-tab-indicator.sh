@@ -107,7 +107,7 @@ agent="${2:-}"
 JQ="$(command -v jq || true)"
 # Shared with CuaNotch's cua-notch-agent-hook: the one implementation of "is
 # background work from this session still out?". See its header.
-BG_PENDING="$HOME/.local/share/cua-notch/agent-bg-pending"
+BG_PENDING="$HOME/.local/bin/agent-bg-pending"
 
 # Watchdog for the companion daemon. agent-tab-watcher.sh is spawned exactly
 # once, from tmux.conf, so if it ever dies mid-session (stray pkill, OOM, a
