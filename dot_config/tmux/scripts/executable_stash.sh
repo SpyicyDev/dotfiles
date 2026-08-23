@@ -18,6 +18,12 @@ set -uo pipefail
 
 HOLD=stash          # the detached holding session
 
+# Absolute, because this script re-enters itself inside a popup and
+# `display-popup` does NOT expand #{...} formats in its command the way
+# run-shell does — a `#{HOME}/...` path reaches the popup's shell literally,
+# fails to exec, and the popup vanishes instantly with no error anywhere.
+SELF="$HOME/.config/tmux/scripts/stash.sh"
+
 hold_exists() { tmux has-session -t "=$HOLD" 2>/dev/null; }
 count()       { hold_exists && tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ' || echo 0; }
 msg()         { tmux display-message "stash: $*" 2>/dev/null; }
@@ -56,7 +62,6 @@ do_stash() {
     tmux move-window -s "$win" -t "$HOLD": || { msg "could not park it"; return 1; }
     [ -n "$boot" ] && tmux kill-window -t "$boot" 2>/dev/null
     publish
-    msg "parked ($(count) hidden) — prefix+h to bring back"
 }
 
 do_unstash() {
@@ -64,17 +69,15 @@ do_unstash() {
     hold_exists || { msg "nothing is parked"; return 0; }
 
     if [ -z "$win" ]; then
-        local n; n=$(count)
-        if [ "$n" = 1 ]; then
-            win=$(tmux list-windows -t "=$HOLD" -F '#{window_id}' | head -1)
-        else
-            # More than one: pick. Popup + fzf, matching the picker style
-            # already used for sessions (prefix+a).
-            win=$(tmux list-windows -t "=$HOLD" -F '#{window_id}	#{window_name}	#{?#{@agent_summary},#{@agent_summary},#{pane_current_path}}' \
-                  | fzf --with-nth=2.. --delimiter='\t' --height=100% --reverse \
-                        --prompt='bring back > ' 2>/dev/null | cut -f1)
-            [ -n "$win" ] || return 0
+        if [ "$(count)" -gt 1 ]; then
+            # fzf needs a terminal, so the choosing happens inside a popup that
+            # re-enters this script as `pick`. Deciding here rather than in an
+            # if-shell in tmux.conf keeps the branch in one place and avoids a
+            # second layer of shell quoting inside a tmux command string.
+            tmux display-popup -E -w 60% -h 60% "$SELF pick"
+            return 0
         fi
+        win=$(tmux list-windows -t "=$HOLD" -F '#{window_id}' | head -1)
     fi
 
     # Home if it still exists, otherwise wherever we are now — a parked window
@@ -88,7 +91,16 @@ do_unstash() {
     tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
     tmux select-window -t "$win" 2>/dev/null
     publish
-    msg "restored"
+}
+
+# Runs inside the popup, where there is a real terminal for fzf.
+do_pick() {
+    local win
+    win=$(tmux list-windows -t "=$HOLD" \
+            -F '#{window_id}	#{?#{@agent_summary},#{@agent_summary},#{window_name}}	#{pane_current_path}' \
+          | fzf --with-nth=2.. --delimiter='\t' --reverse --prompt='bring back > ' \
+          | cut -f1)
+    [ -n "$win" ] && do_unstash "$win"
 }
 
 do_list() {
@@ -102,6 +114,7 @@ case "${1:-}" in
     unstash) shift; do_unstash "${1:-}" ;;
     count)   count ;;
     publish) publish ;;
+    pick)    do_pick ;;
     list)    do_list ;;
     *)       sed -n '/^#   stash.sh/,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//;$d' ;;
 esac
