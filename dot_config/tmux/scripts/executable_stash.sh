@@ -46,6 +46,38 @@ ACTIVE_SECS=15        # a transcript written this recently means a turn is in fl
 # `status` yet loses that empty field and every later field shifts left.
 SEP=$'\x1f'
 
+# Serialise the part that reads tmux state and then acts on it. Both binds are
+# run-shell, so two presses genuinely run at once, and every check-then-move in
+# here was racy: two parks of a two-window session both saw "2 windows", both
+# moved, and the second emptied the session — which with detach-on-destroy on
+# drops the attached client to a shell.
+#
+# mkdir is the atomic primitive (there is no flock(1) on macOS). The lock is
+# held only across the state-changing section — never across the up-to-12s
+# suspend or the up-to-90s resume, which would make one park block the next.
+LOCKDIR="${TMPDIR:-/tmp}/tmux-stash.${UID:-$(id -u)}.lock"
+LOCK_STALE=30
+
+lock_acquire() {
+    local i=0 owner age
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        # Break a lock whose owner died, or one that outlived any sane critical
+        # section — otherwise a killed park wedges the feature until reboot.
+        owner=$(cat "$LOCKDIR/pid" 2>/dev/null)
+        age=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || date +%s) ))
+        if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } || [ "$age" -ge "$LOCK_STALE" ]; then
+            log "breaking stale lock (owner ${owner:-?}, age ${age}s)"
+            rm -rf "$LOCKDIR" 2>/dev/null
+            continue
+        fi
+        i=$((i + 1)); [ "$i" -gt 100 ] && { log "could not take the lock"; return 1; }
+        sleep 0.1
+    done
+    printf '%s' "$$" > "$LOCKDIR/pid" 2>/dev/null
+    return 0
+}
+lock_release() { rm -rf "$LOCKDIR" 2>/dev/null; }
+
 hold_exists() { tmux has-session -t "=$HOLD" 2>/dev/null; }
 # The `&&`/`||` form printed TWO lines when tmux failed: wc still printed 0 and
 # pipefail then propagated tmux's failure, firing the `|| echo 0` as well. A
@@ -217,6 +249,61 @@ is_working() {
     [ "$mt" -gt 0 ] && [ $(( $(date +%s) - mt )) -lt "$ACTIVE_SECS" ]
 }
 
+# Is a background Workflow still in flight for this session?
+#
+# Derived from the runtime's own files rather than from @agent_workflow. That
+# option is maintained by agent-tab-watcher.sh, so reading it alone means the
+# guard FAILS OPEN if the watcher has died — and its own header documents that
+# it can disappear silently after days of uptime. A backgrounded workflow
+# outlives the turn that started it and would be killed with the process, so
+# this is not a guard that may quietly stop working.
+#
+# The rule (same one the watcher uses): the runtime creates
+# subagents/workflows/wf_<id>/ while a workflow runs and only writes
+# workflows/<id>.json when it finishes, so live == dir without completion file.
+# The 1h mtime backstop is the watcher's too — transcripts go quiet during long
+# stalls, and the worst measured gap on this machine was 394s.
+has_live_workflow() {
+    local sid="$1" cwd="$2" proj base d wfid mt now
+    [ -n "$sid" ] && [ -n "$cwd" ] || return 1
+    proj="${cwd//\//-}"; proj="${proj//./-}"      # claude munges / and . to -
+    base="$HOME/.claude/projects/$proj/$sid"
+    [ -d "$base/subagents/workflows" ] || return 1
+    now=$(date +%s)
+    for d in "$base"/subagents/workflows/wf_*/; do
+        [ -d "$d" ] || continue
+        wfid="${d%/}"; wfid="${wfid##*/}"
+        [ -f "$base/workflows/$wfid.json" ] && continue    # completed
+        mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
+        [ -n "$mt" ] && [ $((now - mt)) -lt 3600 ] && return 0
+    done
+    return 1
+}
+
+# Is this agent driving an app through cua-driver right now? Same reasoning as
+# above: read the shim's own activity file rather than trusting @agent_cua,
+# which the watcher may not be alive to set.
+CUA_ACTIVITY="$HOME/Library/Application Support/CuaNotch/activity.json"
+CUA_LIVE=60
+has_live_cua() {
+    local pid="$1"
+    [ -n "$pid" ] && [ -f "$CUA_ACTIVITY" ] || return 1
+    python3 - "$CUA_ACTIVITY" "$pid" "$CUA_LIVE" <<'PY' 2>/dev/null
+import json, sys, time
+try:
+    sessions = json.load(open(sys.argv[1])).get("sessions", {}) or {}
+except Exception:
+    raise SystemExit(1)
+pid, live, now = int(sys.argv[2]), float(sys.argv[3]), time.time()
+for d in sessions.values():
+    if (isinstance(d, dict) and d.get("agent_pid")
+            and int(d["agent_pid"]) == pid
+            and now - float(d.get("ts") or 0) < live):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 # Text typed but not submitted lives only in the TUI's buffer and dies with the
 # process. The composer is the band between the LAST TWO horizontal rules — not
 # the text after the last one, which is the model/context status line and is
@@ -287,9 +374,16 @@ suspend_agent() {
     is_working "$a_status" "$a_sid" "$a_pid" && { log "agent is mid-turn — left running"; return 0; }
     has_unsent_input "$a_pane"      && { log "unsent input in the composer — left running"; return 0; }
     # A backgrounded workflow outlives its turn and computer-use spans turns;
-    # both would die with the process. The tab watcher already tracks these.
-    [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] && { log "background workflow running — left running"; return 0; }
-    [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] && { log "driving an app — left running"; return 0; }
+    # both would die with the process. Checked TWO ways each — the watcher's
+    # flag, which is instant but goes stale if the daemon dies, and the
+    # underlying files, which are authoritative but cost a little more. Either
+    # saying "busy" is enough to leave the agent alone.
+    if [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] || has_live_workflow "$a_sid" "$a_cwd"; then
+        log "background workflow still in flight — left running"; return 0
+    fi
+    if [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] || has_live_cua "$a_pid"; then
+        log "driving an app through cua — left running"; return 0
+    fi
 
     # Recorded BEFORE the kill: claude deletes its own session file on exit, so
     # afterwards there is nothing left that knows the sessionId.
@@ -385,14 +479,21 @@ do_stash() {
     local win="${1:-$(tmux display-message -p '#{window_id}')}"
     local sess; sess=$(tmux display-message -p -t "$win" '#{session_name}')
 
+    # Everything from here to the move reads tmux state and then acts on it, so
+    # it runs under the lock. Released before the suspend, which is slow and
+    # touches only this one window.
+    lock_acquire || { msg "busy — try again"; return 1; }
+
     # Never strand a client: taking a session's last window destroys it, and
     # detach-on-destroy is on here, so that would drop the attached client to
-    # the shell.
-    if [ "$(tmux list-windows -t "=$sess" -F '#{window_id}' | wc -l | tr -d ' ')" -le 1 ]; then
+    # the shell. Counted INSIDE the lock — two concurrent parks both saw "2
+    # windows" and both moved, and the second one emptied the session.
+    if [ "$(tmux list-windows -t "=$sess" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')" -le 1 ]; then
+        lock_release
         msg "that's the only tab in this session — not parking it"
         return 1
     fi
-    case "$sess" in "$HOLD") msg "already parked"; return 0 ;; esac
+    case "$sess" in "$HOLD") lock_release; msg "already parked"; return 0 ;; esac
 
     # Origin travels with the window (see header). The label is captured too:
     # @agent_summary is maintained by the tab watcher and gets cleared once the
@@ -418,10 +519,20 @@ do_stash() {
         boot=$(tmux new-session -d -s "$HOLD" -n _bootstrap -P -F '#{window_id}' 2>/dev/null) || boot=""
     fi
 
-    tmux move-window -s "$win" -t "$HOLD": || { msg "could not park it"; return 1; }
+    if ! tmux move-window -s "$win" -t "$HOLD": 2>/dev/null; then
+        # If this call created the holding session and then failed to put
+        # anything in it, take the placeholder back out rather than leaving a
+        # session whose only window is a stray shell that `count` reports as
+        # parked and the next prefix+h would hand you.
+        [ -n "$boot" ] && tmux kill-window -t "$boot" 2>/dev/null
+        lock_release
+        msg "could not park it"
+        return 1
+    fi
     # Only ever kill a window this invocation created, and never the one just parked.
     [ -n "$boot" ] && [ "$boot" != "$win" ] && tmux kill-window -t "$boot" 2>/dev/null
     publish
+    lock_release
 
     # After the move, so the tab disappears immediately and the (slower)
     # graceful shutdown happens out of sight.
@@ -445,10 +556,23 @@ do_unstash() {
             # re-enters this script as `pick`. Deciding here rather than in an
             # if-shell in tmux.conf keeps the branch in one place and avoids a
             # second layer of shell quoting inside a tmux command string.
+            # Deliberately outside the lock: the popup waits on a human.
             tmux display-popup -E -w 60% -h 60% "$SELF pick"
             return 0
         fi
-        win=$(tmux list-windows -t "=$HOLD" -F '#{window_id}' | head -1)
+    fi
+
+    lock_acquire || { msg "busy — try again"; return 1; }
+    # Re-resolve under the lock. Picking "the only parked window" before taking
+    # it meant two unstashes could select the same window, and the second
+    # move-window then acted on one that had already gone home.
+    if [ -z "$win" ]; then
+        win=$(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null | head -1)
+    fi
+    if [ -z "$win" ] || ! tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null | grep -qx "$win"; then
+        lock_release
+        msg "nothing is parked"
+        return 0
     fi
 
     # Home if it still exists, otherwise wherever we are now — a parked window
@@ -458,11 +582,17 @@ do_unstash() {
         origin=$(tmux display-message -p '#{session_name}')
     fi
 
-    tmux move-window -s "$win" -t "$origin": || { msg "could not bring it back"; return 1; }
+    if ! tmux move-window -s "$win" -t "$origin": 2>/dev/null; then
+        lock_release; msg "could not bring it back"; return 1
+    fi
     tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
     tmux set-option -uw -t "$win" @stash_label 2>/dev/null
     tmux select-window -t "$win" 2>/dev/null
     publish
+    lock_release
+
+    # Outside the lock: the resume polls for up to RESUME_WAIT and concerns
+    # only this window.
     resume_agent "$win"
 }
 
