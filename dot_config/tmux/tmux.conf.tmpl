@@ -116,14 +116,7 @@ run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
 # set -g @catppuccin_status_modules_right "application session battery date_time"
 # Coffee (caffeinate) and battery modules disabled.
 # set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session coffee battery"
-# `stash` sits LAST, and has to. catppuccin bakes each module's left-separator
-# background from the module before it, giving only the FIRST module bg=default
-# so it meets the bare status bar. Putting a conditionally-empty module first
-# therefore hands `directory` a #313244 separator permanently — and since stash
-# renders nothing most of the time, that wrong-coloured chevron is what you see
-# almost always. Last, it inherits the previous module's background when shown
-# and changes nothing when hidden.
-set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session stash"
+set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session"
 set -g @catppuccin_date_time_text "%I:%M %p | %m-%d-%y"
 set -g @catppuccin_status_left_separator "█"
 
@@ -347,6 +340,11 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash"
 bind C-l kill-pane
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
 run '~/.tmux/plugins/tpm/tpm'
+
+# After tpm, because catppuccin builds status-right while tpm sources it — this
+# prepends the stash indicator to the left end of it. See the script for why it
+# is not a catppuccin module.
+run-shell "#{HOME}/.config/tmux/scripts/stash-statusline.sh"
 
 # --- resurrect save guard (must stay BELOW the tpm line) ---
 set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
