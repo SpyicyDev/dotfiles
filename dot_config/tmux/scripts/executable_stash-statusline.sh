@@ -10,10 +10,18 @@
 # it permanently demotes `directory` to a #313244 arc, which is then wrong on
 # the bare bar for as long as nothing is parked (i.e. nearly always).
 #
-# So catppuccin keeps `directory` first and untouched at bg=default, and this
-# segment is prepended OUTSIDE the chain. It opens on default and closes back
-# to default, making it self-contained: directory's default-bg arc is correct
-# both when this is showing and when it collapses to nothing.
+# So catppuccin keeps `directory` first, and this segment is prepended OUTSIDE
+# the chain — but prepending alone is not enough. A powerline chain joins
+# because each arc is drawn over the PREVIOUS module's background; directory's
+# arc is drawn over bg=default, so with a pill to its left the arc's negative
+# space showed the bare bar and left a dark wedge between the two (measured: a
+# 3px #1e1e2d notch between #313243 and the pink arc).
+#
+# Hence the one surgical edit below: directory's leading bg becomes a format
+# that follows whether this segment is showing. Formats inside #[...] style
+# specs are fine — window-status-format in tmux.conf is built entirely from
+# them. This segment then ends ON #313244 rather than capping back to default,
+# so the join is seamless when shown and untouched when hidden.
 set -uo pipefail
 
 cur=$(tmux show -gv status-right 2>/dev/null) || exit 0
@@ -35,10 +43,17 @@ thm_gray=$(opt @thm_gray '#313244')
 seg="#[fg=${color}#,bg=default#,nobold#,nounderscore#,noitalics]${sep}"
 seg="${seg}#[fg=${thm_bg}#,bg=${color}#,nobold#,nounderscore#,noitalics] "
 seg="${seg}#[fg=${thm_fg}#,bg=${thm_gray}] 󰒲 #{E:@stash_count} "
-seg="${seg}#[fg=${thm_gray}#,bg=default#,nobold#,nounderscore#,noitalics]█"
 
 # Empty when nothing is parked — a hidden tab is the only thing this reports,
 # so at zero it should not cost a cell. Unset counts as zero (before the first
 # publish).
-tmux set -g status-right \
-  "#{?#{||:#{==:#{E:@stash_count},0},#{==:#{E:@stash_count},}},,${seg}}${cur}"
+showing="#{||:#{==:#{E:@stash_count},0},#{==:#{E:@stash_count},}}"
+cond="#{?${showing},,${seg}}"
+
+# The first `bg=default` in catppuccin's string is the leading module's arc —
+# the only one drawn against the bare bar, and so the only one that has to
+# change when something sits to its left. Replacing just that one occurrence
+# leaves every other module's chaining exactly as catppuccin built it.
+patched="${cur/bg=default/bg=#{?${showing},default,${thm_gray}\}}"
+
+tmux set -g status-right "${cond}${patched}"
