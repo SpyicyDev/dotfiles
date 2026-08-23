@@ -183,6 +183,19 @@ set_state() {
 clear_state() {
     local win="$1"
     local cur
+
+    # A slept session (nap.sh) reaches here: SIGTERM is a clean exit, so Claude
+    # fires SessionEnd on its way out and this would wipe the very state nap
+    # just set — leaving a dim, ANONYMOUS tab, since @agent_summary is what the
+    # formats render and #W is a poor fallback. The nap file says the exit was
+    # deliberate, so leave the whole group alone; nap.sh owns these options
+    # until the session is woken. This is the same guard the watcher's GC
+    # branch uses, and it has to exist in both: the watcher polls once a
+    # second, but this fires synchronously inside the kill.
+    if [ -f "$HOME/.claude/naps/${win#@}.json" ]; then
+        return 0
+    fi
+
     cur=$(window_state "$win")
     tmux set-option -uw -t "$win" @agent_state 2>/dev/null || true
     tmux set-option -uw -t "$win" @agent_summary 2>/dev/null || true
