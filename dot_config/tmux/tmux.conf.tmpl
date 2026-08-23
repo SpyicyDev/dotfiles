@@ -116,7 +116,7 @@ run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
 # set -g @catppuccin_status_modules_right "application session battery date_time"
 # Coffee (caffeinate) and battery modules disabled.
 # set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session coffee battery"
-set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session"
+set -g @catppuccin_status_modules_right "stash directory codex_session codex_weekly session"
 set -g @catppuccin_date_time_text "%I:%M %p | %m-%d-%y"
 set -g @catppuccin_status_left_separator "█"
 
@@ -328,6 +328,14 @@ unbind -n M-y
 # set -g @plugin 'git@github.com:user/plugin'
 # set -g @plugin 'git@bitbucket.com:user/plugin'
 
+
+# Park a tab out of the tab bar without stopping it (tmux has no hide/minimize
+# of its own — tmux/tmux#3047 — but move-window to a detached session is exactly
+# that). prefix+H hides, prefix+h brings one back; both verified unbound first.
+bind-key H run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh stash '#{window_id}'"
+bind-key h if-shell "test $(tmux show -gqv @stash_count) -gt 1 2>/dev/null" \
+    "display-popup -E -w 60% -h 60% \"#{HOME}/.config/tmux/scripts/stash.sh unstash\"" \
+    "run-shell -b \"#{HOME}/.config/tmux/scripts/stash.sh unstash\""
 
 bind C-l kill-pane
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
