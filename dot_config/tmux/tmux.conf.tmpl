@@ -332,3 +332,6 @@ unbind -n M-y
 bind C-l kill-pane
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
 run '~/.tmux/plugins/tpm/tpm'
+
+# --- resurrect save guard (must stay BELOW the tpm line) ---
+set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
