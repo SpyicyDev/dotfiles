@@ -25,6 +25,7 @@
 #   stash.sh unstash [<window>]   bring one back; picker if several are parked
 #   stash.sh count                how many are parked (for the status line)
 #   stash.sh list                 what is parked, and where each came from
+#   stash.sh restore-state        re-apply parked state after a resurrect restore
 set -uo pipefail
 
 HOLD=stash          # the detached holding session
@@ -59,7 +60,59 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" 2>/d
 # rather than polled with a #() shell call. A #() in the status format re-forks
 # on every redraw forever; this forks only when you actually park or restore
 # something, which on an idle machine is never.
-publish() { tmux set-option -g @stash_count "$(count)" 2>/dev/null; }
+publish() { tmux set-option -g @stash_count "$(count)" 2>/dev/null; save_state; }
+
+# --- surviving a tmux restart -------------------------------------------------
+#
+# tmux-resurrect already saves the holding session verbatim — its panes and
+# windows appear in the save file as `stash` like any other session — so parked
+# windows come back parked with no help from us. What it does NOT save is
+# WINDOW OPTIONS, and that is where everything this script knows lives:
+# @stash_origin (where to put a window back), @stash_label (its name once the
+# agent that supplied it is gone) and above all @stash_session, which after a
+# suspend is the ONLY remaining pointer to that conversation — claude deletes
+# its own ~/.claude/sessions/<pid>.json on the way out.
+#
+# So the options are mirrored to a sidecar and re-applied by a post-restore
+# hook. Written on every state change rather than from resurrect's save hook:
+# this set only changes when this script runs, so a save hook would add a
+# second writer, an ordering dependency on a hook chain two other things
+# already share, and nothing else.
+STATE_FILE="$HOME/.tmux/resurrect/stash-state.tsv"
+
+save_state() {
+    hold_exists || { rm -f "$STATE_FILE" 2>/dev/null; return 0; }
+    mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
+    # $SEP, not a tab: origin/label/session/cwd are all legitimately empty for a
+    # parked window that holds no agent, and tab-delimited empty fields do not
+    # survive a `read`.
+    tmux list-windows -t "=$HOLD" -F \
+        "#{window_index}${SEP}#{window_name}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}" \
+        > "$STATE_FILE" 2>/dev/null
+}
+
+# Re-attach the options to the windows resurrect just rebuilt. Matching is by
+# window index within the holding session, which is what resurrect restores
+# them with; the name is a sanity check, not the key, because a suspended
+# window's name follows its pane's command and becomes `zsh` once the agent is
+# gone.
+do_restore_state() {
+    [ -f "$STATE_FILE" ] || return 0
+    hold_exists || return 0
+    local idx name origin label sess cwd win
+    while IFS="$SEP" read -r idx name origin label sess cwd; do
+        [ -n "$idx" ] || continue
+        win=$(tmux list-windows -t "=$HOLD" -F '#{window_index} #{window_id}' 2>/dev/null \
+              | awk -v i="$idx" '$1==i{print $2}')
+        [ -n "$win" ] || continue
+        [ -n "$origin" ] && tmux set-option -w -t "$win" @stash_origin "$origin" 2>/dev/null
+        [ -n "$label" ]  && tmux set-option -w -t "$win" @stash_label  "$label"  2>/dev/null
+        [ -n "$sess" ]   && tmux set-option -w -t "$win" @stash_session "$sess"  2>/dev/null
+        [ -n "$cwd" ]    && tmux set-option -w -t "$win" @stash_cwd    "$cwd"    2>/dev/null
+        log "restored parked window $win (idx $idx${sess:+, suspended session ${sess%%-*}})"
+    done < "$STATE_FILE"
+    tmux set-option -g @stash_count "$(count)" 2>/dev/null
+}
 
 # --- agent suspend / resume ---------------------------------------------------
 
@@ -241,6 +294,13 @@ do_stash() {
     # After the move, so the tab disappears immediately and the (slower)
     # graceful shutdown happens out of sight.
     suspend_agent "$win"
+
+    # AGAIN, and this one is not redundant: the publish above ran before the
+    # agent was suspended, so the sidecar it wrote has an empty @stash_session.
+    # Leaving it at that meant a tmux restart came back with a suspended window
+    # and no pointer to its conversation — the single worst outcome this whole
+    # mechanism exists to prevent. Re-mirror once the suspend has had its say.
+    save_state
 }
 
 do_unstash() {
@@ -296,6 +356,7 @@ case "${1:-}" in
     count)   count ;;
     publish) publish ;;
     pick)    do_pick ;;
+    restore-state) do_restore_state ;;
     list)    do_list ;;
     *)       sed -n '/^#   stash.sh/,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//;$d' ;;
 esac

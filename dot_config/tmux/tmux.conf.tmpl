@@ -348,3 +348,14 @@ run-shell "#{HOME}/.config/tmux/scripts/stash-statusline.sh"
 
 # --- resurrect save guard (must stay BELOW the tpm line) ---
 set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/scripts/save-assistant-sessions.sh'; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/resurrect-guard.sh'"
+
+# Parked windows come back parked on their own — resurrect saves the holding
+# session verbatim — but it does not save WINDOW OPTIONS, which is where the
+# parked state lives, including the sessionId of a suspended agent (the only
+# surviving pointer to that conversation). This re-applies them afterwards.
+#
+# `set -ag` APPENDS: restore-assistant-sessions.sh is already on this hook and
+# must keep running. And this sits below the tpm line for the same reason the
+# guard above does — assistant-resurrect's .tmux re-sets these hooks when tpm
+# loads it, so anything above would be silently replaced.
+set -ag @resurrect-hook-post-restore-all "; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/stash.sh' restore-state"
