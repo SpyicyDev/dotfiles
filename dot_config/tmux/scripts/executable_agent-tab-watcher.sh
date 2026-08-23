@@ -10,8 +10,7 @@
 #
 # Every POLL_SECONDS this daemon matches agent processes to tmux windows by
 # TTY and reconciles the per-window @agent_state option:
-#   agent present + no state OR waking → idle    (seed presence)
-#   no agent     + a nap file           → sleeping (deliberate absence; keep name)
+#   agent present + no state           → idle    (seed presence)
 #   no agent     + any state OR summary → unset @agent_state/@agent_summary (GC)
 # Hook-set states (running/needs-input/done) are never overridden while the
 # agent lives.
@@ -56,12 +55,6 @@
 
 # 1s: doubles as the blink interval for the running-glyph animation.
 POLL_SECONDS=1
-
-# nap.sh snapshots a slept session here as <window-id-without-@>.json. Presence
-# of that file is how this daemon tells "the agent died" from "the agent was
-# deliberately put to sleep" — see the GC branch at the end of the reconcile
-# loop, which must not strip a sleeping tab's state or its name.
-NAP_DIR="$HOME/.claude/naps"
 
 command -v tmux >/dev/null 2>&1 || exit 0
 
@@ -490,30 +483,10 @@ EOF
             fi
         fi
 
-        # A slept session (nap.sh) has no live process by design, so the GC
-        # below would read it as a dead agent and strip both its state and its
-        # @agent_summary — leaving a blank tab where a dim, named, sleeping one
-        # should be. The nap file is the marker that the absence is deliberate;
-        # hold the window at `sleeping` and let the summary stand. Checked
-        # BEFORE the seed/GC pair because it is the narrower case.
-        #
-        # `waking` needs no branch here: nap.sh sets it when it types the resume
-        # command, and the seed branch clears it to idle the moment the resumed
-        # process shows up on the pane — which also means a wake that never
-        # lands (shell busy, resume failed) decays to a normal GC rather than
-        # sticking a tab at `waking` forever.
-        if [ "$has_agent" = 0 ] && [ -f "$NAP_DIR/${win#@}.json" ]; then
-            [ "$state" = sleeping ] || {
-                tmux set-option -w -t "$win" @agent_state sleeping 2>/dev/null
-                tmux set-option -w -t "$win" @agent_nap 1 2>/dev/null
-                changed=1
-            }
-        elif [ "$has_agent" = 1 ] && { [ -z "$state" ] || [ "$state" = waking ]; }; then
+        if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
-            tmux set-option -uw -t "$win" @agent_nap 2>/dev/null
         elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ]; }; then
             tmux set-option -uw -t "$win" @agent_state 2>/dev/null
-            tmux set-option -uw -t "$win" @agent_nap 2>/dev/null
             tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
             tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
             tmux set-option -uw -t "$win" @agent_pending 2>/dev/null

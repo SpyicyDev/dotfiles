@@ -181,24 +181,8 @@ set -g @catppuccin_window_current_fill "number"
 # glyph carries the signal. No-state fallbacks (catppuccin stock): SELECTED
 # tab sits on base #1e1e2e (blends into the status bar) and unselected tabs
 # get the surface0 #313244 gray pill.
-#
-# SLEEPING (@agent_nap, set for both `sleeping` and `waking` — see nap.sh) is
-# the outermost test on all six options below, because it is the one state
-# where no process exists at all: it cannot coexist with running, cua, a
-# workflow, or an attention state, so nothing it shadows can be live. It is the
-# ANTI-attention state — the tab must recede, never pull. Hence base #1e1e2e
-# here, which is stock catppuccin's SELECTED background precisely because it
-# blends into the status bar (see the no-state fallback note above).
-# The choice was measured, not picked: $background is also the window NUMBER's
-# fg under fill=number, so it has to read against the overlay0 #6c7086 chip
-# while leaving the title recessed. crust #11111b gives a fine 3.84x digit but
-# lifts the title to 5.07x (too bright for something asleep); stock surface0
-# #313244 recesses the title nicely at 3.40x but drops the digit to 2.57x —
-# muddy, and the digit is how you jump to the tab. base #1e1e2e is the only
-# option that wins both: digit 3.36x, title 4.44x — about half the 8.69x of a
-# normal tab, which is what "greyed out" should measure.
-set -g @catppuccin_window_default_background "#{?@agent_nap,#1e1e2e,#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#313244,#a6e3a1},#{?#{==:#{@agent_state},failed},#f38ba8,#{?#{==:#{@agent_state},needs-input},#f9e2af,#313244}}}}"
-set -g @catppuccin_window_current_background "#{?@agent_nap,#1e1e2e,#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#1e1e2e,#a6e3a1},#{?#{==:#{@agent_state},failed},#f38ba8,#{?#{==:#{@agent_state},needs-input},#f9e2af,#1e1e2e}}}}"
+set -g @catppuccin_window_default_background "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#313244,#a6e3a1},#{?#{==:#{@agent_state},failed},#f38ba8,#{?#{==:#{@agent_state},needs-input},#f9e2af,#313244}}}"
+set -g @catppuccin_window_current_background "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#1e1e2e,#a6e3a1},#{?#{==:#{@agent_state},failed},#f38ba8,#{?#{==:#{@agent_state},needs-input},#f9e2af,#1e1e2e}}}"
 
 # fill=number locks the window NUMBER's fg to the $background expression
 # above (number block is `#[fg=$background,bg=$color]#I`), which would put a
@@ -231,14 +215,8 @@ set -g @catppuccin_window_current_background "#{?@agent_nap,#1e1e2e,#{?#{==:#{@a
 # The SELECTED tab never pulses: it is solid peach for every ambient state —
 # you are looking at it, the terminal itself is the progress indicator, and a
 # blinking chip under your cursor is just noise.
-#
-# A sleeping tab takes overlay0 #6c7086 and — the point — is the one agent
-# state that NEVER pulses. Motion here means "in flight"; a slept session is
-# the furthest thing from in flight, so it sits perfectly still. That also
-# keeps it out of the blink budget: @agent_blink is only toggled while
-# something is genuinely running, and nothing about a nap re-arms it.
-set -g @catppuccin_window_default_color "#{?@agent_nap,#6c7086,#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#11111b},#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{@agent_cua},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{==:#{@agent_state},running},#{?#{@agent_blink},#f5c2e7,#89b4fa},#89b4fa}}}}}}"
-set -g @catppuccin_window_current_color "#{?@agent_nap,#6c7086,#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#fab387,#11111b},#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#fab387}}}"
+set -g @catppuccin_window_default_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#11111b},#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{@agent_cua},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{==:#{@agent_state},running},#{?#{@agent_blink},#f5c2e7,#89b4fa},#89b4fa}}}}}"
+set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#fab387,#11111b},#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#fab387}}"
 
 # Tab text: the glyph slot, then the summary. The slot is EXCEPTIONS ONLY —
 # priority background workflow > computer use > nothing. Ordinary states
@@ -274,8 +252,8 @@ set -g @catppuccin_window_current_color "#{?@agent_nap,#6c7086,#{?#{==:#{@agent_
 # workflow/cua flags and shove later tabs. Deliberate — those flags flip rarely
 # (once per workflow, not per turn), and reserving a blank for every agent
 # window would pad the common case to pay for the rare one.
-set -g @catppuccin_window_default_text "#{?@agent_nap,#[fg=#7f849c]󰒲 #{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{@agent_workflow},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{@agent_cua},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}}"
-set -g @catppuccin_window_current_text "#{?@agent_nap,#[fg=#7f849c]󰒲 #{?#{n:#{@agent_summary}},#{@agent_summary},#W},#{?#{@agent_workflow},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{@agent_cua},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}}"
+set -g @catppuccin_window_default_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{@agent_cua},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
+set -g @catppuccin_window_current_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_blink},#94e2d5,#659a91}}]󰒓 ,#{?#{@agent_cua},#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{==:#{@agent_state},done},#11111b,#{?#{@agent_blink},#89b4fa,#5d7aaa}}}]󰍽 ,}}#[fg=#{?#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}},#11111b,#{?#{@agent_workflow},#cdd6f4,#{?#{==:#{@agent_state},done},#11111b,#cdd6f4}}}]#{?#{n:#{@agent_summary}},#{@agent_summary},#W}"
 # end catppuccin
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and
@@ -290,35 +268,6 @@ set-hook -g after-select-window 'run-shell -b "#{HOME}/.config/tmux/scripts/agen
 set-hook -g 'after-select-window[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
 set-hook -g 'after-select-pane[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
 set-hook -g 'client-session-changed[1]' 'run-shell -b "#{HOME}/.local/bin/cua-notch-visit"'
-
-# Session nap: terminate an idle Claude session but keep its tab, and resume it
-# in place on return. Four idle agent tabs measured ~4.0 GB RSS and ~7% CPU
-# doing nothing; sleeping them gives that back. SIGSTOP was tried first and
-# rejected — it frees no memory and leaves the TUI permanently unable to read
-# input (see the header of nap.sh for the measurements).
-#
-# prefix+S sleep · prefix+W wake · prefix+Z pin (never auto-sleep).
-# All three verified unbound in every key table before claiming them: the
-# obvious prefix+s and prefix+w are choose-tree, and prefix+P is tmux-floax.
-# W and b appear in copy-mode-vi as word motions, which do not collide with the
-# prefix table.
-bind-key S run-shell -b "#{HOME}/.config/tmux/scripts/nap.sh sleep '#{window_id}'"
-bind-key W run-shell -b "#{HOME}/.config/tmux/scripts/nap.sh wake '#{window_id}'"
-bind-key Z run-shell -b "#{HOME}/.config/tmux/scripts/nap.sh pin '#{window_id}'"
-bind-key M-s run-shell -b "#{HOME}/.config/tmux/scripts/nap.sh sleep-idle 0"
-
-# Auto-wake on arrival. Deliberately after-select-window and NOT pane-focus-in:
-# the latter also fires when the terminal itself regains focus, so merely
-# alt-tabbing back would rehydrate a session you never asked for. This fires
-# only on a real tab switch. Explicit [2] — [0] is agent-tab-indicator and [1]
-# is cua-notch-visit; an unindexed handler would silently overwrite [0].
-# nap.sh debounces internally (NAP_FOCUS_DEBOUNCE, default 2s) and re-checks
-# that the window is still the one being looked at, so passing through a tab on
-# the way somewhere else does not pay for a rehydrate — which matters, because
-# wake latency scales with transcript size and the largest session here is
-# 20 MB / 5592 messages.
-set-hook -g 'after-select-window[2]' 'run-shell -b "#{HOME}/.config/tmux/scripts/nap.sh wake-on-focus #{window_id}"'
-set-hook -g 'client-session-changed[2]' 'run-shell -b "#{HOME}/.config/tmux/scripts/nap.sh wake-on-focus #{window_id}"'
 
 # Fork of tmux-plugins/tmux-resurrect. Its ONLY functional change is
 # strategies/nvim_session.sh: upstream looks for a `Session.vim` in the pane's
