@@ -559,10 +559,16 @@ is_working() {
 # works (it follows the chain), so the recorded sid is fine for RESUMING —
 # it is only wrong for LOOKING.
 #
-# The chain is not stored anywhere structured, but a continued transcript
-# carries the old id in its compaction summary, so a fixed-string grep over
-# the project's transcripts finds every descendant. Once per park, not per
-# tick, so the cost of reading a few MB is fine here.
+# The chain is not stored anywhere structured, but it has one precise anchor:
+# the continued transcript's compaction record — a user entry flagged
+# `"isCompactSummary":true` whose text names the old transcript by PATH
+# (`…/<old sid>.jsonl`). Match on that, on that line only. A bare search for
+# the id was tried first and was wrong: transcripts mention other sessions'
+# ids in plain text all the time (a peer's transcript named this one dozens
+# of times), and measured, the bare match claimed four false descendants
+# where the anchor found exactly the real one. A false descendant is not
+# harmless: its running subagents would refuse a park of an unrelated tab.
+# Once per park, not per tick, so reading a few MB is fine here.
 session_dirs() {
     local sid="$1" cwd="$2" proj f id
     [ -n "$sid" ] && [ -n "$cwd" ] || return 0
@@ -576,7 +582,8 @@ session_dirs() {
         [ -f "$f" ] || continue
         id="${f##*/}"; id="${id%.jsonl}"
         [ "$id" = "$sid" ] && continue
-        grep -qF -m1 -- "$sid" "$f" 2>/dev/null && printf '%s\n' "$proj/$id"
+        grep -F '"isCompactSummary":true' "$f" 2>/dev/null | grep -qF -- "/$sid.jsonl" \
+            && printf '%s\n' "$proj/$id"
     done
 }
 
