@@ -19,7 +19,7 @@ State by state (unselected tab):
 | `idle` | agent open, not working | blue, solid | stock | — |
 | `running` | agent mid-turn | **pink `#f5c2e7` ↔ blue `#89b4fa`, 1 s** | stock | — |
 | `running` + cua | agent driving an app | **pink ↔ blue** | stock | blue `󰍽` pulsing |
-| *background workflow* | a Claude Workflow still running after the turn ended | **pink ↔ blue** | stock (green "done" tint suppressed — it isn't really finished) | teal `󰒓` pulsing |
+| *background workflow* | a Claude Workflow, or a background subagent (the Agent tool), still running after the turn ended | **pink ↔ blue** | stock (green "done" tint suppressed — it isn't really finished) | teal `󰒓` pulsing |
 | `needs-input` | a question to answer / turn failed | crust (yellow digit) | yellow `#f9e2af` | — |
 | `needs-approval` | blocked on a permission decision | crust (red digit) | red `#f38ba8` | — |
 | `done` | turn finished | crust (green digit) | green `#a6e3a1` | — |
@@ -328,6 +328,21 @@ file. Each tick the watcher maps each claude window pane → pid →
 dirs, and sets/clears the per-window `@agent_workflow` flag. The blink driver
 also toggles while any workflow is in flight, not just while a window is
 `running`.
+
+**Background subagents wear the same gear** (2026-08-25). The Agent tool runs
+in the background too, and a turn that ended with three reviewers still out
+is in exactly the position of one with a fleet out. A subagent's transcript
+`…/subagents/agent-<id>.jsonl` has no completion file; it is finished when its
+*last record* is the agent's answer — an assistant **text** block
+(`"role":"assistant","content":[{"type":"text"`). Anything else at the tail (a
+tool call, a tool result) is a run in progress. Not `stop_reason`: 2.1.241
+wrote `end_turn` on the final record, 2.1.245 writes `null`, and the first
+live test kept the gear lit on exactly that. Streaming writes one block per
+record, so an answer about to be followed by a tool call sits at the tail for
+a moment — a five-second quiet guard covers it. Same one-hour age backstop as
+workflows, because a killed agent leaves no marker. CuaNotch's
+`subagentFinished()` tests the same marker with the same guard;
+`check-invariants` pins the marker, the guard and the hour.
 
 **Staleness rule** (changed 2026-08-19): a runtime dir counts as live iff one
 of its transcripts (`agent-*.jsonl` / `journal.jsonl`) moved in the **last

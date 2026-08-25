@@ -186,11 +186,12 @@ codex_status() {
     '
 }
 
-# True if the claude session owning PID has a background Workflow in flight.
-# Runtime dir without its completion file = running (see header). Scoped to
-# the session's own project/<sid> dir so other panes' workflows don't leak in.
-session_has_running_workflow() {
-    local pid="$1" sf sid cwd proj base d wfid mt now raw
+# Resolve a claude PID to its session's project dir
+# (~/.claude/projects/<proj>/<sid>) in SESSION_BASE. Shared by the workflow
+# and subagent tests below; a global rather than a `$(...)`, which would fork.
+resolve_session_base() {
+    local pid="$1" sf sid cwd proj raw
+    SESSION_BASE=""
     [ -n "$pid" ] || return 1
     sf="$HOME/.claude/sessions/$pid.json"
     [ -f "$sf" ] || return 1
@@ -207,7 +208,56 @@ session_has_running_workflow() {
     { [ -n "$sid" ] && [ -n "$cwd" ]; } || return 1
     # Claude munges the project dir name from cwd: '/' and '.' both become '-'.
     proj="${cwd//\//-}"; proj="${proj//./-}"
-    base="$HOME/.claude/projects/$proj/$sid"
+    SESSION_BASE="$HOME/.claude/projects/$proj/$sid"
+}
+
+# True if the claude session owning PID has a background SUBAGENT (the Agent
+# tool) still out. Same gear as a workflow, on purpose: from the tab's point
+# of view a turn that ended with three reviewers still running is in exactly
+# the position of one with a fleet out - it looks finished and is not.
+# A subagent transcript subagents/agent-<id>.jsonl is finished when its LAST
+# record is the agent's answer: an assistant TEXT block. Anything else at
+# the tail (a tool call, a tool result) is a run in progress. NOT
+# stop_reason: 2.1.241 transcripts carry end_turn on the final record and
+# 2.1.245 writes null there, which kept the gear lit through the first live
+# test. The content-block marker is the same on both, and that exact run of
+# unescaped quotes cannot occur inside a JSON string value, so a tool result
+# quoting a transcript cannot fake it. Streaming writes one block per
+# record, so an answer about to be followed by a tool call sits at the tail
+# as a text record for a moment - the five-second quiet guard covers that.
+# Same one-hour age backstop as the workflows, for the same reason - a
+# killed agent leaves no marker. PINNED to CuaNotch's subagentFinished();
+# see check-invariants.
+session_has_running_subagent() {
+    local f mt now last age
+    resolve_session_base "$1" || return 1
+    [ -d "$SESSION_BASE/subagents" ] || return 1
+    printf -v now '%(%s)T' -1
+    for f in "$SESSION_BASE"/subagents/agent-*.jsonl; do
+        [ -f "$f" ] || continue
+        mt=$(stat -f %m "$f" 2>/dev/null)
+        [ -n "$mt" ] || continue
+        age=$((now - mt))
+        [ "$age" -lt 3600 ] || continue
+        [ "$age" -ge 5 ] || return 0      # still moving: in progress
+        # Only the tail: transcripts run to megabytes. Two forks, and only
+        # for a transcript touched within the hour, which is rare.
+        last=$(tail -c 65536 "$f" 2>/dev/null | tail -n 1)
+        case "$last" in
+            *'"role":"assistant","content":[{"type":"text"'*) continue ;;
+        esac
+        return 0
+    done
+    return 1
+}
+
+# True if the claude session owning PID has a background Workflow in flight.
+# Runtime dir without its completion file = running (see header). Scoped to
+# the session's own project/<sid> dir so other panes' workflows don't leak in.
+session_has_running_workflow() {
+    local d wfid mt now base
+    resolve_session_base "$1" || return 1
+    base="$SESSION_BASE"
     [ -d "$base/subagents/workflows" ] || return 1
     printf -v now '%(%s)T' -1
     for d in "$base"/subagents/workflows/wf_*/; do
@@ -419,7 +469,9 @@ EOF
             for kv in $win_pid; do
                 case "$kv" in "${win}="*) pid="${kv#*=}"; break ;; esac
             done
-            if [ -n "$pid" ] && session_has_running_workflow "$pid"; then
+            # A workflow or a background subagent: one gear for both.
+            if [ -n "$pid" ] && { session_has_running_workflow "$pid" \
+                                  || session_has_running_subagent "$pid"; }; then
                 wf=1; any_workflow=1
             fi
             case "$cua_pids" in

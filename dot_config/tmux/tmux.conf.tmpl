@@ -128,16 +128,17 @@ set -g @catppuccin_window_current_fill "number"
 # Agent tab indicator (see docs/agent-tab-indicator.md). Claude Code / Codex
 # hooks + scripts/agent-tab-watcher.sh maintain per-window options
 # @agent_state (idle|running|needs-input|failed|done), @agent_summary,
-# @agent_workflow (background Claude Workflow in flight) and @agent_cua (the
-# agent is driving an app through cua-driver); the Catppuccin window formats
-# below render them.
+# @agent_workflow (a background Claude Workflow OR a background subagent in
+# flight - one gear for both) and @agent_cua (the agent is driving an app
+# through cua-driver); the Catppuccin window formats below render them.
 #
 # THREE CHANNELS. Each tab says three independent things, one per surface:
 #   NUMBER CHIP ($color)      motion — is this window in flight right now?
 #   TAB BODY    ($background) attention tier — does it want you? (green/
 #                             yellow/red fill, ambient states leave it stock)
 #   GLYPH SLOT  (text)        the exception — a job the chip alone can't
-#                             describe: 󰒓 background workflow, 󰍽 computer use.
+#                             describe: 󰒓 background workflow or subagent,
+#                             󰍽 computer use.
 #                             EMPTY for idle and for an ordinary running turn.
 # There is deliberately no "an agent lives here" marker anymore (the old mauve
 # robot): an idle agent tab is a stock blue tab. Presence is still legible from
