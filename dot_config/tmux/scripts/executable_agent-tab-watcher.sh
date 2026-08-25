@@ -483,7 +483,7 @@ $ps_out
 EOF
 
     # Current per-window state in one call (formats resolve window options).
-    if ! states=$(tmux list-windows -a -F '#{window_id} #{@agent_state}' 2>/dev/null); then
+    if ! states=$(tmux list-windows -a -F '#{window_id} #{@agent_state} #{window_active_clients}' 2>/dev/null); then
         fail_streak=$((fail_streak + 1))
         { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
         sleep "$POLL_SECONDS"
@@ -558,7 +558,33 @@ EOF
     # Rebuilt each tick; a window that stops reading idle drops out, so the
     # streak only ever counts CONSECUTIVE observations.
     idle_streak_next=" "
-    while IFS=' ' read -r win state; do
+    wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
+    while IFS=' ' read -r win state wac; do
+        # SEEN-IT, CONTINUOUSLY. The hook discharges a yellow/green that lands
+        # while the user is sitting on the tab with WezTerm focused; this is
+        # the other order - the tint landed while WezTerm was behind something,
+        # and the user then Cmd-Tabbed back to it without changing tabs, so no
+        # select-window hook ever fires. Same test (active for a client AND
+        # WezTerm frontmost), same discharge as clear-current, once a second.
+        # Red is left alone: a dead turn is not answered by being looked at.
+        # The frontmost lookup forks twice, so it runs only when there is a
+        # tinted, watched window to ask about - almost never.
+        case "$state" in
+            done|needs-input)
+                case "$wac" in ''|0|*[!0-9]*) : ;; *)
+                    if [ -z "$wez_front" ]; then
+                        wez_front=no
+                        [ "$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)" = \
+                          '"CFBundleIdentifier"="com.github.wez.wezterm"' ] && wez_front=yes
+                    fi
+                    if [ "$wez_front" = yes ]; then
+                        tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
+                        [ "$state" = needs-input ] && \
+                            tmux set-option -w -t "$win" @agent_pending "$(printf '%(%s)T' -1)" 2>/dev/null
+                        state=idle
+                    fi ;;
+                esac ;;
+        esac
         [ -n "$win" ] || continue
         case "$present" in
             *" ${win} "*) has_agent=1 ;;

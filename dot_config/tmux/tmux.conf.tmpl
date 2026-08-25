@@ -274,7 +274,9 @@ set -g @catppuccin_window_current_text "#{?#{@agent_workflow},#[fg=#{?#{||:#{@st
 
 # Agent tab indicator runtime: presence/GC watcher daemon (singleton), and
 # focus discharges a tab's attention state (needs-input/done → idle) the
-# moment you switch to it. NOTE: this occupies after-select-window[0]; new
+# moment you switch to it - and a yellow/green that lands while you are
+# already sitting on that tab with WezTerm frontmost never tints at all (the
+# hook and the watcher both test that). NOTE: this occupies after-select-window[0]; new
 # handlers must use explicit indices ([1]+) or they'll overwrite this one.
 run-shell -b "bash #{HOME}/.config/tmux/scripts/agent-tab-watcher.sh"
 set-hook -g after-select-window 'run-shell -b "#{HOME}/.config/tmux/scripts/agent-tab-indicator.sh clear-current #{window_id}"'

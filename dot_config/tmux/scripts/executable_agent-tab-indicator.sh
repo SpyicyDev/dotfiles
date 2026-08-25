@@ -647,6 +647,19 @@ fi
 watched=$(tmux display-message -p -t "$win" '#{window_active_clients}' 2>/dev/null || true)
 case "$watched" in ''|*[!0-9]*) watched=0 ;; esac
 
+# ...and is the user actually LOOKING? A watched window in a WezTerm that is
+# behind Slack is not being seen, and until 2026-08-25 `done` skipped its
+# tint on the watched test alone - the one case where a finish could be
+# missed with no colour ever shown. Now both: the window is active for a
+# client AND WezTerm is frontmost. Two lsappinfo forks, ~11ms, and only on
+# the two events that would tint. Mack's ask: a yellow or green that lands
+# while he is sitting on that tab with WezTerm focused clears at once.
+viewing_now() {
+    [ "$watched" -gt 0 ] || return 1
+    [ "$(lsappinfo info -only bundleid "$(lsappinfo front 2>/dev/null)" 2>/dev/null)" = \
+      '"CFBundleIdentifier"="com.github.wez.wezterm"' ]
+}
+
 case "$mode" in
     idle)
         # SessionStart with source=compact fires mid-turn after auto-compaction;
@@ -691,7 +704,19 @@ case "$mode" in
         # telling them apart painted a question red twice in two days. There
         # is nothing left to get wrong: both mean "waiting on you", and the
         # tab name still says which session.
-        set_state "$win" needs-input
+        #
+        # EXCEPT when the prompt lands in front of the user's eyes: the
+        # window active in a client and WezTerm frontmost. Then it is
+        # discharged exactly as clear-current would a moment later - idle,
+        # with @agent_pending stamped so the heartbeat re-arms `running`
+        # once the answered turn resumes. Switching away first still gets
+        # the yellow, so a prompt is never silently lost.
+        if viewing_now; then
+            set_state "$win" idle
+            tmux set-option -w -t "$win" @agent_pending "$(now_epoch)" 2>/dev/null || true
+        else
+            set_state "$win" needs-input
+        fi
         ;;
     failed)
         # The turn itself died (529, overloaded). RED, and red now means
@@ -721,8 +746,10 @@ case "$mode" in
             compose_summary "$win" "$(extract_summary "$payload")" "$payload"
             exit 0
         fi
-        # Don't tint a window someone is actively watching — they saw it finish.
-        if [ "$watched" -gt 0 ]; then
+        # Don't tint a window the user is looking at — they saw it finish.
+        # Watched AND WezTerm frontmost (see viewing_now): a watched window
+        # in a backgrounded terminal was the one way to miss a finish.
+        if viewing_now; then
             set_state "$win" idle
         else
             set_state "$win" "done"

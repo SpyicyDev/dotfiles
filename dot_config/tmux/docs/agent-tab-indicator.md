@@ -38,11 +38,19 @@ Blue is both catppuccin's resting chip accent and the computer-use hue. On the c
 Tabs are **not** width-stabilised: the glyph slot's 2 cells appear and vanish with the workflow/cua flags. Those flip once per workflow rather than once per turn, so reserving a blank on every agent window would pad the common case to pay for the rare one.
 
 **Seen-it semantics:** focusing a tinted tab discharges it to `idle`
-(`after-select-window` → `clear-current`). `done` additionally isn't tinted
-if a client is already watching its window (`#{window_active_clients}` > 0 —
-you saw it finish). `needs-input` is *always* asserted, even on the focused
-window: focusing a prompt is not answering it, so a prompt is never silently
-lost by switching away before you respond.
+(`after-select-window` → `clear-current`). And a `done` or `needs-input`
+that lands while you are *looking at that tab* — its window active for a
+client (`#{window_active_clients}` > 0) **and** WezTerm frontmost
+(`lsappinfo`) — never tints at all (2026-08-25, Mack's ask): the hook
+discharges it on arrival, and the watcher re-checks once a second for the
+other order (tint landed while WezTerm was behind something, then you
+Cmd-Tabbed back without changing tabs, which fires no select hook). A
+discharged `needs-input` stamps `@agent_pending` exactly as `clear-current`
+does, so the heartbeat re-arms `running` when the answered turn resumes.
+Before this, `done` skipped its tint on the watched test alone — a watched
+window in a backgrounded terminal was the one way to miss a finish — and
+`needs-input` was always asserted. Switching away before the prompt lands
+still gets the yellow; red is never auto-discharged.
 
 ## Architecture
 
