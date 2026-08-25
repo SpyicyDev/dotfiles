@@ -230,8 +230,8 @@ set -g @catppuccin_window_current_background "#{?#{@stash_sel},#cba6f7,#{?#{==:#
 # needs crust for the same reason and by the same branch. Tinting the body
 # alone would have left a done tab's dark text on… a light background it was
 # already dark for, but an ordinary tab's #cdd6f4 label unreadable on mauve.
-set -g @catppuccin_window_default_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#11111b},#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{@agent_cua},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{==:#{@agent_state},running},#{?#{@agent_blink},#f5c2e7,#89b4fa},#89b4fa}}}}}"
-set -g @catppuccin_window_current_color "#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#fab387,#11111b},#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#fab387}}"
+set -g @catppuccin_window_default_color "#{?#{@stash_sel},#11111b,#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#11111b},#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#{?#{@agent_workflow},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{@agent_cua},#{?#{@agent_blink},#f5c2e7,#89b4fa},#{?#{==:#{@agent_state},running},#{?#{@agent_blink},#f5c2e7,#89b4fa},#89b4fa}}}}}}"
+set -g @catppuccin_window_current_color "#{?#{@stash_sel},#11111b,#{?#{==:#{@agent_state},done},#{?#{@agent_workflow},#fab387,#11111b},#{?#{||:#{@stash_sel},#{||:#{m:needs-*,#{@agent_state}},#{==:#{@agent_state},failed}}},#11111b,#fab387}}}"
 
 # Tab text: the glyph slot, then the summary. The slot is EXCEPTIONS ONLY —
 # priority background workflow > computer use > nothing. Ordinary states
@@ -368,8 +368,18 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash"
 # session, it resolves by tmux's most-recently-active rules — and once anything
 # is parked, the holding session is the newest thing on the server, so every
 # selection silently landed on it and did nothing.
-bind-key S-Right run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start right '#{window_id}'" \; switch-client -T stash
-bind-key S-Left  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start left '#{window_id}'"  \; switch-client -T stash
+#
+# switch-client FIRST, run-shell second, and the order is load-bearing. A
+# non-repeat binding resets the client to the root table at dispatch, and a
+# foreground run-shell blocks the client's command queue until the script exits
+# (~110-170ms: 7-10 tmux round-trips at ~15ms each). With the switch last, the
+# client sits in ROOT for that whole window — where S-Right is unbound, so
+# holding the key down loses extends, and a quick H reaches the pane as a
+# literal keystroke. Arming the table before the work closes the gap: a repeat
+# then dispatches from the `stash` table and queues behind the running job,
+# which is exactly the serialisation the foreground run-shell is here for.
+bind-key S-Right switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start right '#{window_id}'"
+bind-key S-Left  switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start left '#{window_id}'"
 
 # NOT run-shell -b: two quick taps backgrounded both read the same cursor and
 # both wrote cursor+1, so the selection stopped growing while the keys kept
@@ -379,17 +389,38 @@ bind-key S-Left  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start left
 #
 # Each extend re-arms the table: a key table is one-shot, so a binding that does
 # not switch-client back into it drops you to root after one press.
-bind-key -T stash S-Right run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move right '#{window_id}'" \; switch-client -T stash
-bind-key -T stash S-Left  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move left '#{window_id}'"  \; switch-client -T stash
+bind-key -T stash S-Right switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move right '#{window_id}'"
+bind-key -T stash S-Left  switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move left '#{window_id}'"
 bind-key -T stash H     run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 bind-key -T stash Enter run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 bind-key -T stash Escape run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
 bind-key -T stash q      run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
-# Anything else cancels. Without this the table would still fall back to root on
-# an unbound key — but the tint is a window option, so the selection would stay
-# painted on the tab bar with no mode left to clear it. `Any` is a fallback:
-# tmux matches the specific bindings above first (verified).
-bind-key -T stash Any run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
+bind-key -T stash C-c    run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
+bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
+
+# NO `Any` FALLBACK, deliberately — it was here and it made the mode unusable.
+#
+# `Any` matches literally every key event, and tmux's key events include things
+# no human pressed. Its dispatch tries Any BEFORE the built-in bail-out that
+# stops mouse movement from knocking a client out of a key table, so with
+# `mouse on` a single cell of pointer movement cancelled the selection — and a
+# Claude pane turns on all-motion tracking (DEC 1003), so in `main`, which is
+# exactly where tabs get parked, the gesture only survived if the mouse never
+# twitched. `focus-events on` is worse still: Any ate FocusOut, so Cmd-Tabbing
+# away — or any agent on this machine moving a window — cancelled it too, and
+# swallowed the focus event the pane's app was waiting for.
+#
+# Shadowing those with explicit no-op bindings is NOT available: tmux 3.6
+# rejects `MouseMovePane`, `FocusIn` and `FocusOut` as unknown key names
+# (checked). So the fallback goes, and an unbound key now falls through to root
+# and reaches the pane, leaving the tint painted.
+#
+# That is survivable because the tint is self-healing rather than modal: every
+# sel-start clears the flag server-wide before selecting, and a single
+# prefix+H clears it too (see do_stash). The one escape this cannot catch is
+# the prefix key itself, which tmux intercepts before any binding lookup — so
+# a binding for it in THIS table would never run. prefix+H mid-selection is
+# therefore the intended way out, and it is the muscle memory anyway.
 
 bind C-l kill-pane
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)
@@ -418,7 +449,15 @@ set -ag @resurrect-hook-post-restore-all "; bash '{{ .chezmoi.homeDir }}/.config
 # `renumber-windows on` means closing ANY window shifts its neighbours — so a
 # close the script did not perform left a row pointing at what is now a
 # different window, and a later restore stamped a suspended session's id onto
-# it. Refreshing on close means the index is never wrong for long. (Safe to run
-# during a park's own move-window: save_state merges rather than rebuilds, so
-# an interleaved snapshot cannot drop a session id.)
+# it. Refreshing on close means the index is never wrong for long.
+#
+# This fires once per window UNLINKED, so a range park fires N+1 of these,
+# concurrently and unlocked, on top of whatever the park itself is doing. That
+# used to be described here as safe because "save_state merges rather than
+# rebuilds, so an interleaved snapshot cannot drop a session id" — which was
+# wrong: the merge has a "still a live agent, so it needs no record" branch, and
+# suspend_agent mirrors the id while the agent is still alive, so an interleaved
+# snapshot dropped exactly the row that was about to become the only pointer to
+# a conversation. save_state now takes its own lock and snapshots inside it,
+# which is what actually makes this safe.
 set-hook -g 'window-unlinked[1]' 'run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh publish"'

@@ -68,12 +68,33 @@ SEP=$'\x1f'
 LOCKDIR="${TMPDIR:-/tmp}/tmux-stash.${UID:-$(id -u)}.lock"
 LOCK_STALE=30
 
+# The sidecar has its OWN mutex, separate from the one above, because save_state
+# is reached from paths that deliberately run unlocked and concurrently (see the
+# header on save_state) AND from inside this lock's critical section via
+# publish() — one mutex for both would deadlock. There is no lock-ordering cycle
+# to worry about: save_state never takes the main lock, so the order is always
+# main -> sidecar and never the reverse.
+SAVE_LOCKDIR="${TMPDIR:-/tmp}/tmux-stash-save.${UID:-$(id -u)}.lock"
+
 lock_acquire() {
+    local dir="${1:-$LOCKDIR}"
     local i=0 owner age
-    while ! mkdir "$LOCKDIR" 2>/dev/null; do
-        i=$((i + 1)); [ "$i" -gt 100 ] && { log "could not take the lock"; return 1; }
-        owner=$(cat "$LOCKDIR/pid" 2>/dev/null)
-        age=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || date +%s) ))
+    while :; do
+        if mkdir "$dir" 2>/dev/null; then
+            # Stamping ownership is part of ACQUIRING, not a formality after it.
+            # If the directory is gone by now — a concurrent holder's `rm -rf`
+            # racing our mkdir, seen under 10-way contention — we do not hold
+            # the lock, and returning anyway would be worse than failing: with
+            # no pid file, lock_release refuses to free it and the lock sticks
+            # until the stale sweep. Go round again instead.
+            # Braces around the redirection: a failing `>` is reported by the
+            # SHELL, not by printf, so `printf ... 2>/dev/null` does not silence
+            # it and the retry printed a scary path error on every race.
+            { printf '%s' "$$" > "$dir/pid"; } 2>/dev/null && return 0
+        fi
+        i=$((i + 1)); [ "$i" -gt 100 ] && { log "could not take the lock (${dir##*/})"; return 1; }
+        owner=$(cat "$dir/pid" 2>/dev/null)
+        age=$(( $(date +%s) - $(stat -f %m "$dir" 2>/dev/null || date +%s) ))
         if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } || [ "$age" -ge "$LOCK_STALE" ]; then
             # Breaking must itself be atomic. `rm -rf` then `mkdir` is not a
             # compare-and-swap: two processes can both judge the lock stale,
@@ -82,22 +103,21 @@ lock_acquire() {
             # critical section holding "the lock". rename(2) has exactly one
             # winner, so only the process that succeeds in moving the stale
             # directory aside is allowed to clear it.
-            if mv "$LOCKDIR" "${LOCKDIR}.stale.$$" 2>/dev/null; then
-                log "broke stale lock (owner ${owner:-?}, age ${age}s)"
-                rm -rf "${LOCKDIR}.stale.$$" 2>/dev/null
+            if mv "$dir" "${dir}.stale.$$" 2>/dev/null; then
+                log "broke stale lock (${dir##*/}, owner ${owner:-?}, age ${age}s)"
+                rm -rf "${dir}.stale.$$" 2>/dev/null
             fi
         fi
         sleep 0.1
     done
-    printf '%s' "$$" > "$LOCKDIR/pid" 2>/dev/null
-    return 0
 }
 
 # Only ever release a lock we still own. Without the ownership test, a process
 # whose lock was broken out from under it would delete whoever holds it now.
 lock_release() {
-    [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] || return 0
-    rm -rf "$LOCKDIR" 2>/dev/null
+    local dir="${1:-$LOCKDIR}"
+    [ "$(cat "$dir/pid" 2>/dev/null)" = "$$" ] || return 0
+    rm -rf "$dir" 2>/dev/null
 }
 
 hold_exists() { tmux has-session -t "=$HOLD" 2>/dev/null; }
@@ -207,9 +227,34 @@ window_for_row() {
     printf '%s' "$win"
 }
 
+# SERIALISED, and the tmux snapshot is taken INSIDE the lock.
+#
+# This is a read-merge-write cycle — snapshot tmux, read the old file, decide
+# which old rows to keep, rename a new file over the top — i.e. a textbook
+# lost update, and it is reached from several genuinely concurrent unlocked
+# callers: the `window-unlinked` hook fires one backgrounded `publish` per
+# window MOVED (so a range park fires N+1 of them), and do_unstash_many fires
+# one `resume` per window restored, each mirroring whenever its agent registers,
+# up to 90s later.
+#
+# The specific loss, which a reviewer demonstrated and this comment previously
+# denied: suspend_agent deliberately records the sessionId and mirrors it BEFORE
+# killing the agent, so for that instant the id is on disk, in a window option,
+# AND still listed by live_sessions. A concurrent writer whose tmux snapshot
+# predates the option therefore reaches "still a live agent? then it needs no
+# record" below, drops the row, and renames its copy over the top — moments
+# before the kill makes that row the only pointer to the conversation. Nothing
+# re-mirrors until the next park or unpark, which may be days.
+#
+# Taking the lock FIRST and snapshotting after makes each cycle atomic, so a
+# writer either sees the option or predates the whole thing; either way the id
+# survives. Failing to get the lock is safe to skip: whoever holds it is about
+# to write, and their snapshot is newer than ours.
 save_state() {
-    local sf tmp rows
+    local sf tmp rows live
     sf=$(state_file)
+
+    lock_acquire "$SAVE_LOCKDIR" || { log "sidecar busy — skipped this mirror"; return 0; }
 
     # Every window that matters, not just the parked ones. A window can leave
     # the holding session still carrying @stash_session — resume_agent declines
@@ -218,7 +263,7 @@ save_state() {
     # moment the window option became the sole surviving pointer.
     rows=$(tmux list-windows -a -F \
         "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}" \
-        2>/dev/null) || return 0    # tmux unreachable: keep whatever is on disk
+        2>/dev/null) || { lock_release "$SAVE_LOCKDIR"; return 0; }   # tmux unreachable: keep what is on disk
     rows=$(printf '%s\n' "$rows" | awk -F"$SEP" -v hold="$HOLD" '$1==hold || $7!=""')
 
     # MERGE, never a blind rebuild.
@@ -241,11 +286,16 @@ save_state() {
     if [ -f "$sf" ]; then
         local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd
         local fresh_sids; fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
+        # ONCE, not per row: live_sessions forks a python3 interpreter, and this
+        # ran inside the loop — O(rows) interpreter startups while holding a
+        # lock, which after a restart (many rows, no options yet) is the slowest
+        # thing in the file and was itself widening the race above.
+        live=$(live_sessions)
         while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd; do
             [ -n "$o_sid" ] || continue
             printf '%s\n' "$fresh_sids" | grep -qx "$o_sid" && continue   # already represented
             # Still a live agent? Then it is not suspended and needs no record.
-            grep -q "${SEP}${o_sid}${SEP}" < <(live_sessions) && continue
+            printf '%s\n' "$live" | grep -q "${SEP}${o_sid}${SEP}" && continue
             # Identity, not "some window has that index": after a close,
             # renumber-windows slides a DIFFERENT window into the vacated slot,
             # and carrying the row forward there is exactly how a suspended
@@ -255,14 +305,21 @@ save_state() {
                 log "carried forward suspended session ${o_sid%%-*} ($o_sess:$o_idx) — window exists but has no options yet"
             else
                 mkdir -p "$(dirname "$of")" 2>/dev/null
-                printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}" >> "$of" 2>/dev/null
-                log "suspended session ${o_sid%%-*} has no window any more — moved to $(basename "$of")"
+                # Append only if this sid is not already parked here. The file is
+                # a hand-recovery list, and re-appending the same session on
+                # every save turned one lost conversation into eight identical
+                # rows — noise that makes `stash.sh list` look like a disaster.
+                if ! grep -q "${SEP}${o_sid}${SEP}" "$of" 2>/dev/null; then
+                    printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}" >> "$of" 2>/dev/null
+                    log "suspended session ${o_sid%%-*} has no window any more — moved to $(basename "$of")"
+                fi
             fi
         done < "$sf"
     fi
 
     if [ -z "$rows" ]; then
         rm -f "$sf" 2>/dev/null
+        lock_release "$SAVE_LOCKDIR"
         return 0
     fi
     mkdir -p "$(dirname "$sf")" 2>/dev/null
@@ -272,6 +329,7 @@ save_state() {
     tmp="${sf}.$$"
     printf '%s\n' "$rows" > "$tmp" 2>/dev/null && mv -f "$tmp" "$sf" 2>/dev/null
     rm -f "$tmp" 2>/dev/null
+    lock_release "$SAVE_LOCKDIR"
 }
 
 # Rows that could not be safely matched are parked HERE rather than dropped.
@@ -762,6 +820,11 @@ ensure_hold() {
 # holding session already exists.
 park_one() {
     local win="$1" sess="$2" label
+    # Invariant, enforced here rather than trusted from callers: nothing inside
+    # the holding session is ever flagged as selected. @stash_sel is a window
+    # option, so it survives the move and would repaint the tab mauve when it
+    # comes back — with no selection in progress to explain why.
+    tmux set-option -uw -t "$win" @stash_sel 2>/dev/null
     # Origin travels with the window (see header). The label is captured too:
     # @agent_summary is maintained by the tab watcher and gets cleared once the
     # agent it describes is gone, so without this the picker would list a
@@ -790,7 +853,7 @@ do_stash_many() {
     # Everything from here to the moves reads tmux state and then acts on it, so
     # it runs under the lock. Released before the suspends, which are slow and
     # touch only windows that are already parked.
-    lock_acquire || { msg "busy — try again"; return 1; }
+    lock_acquire || { msg "busy — try again"; return 0; }   # 0: see the note on the refusal below
 
     # Resolve membership UNDER the lock. These ids come from a keypress that may
     # be seconds old by now, so in between a window can have been closed, parked
@@ -827,12 +890,30 @@ do_stash_many() {
             # nobody asked for is worse than a clear no.
             msg "that's every tab in this session — leave one out and try again"
         fi
-        return 1
+        # 0, NOT 1. `run-shell` displays the exit status of a failed command IN
+        # THE PANE — which puts it into view-mode, so every subsequent keystroke
+        # goes to copy-mode's key table instead of whatever is running there
+        # until the user presses q. `-b` does not exempt it. A refusal the user
+        # has already been told about via msg() is not a script failure, and
+        # hijacking the focused pane to report it is far worse than the refusal.
+        return 0
     fi
 
     ensure_hold
-    local parked=() failed=0
+    local parked=() failed=0 left
     for w in "${wins[@]}"; do
+        # Re-check per move, not just once up front. The count above cannot be
+        # fooled by duplicates or foreign ids, but nothing stops a window
+        # CLOSING on its own between the count and the last move — a shell
+        # exiting is not a stash.sh actor and the lock cannot hold it back. With
+        # a range that is "N of N+1", so one exit is enough to leave the session
+        # empty, and destroying it drops the attached client to a shell.
+        left=$(tmux list-windows -t "=$sess" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
+        case "$left" in ''|*[!0-9]*) left=0 ;; esac
+        if [ "$left" -le 1 ]; then
+            msg "stopped at ${#parked[@]} — the rest is all that's left in this session"
+            break
+        fi
         if park_one "$w" "$sess"; then parked+=("$w"); else failed=$((failed + 1)); fi
     done
 
@@ -844,7 +925,7 @@ do_stash_many() {
         [ -n "$BOOT_WIN" ] && tmux kill-window -t "$BOOT_WIN" 2>/dev/null
         lock_release
         msg "could not park it"
-        return 1
+        return 0
     fi
     # Only ever kill a window this invocation created, and never one just parked.
     if [ -n "$BOOT_WIN" ]; then
@@ -872,7 +953,24 @@ do_stash_many() {
     save_state
 }
 
-do_stash() { do_stash_many "${1:-$(tmux display-message -p '#{window_id}')}"; }
+# The single-window entry point. Resolves its target through sel_win for the
+# reason spelled out there — a bare `display-message -p` answers by
+# most-recently-active rules, so `stash.sh stash` typed at a shell (where no
+# window id is passed) could park a window in a different session than the one
+# you are looking at, or no-op with a misleading "already parked".
+#
+# It also clears any range selection first. tmux hands the prefix key back to
+# the prefix table WITHOUT consulting the `stash` table's bindings, so pressing
+# prefix mid-selection is the one exit that cannot run sel-cancel — and the
+# muscle-memory follow-up is prefix+H. Clearing here means that sequence parks
+# the current window and tidies the tint, instead of parking one window that
+# then travels into the holding session still flagged and comes back mauve.
+do_stash() {
+    sel_clear
+    tmux set-option -gu @stash_anchor 2>/dev/null
+    tmux set-option -gu @stash_cursor 2>/dev/null
+    do_stash_many "$(sel_win "${1:-}")"
+}
 
 # --- selecting a range of tabs ------------------------------------------------
 #
@@ -1094,11 +1192,11 @@ do_unstash() {
 # Bring one or more parked windows back, in a single transaction for the same
 # reasons do_stash_many is one.
 do_unstash_many() {
-    local w win origin origins="" ordered=() wanted=" $* "
+    local w win origin origins=() ordered=() wanted=" $* "
 
     hold_exists || { msg "nothing is parked"; return 0; }
 
-    lock_acquire || { msg "busy — try again"; return 1; }
+    lock_acquire || { msg "busy — try again"; return 0; }   # 0: see the note on the refusal below
 
     # Re-resolve under the lock. Picking "the only parked window" before taking
     # it meant two unstashes could select the same window, and the second
@@ -1137,9 +1235,20 @@ do_unstash_many() {
         # answer `stash`, and moving a parked window to `stash` succeeds while
         # leaving it exactly where it was: parked, with its origin now cleared,
         # and no way left to tell it had ever been anywhere else.
+        #
+        # Prefer a session someone is actually ATTACHED to. `list-sessions` is
+        # sorted by name, so taking its head is "alphabetically first", which on
+        # this machine is `agents` — the window would land somewhere the user is
+        # not looking, and the select-window below would then quietly change
+        # THAT session's current window instead. -F to match literally: a
+        # session name is user-chosen and may contain regex metacharacters.
         case "${origin:-}" in
-            "$HOLD"|"") origin=$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
-                                 grep -vx "$HOLD" | head -1) ;;
+            "$HOLD"|"")
+                origin=$(tmux list-sessions -F '#{?session_attached,#{session_name},}' 2>/dev/null |
+                         grep -vxF "$HOLD" | grep -v '^$' | head -1)
+                [ -n "$origin" ] || origin=$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
+                                             grep -vxF "$HOLD" | head -1)
+                ;;
         esac
         if [ -z "$origin" ]; then
             failed=$((failed + 1))
@@ -1152,17 +1261,26 @@ do_unstash_many() {
         fi
         tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
         tmux set-option -uw -t "$win" @stash_label 2>/dev/null
-        case " $origins " in *" $origin "*) : ;; *) origins="$origins $origin" ;; esac
+        # An ARRAY, not a space-joined string. Session names are user-chosen and
+        # may contain spaces (or glob metacharacters), and the string form both
+        # word-split `my project` into two bogus targets — silently skipping the
+        # renumber, so the origin kept its index hole forever — and exposed the
+        # name to pathname expansion.
+        local seen=0 o
+        for o in ${origins[@]+"${origins[@]}"}; do
+            [ "$o" = "$origin" ] && { seen=1; break; }
+        done
+        [ "$seen" = "1" ] || origins+=("$origin")
         restored+=("$win")
     done
 
     if [ "${#restored[@]}" -eq 0 ]; then
-        lock_release; msg "could not bring it back"; return 1
+        lock_release; msg "could not bring it back"; return 0
     fi
     # Land on the first of the group, so a multi-tab restore leaves you at the
     # left end of what just came back rather than on whichever one moved last.
     tmux select-window -t "${restored[0]}" 2>/dev/null
-    renumber "$HOLD" $origins
+    renumber "$HOLD" ${origins[@]+"${origins[@]}"}
     publish
     lock_release
     [ "$failed" -gt 0 ] && msg "brought back ${#restored[@]}, could not bring back $failed"
