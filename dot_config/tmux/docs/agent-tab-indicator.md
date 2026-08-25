@@ -332,17 +332,34 @@ also toggles while any workflow is in flight, not just while a window is
 **Background subagents wear the same gear** (2026-08-25). The Agent tool runs
 in the background too, and a turn that ended with three reviewers still out
 is in exactly the position of one with a fleet out. A subagent's transcript
-`…/subagents/agent-<id>.jsonl` has no completion file; it is finished when its
-*last record* is the agent's answer — an assistant **text** block
-(`"role":"assistant","content":[{"type":"text"`). Anything else at the tail (a
-tool call, a tool result) is a run in progress. Not `stop_reason`: 2.1.241
-wrote `end_turn` on the final record, 2.1.245 writes `null`, and the first
-live test kept the gear lit on exactly that. Streaming writes one block per
-record, so an answer about to be followed by a tool call sits at the tail for
-a moment — a five-second quiet guard covers it. Same one-hour age backstop as
-workflows, because a killed agent leaves no marker. CuaNotch's
-`subagentFinished()` tests the same marker with the same guard;
-`check-invariants` pins the marker, the guard and the hour.
+`…/subagents/agent-<id>.jsonl` has no completion file, and its own tail cannot
+be trusted: 2.1.245 writes `stop_reason: null` on the final record, and "last
+record is an assistant text block" misfires on the text-then-tool_use gap,
+which scales with the tool call's payload (23% of measured gaps beat 5s, the
+worst 86s — an opus review of cua-notch v0.4.0 caught seven live agents
+reading as finished). The **parent** knows: when a background agent finishes
+the harness appends a `<task-notification>` naming its `<task-id>` to the
+parent transcript, promptly — the same witness `agent-bg-pending` uses for the
+session's state. So a subagent is finished when its parent was notified about
+it *since its transcript last moved* (a resumed agent moves again and is
+running again), or when its last record is the user's interrupt marker (the
+parent is never notified for an Esc); otherwise it is running, for at most the
+workflows' one-hour backstop. The parent transcript is read incrementally
+(bytes appended since the last look) and the interrupt verdict is cached by
+mtime+size. CuaNotch's `tallyNotifications`/`subagentInterrupted` apply the
+same three rules; `check-invariants` pins the tag, the marker, the tail
+budget and the hour.
+
+**Compaction moves the runtime dir** (2026-08-25). After a compaction
+`~/.claude/sessions/<pid>.json` can go on reporting the *original* sessionId
+for a while, but the continued conversation gets a new id and its transcript,
+`subagents/` and `workflows/` all move under it — the watcher looked in the
+empty old dir, showed no gear, and a park SIGTERMed a session with two
+reviewers out. `resolve_session_bases` now follows the lineage: a descendant is
+a transcript whose `"isCompactSummary":true` record names the old transcript's
+path on the same line (a bare mention of the id is not enough — sessions quote
+ids in conversation all day), walked transitively and cached per pid+sid for
+a minute. Both subagent and workflow checks run over every dir in the chain.
 
 **Staleness rule** (changed 2026-08-19): a runtime dir counts as live iff one
 of its transcripts (`agent-*.jsonl` / `journal.jsonl`) moved in the **last

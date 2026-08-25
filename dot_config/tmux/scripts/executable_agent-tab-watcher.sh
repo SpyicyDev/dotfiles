@@ -186,12 +186,29 @@ codex_status() {
     '
 }
 
-# Resolve a claude PID to its session's project dir
-# (~/.claude/projects/<proj>/<sid>) in SESSION_BASE. Shared by the workflow
-# and subagent tests below; a global rather than a `$(...)`, which would fork.
-resolve_session_base() {
-    local pid="$1" sf sid cwd proj raw
-    SESSION_BASE=""
+# Resolve a claude PID to its session's runtime dirs. SESSION_PROJ is the
+# project dir (~/.claude/projects/<proj>) and SESSION_BASES the session ids
+# under it that belong to this process - PLURAL, because of compaction:
+# after a compaction ~/.claude/sessions/<pid>.json can go on reporting the
+# ORIGINAL id for a while, but the continued conversation gets a NEW id and
+# its transcript, subagents/ and workflows/ all move under that one.
+# Measured 2026-08-25: a process reporting 88d5cc09 had two running
+# reviewers under 42a666ca/, this function looked in the empty dir, the gear
+# never showed, and the tab read done with work in flight - which is how a
+# park SIGTERMed that session mid-review. The lineage is discoverable: the
+# continued transcript's compaction summary is a user record marked
+# "isCompactSummary":true whose text names the old transcript's PATH, so a
+# descendant is a transcript with both on ONE line (a bare mention of the
+# id is not enough - other sessions quote ids in conversation all day).
+# Walked transitively, and cached per pid+sid for a minute: the grep over
+# every transcript in the project is the one thing here that is not free.
+declare -A SB_CACHE SB_CACHE_AT
+SESSION_PROJ=""
+SESSION_BASES=()
+resolve_session_bases() {
+    local pid="$1" sf sid cwd proj raw now key dirs frontier found id f fid
+    SESSION_PROJ=""
+    SESSION_BASES=()
     [ -n "$pid" ] || return 1
     sf="$HOME/.claude/sessions/$pid.json"
     [ -f "$sf" ] || return 1
@@ -208,58 +225,144 @@ resolve_session_base() {
     { [ -n "$sid" ] && [ -n "$cwd" ]; } || return 1
     # Claude munges the project dir name from cwd: '/' and '.' both become '-'.
     proj="${cwd//\//-}"; proj="${proj//./-}"
-    SESSION_BASE="$HOME/.claude/projects/$proj/$sid"
+    SESSION_PROJ="$HOME/.claude/projects/$proj"
+    key="$pid:$sid"
+    printf -v now '%(%s)T' -1
+    if [ -n "${SB_CACHE[$key]:-}" ] && [ $((now - SB_CACHE_AT[$key])) -lt 60 ]; then
+        read -ra SESSION_BASES <<<"${SB_CACHE[$key]}"
+        return 0
+    fi
+    dirs="$sid"; frontier="$sid"
+    while [ -n "$frontier" ]; do
+        found=""
+        for id in $frontier; do
+            while IFS= read -r f; do
+                [ -n "$f" ] || continue
+                fid="${f##*/}"; fid="${fid%.jsonl}"
+                case " $dirs " in *" $fid "*) continue ;; esac
+                # Both markers on one line, either order.
+                grep -q -m1 -E "\"isCompactSummary\":true.*/$id\.jsonl|/$id\.jsonl.*\"isCompactSummary\":true" "$f" 2>/dev/null || continue
+                dirs="$dirs $fid"; found="$found $fid"
+            done <<EOF
+$(grep -lF -- "/$id.jsonl" "$SESSION_PROJ"/*.jsonl 2>/dev/null)
+EOF
+        done
+        frontier="$found"
+    done
+    SB_CACHE[$key]="$dirs"; SB_CACHE_AT[$key]=$now
+    read -ra SESSION_BASES <<<"$dirs"
+}
+
+# WHEN IS A SUBAGENT FINISHED? Not by its own transcript's tail - two rules
+# were tried there and a 101-transcript corpus refuted both (opus review of
+# cua-notch v0.4.0, 2026-08-25): 2.1.245 writes stop_reason null on the
+# final record, and "last record is an assistant text block" misfires on
+# the text-then-tool_use gap, which scales with the tool call's payload
+# (23% of measured gaps beat 5s, the worst 86s). The PARENT knows: when a
+# background agent finishes, the harness appends a <task-notification>
+# naming its <task-id> to the parent transcript, promptly, and that is the
+# same witness agent-bg-pending uses for the session's state. So a subagent
+# is finished when its parent was notified about it SINCE its transcript
+# last moved (a resumed agent moves again and is running again), or when
+# the user hit Esc on it (its last record is the interrupt marker - the
+# parent is never notified for those), else it is running, for at most the
+# one-hour age backstop a dead parent's agents are given. PINNED to
+# CuaNotch's workflowInfo/tallyNotifications/subagentInterrupted - see
+# check-invariants.
+#
+# The parent transcript is read INCREMENTALLY (bytes appended since the last
+# look, one python over the delta, only when a fresh subagent file makes the
+# answer matter), and the interrupt verdict is cached by mtime+size, so a
+# finished file costs one tail read rather than two forks a second.
+declare -A NOTIF_SIZE NOTIF_IDS INT_CACHE
+notified_ids() {   # $1 parent transcript → NOTIF_IDS[$1] = " id=epoch id=epoch "
+    local p="$1" size have out consumed
+    size=$(stat -f %z "$p" 2>/dev/null) || return 0
+    have="${NOTIF_SIZE[$p]:-0}"
+    [ "$size" = "$have" ] && return 0
+    if [ "$size" -lt "$have" ]; then NOTIF_IDS[$p]=" "; have=0; fi   # rotated
+    out=$(tail -c +$((have + 1)) "$p" 2>/dev/null | python3 -c '
+import sys, re, datetime
+data = sys.stdin.buffer.read()
+cut = data.rfind(b"\n") + 1            # never consume a half-written record
+ids = []
+for line in data[:cut].decode("utf-8", "replace").splitlines():
+    if "<task-id>" not in line:
+        continue
+    m = re.search(r"<task-id>([^<]+)</task-id>", line)
+    if not m:
+        continue
+    ep = 0
+    t = re.search(r"\"timestamp\":\"([^\"]+)\"", line)
+    if t:
+        try:
+            ep = int(datetime.datetime.fromisoformat(t.group(1).replace("Z", "+00:00")).timestamp())
+        except Exception:
+            pass
+    ids.append("%s=%d" % (m.group(1), ep))
+print(" ".join(ids))
+print(cut)')
+    consumed="${out##*$'\n'}"
+    out="${out%$'\n'*}"
+    [ "$consumed" -eq "$consumed" ] 2>/dev/null || return 0
+    NOTIF_IDS[$p]="${NOTIF_IDS[$p]:- }${out} "
+    NOTIF_SIZE[$p]=$((have + consumed))
 }
 
 # True if the claude session owning PID has a background SUBAGENT (the Agent
 # tool) still out. Same gear as a workflow, on purpose: from the tab's point
 # of view a turn that ended with three reviewers still running is in exactly
 # the position of one with a fleet out - it looks finished and is not.
-# A subagent transcript subagents/agent-<id>.jsonl is finished when its LAST
-# record is the agent's answer: an assistant TEXT block. Anything else at
-# the tail (a tool call, a tool result) is a run in progress. NOT
-# stop_reason: 2.1.241 transcripts carry end_turn on the final record and
-# 2.1.245 writes null there, which kept the gear lit through the first live
-# test. The content-block marker is the same on both, and that exact run of
-# unescaped quotes cannot occur inside a JSON string value, so a tool result
-# quoting a transcript cannot fake it. Streaming writes one block per
-# record, so an answer about to be followed by a tool call sits at the tail
-# as a text record for a moment - the five-second quiet guard covers that.
-# Same one-hour age backstop as the workflows, for the same reason - a
-# killed agent leaves no marker. PINNED to CuaNotch's subagentFinished();
-# see check-invariants.
 session_has_running_subagent() {
-    local f mt now last age
-    resolve_session_base "$1" || return 1
-    [ -d "$SESSION_BASE/subagents" ] || return 1
+    local f mt size now age base id p tok when v last
+    resolve_session_bases "$1" || return 1
     printf -v now '%(%s)T' -1
-    for f in "$SESSION_BASE"/subagents/agent-*.jsonl; do
-        [ -f "$f" ] || continue
-        mt=$(stat -f %m "$f" 2>/dev/null)
-        [ -n "$mt" ] || continue
-        age=$((now - mt))
-        [ "$age" -lt 3600 ] || continue
-        [ "$age" -ge 5 ] || return 0      # still moving: in progress
-        # Only the tail: transcripts run to megabytes. Two forks, and only
-        # for a transcript touched within the hour, which is rare.
-        last=$(tail -c 65536 "$f" 2>/dev/null | tail -n 1)
-        case "$last" in
-            *'"role":"assistant","content":[{"type":"text"'*) continue ;;
-        esac
-        return 0
+    for base in "${SESSION_BASES[@]}"; do
+        [ -d "$SESSION_PROJ/$base/subagents" ] || continue
+        p="$SESSION_PROJ/$base.jsonl"
+        for f in "$SESSION_PROJ/$base"/subagents/agent-*.jsonl; do
+            [ -f "$f" ] || continue
+            mt=$(stat -f %m "$f" 2>/dev/null)
+            [ -n "$mt" ] || continue
+            age=$((now - mt))
+            [ "$age" -lt 3600 ] || continue
+            id="${f##*/agent-}"; id="${id%.jsonl}"
+            # 1. Notified since it last moved → finished.
+            notified_ids "$p"
+            when=""
+            for tok in ${NOTIF_IDS[$p]:-}; do
+                case "$tok" in "$id="*) when="${tok#*=}" ;; esac
+            done
+            [ -n "$when" ] && [ "$when" -ge "$mt" ] && continue
+            # 2. Interrupted by the user → finished. Cached by mtime+size.
+            size=$(stat -f %z "$f" 2>/dev/null)
+            v="${INT_CACHE[$f]:-}"
+            if [ "${v%=*}" != "$mt.$size" ]; then
+                last=$(tail -c 65536 "$f" 2>/dev/null | tail -n 1)
+                case "$last" in
+                    *'"type":"user"'*'"type":"text","text":"[Request interrupted by user'*) v="$mt.$size=1" ;;
+                    *) v="$mt.$size=0" ;;
+                esac
+                INT_CACHE[$f]="$v"
+            fi
+            [ "${v#*=}" = 1 ] && continue
+            # 3. Otherwise it is running.
+            return 0
+        done
     done
     return 1
 }
 
 # True if the claude session owning PID has a background Workflow in flight.
 # Runtime dir without its completion file = running (see header). Scoped to
-# the session's own project/<sid> dir so other panes' workflows don't leak in.
+# the session's own project/<sid> dirs so other panes' workflows don't leak in.
 session_has_running_workflow() {
-    local d wfid mt now base
-    resolve_session_base "$1" || return 1
-    base="$SESSION_BASE"
-    [ -d "$base/subagents/workflows" ] || return 1
+    local d wfid mt now base b
+    resolve_session_bases "$1" || return 1
     printf -v now '%(%s)T' -1
+    for b in "${SESSION_BASES[@]}"; do
+    base="$SESSION_PROJ/$b"
+    [ -d "$base/subagents/workflows" ] || continue
     for d in "$base"/subagents/workflows/wf_*/; do
         [ -d "$d" ] || continue
         # ${d%/} then ##*/, not basename: these paths are cwd-munged and
@@ -281,6 +384,7 @@ session_has_running_workflow() {
         # session. CuaNotch's runningWorkflows() must keep the same rule.
         mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
         [ -n "$mt" ] && [ $((now - mt)) -lt 3600 ] && return 0
+    done
     done
     return 1
 }
@@ -351,6 +455,19 @@ while :; do
     # claude pids feed the workflow lookup (codex pids simply miss in
     # ~/.claude/sessions and fall through), and both kinds feed the
     # computer-use pid match (@agent_cua), which is agent-agnostic.
+    # GUARDED like the two tmux reads around it. This was the one data source
+    # in the loop that was not: a single empty/failed ps tick made has_agent=0
+    # for every window, the GC below unset every @agent_* option, and the next
+    # good tick reseeded them all to `idle` - which is TERMINAL for a mid-turn
+    # agent, because the heartbeat only re-arms `running` from idle when
+    # @agent_pending is set, and the GC had just cleared it. An empty listing
+    # is never real (this very shell is in it), so it is treated as a failure.
+    if ! ps_out=$(ps -ax -o tty=,pid=,comm= 2>/dev/null) || [ -z "$ps_out" ]; then
+        fail_streak=$((fail_streak + 1))
+        { [ "$fail_streak" -ge "$FAIL_LIMIT" ] && server_gone; } && exit 0
+        sleep "$POLL_SECONDS"
+        continue
+    fi
     agent_ttys=" "
     tty_pid=" "
     while IFS=' ' read -r tty pid comm; do
@@ -362,7 +479,7 @@ while :; do
             esac
         fi
     done <<EOF
-$(ps -ax -o tty=,pid=,comm= 2>/dev/null)
+$ps_out
 EOF
 
     # Current per-window state in one call (formats resolve window options).
