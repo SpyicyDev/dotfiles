@@ -91,6 +91,23 @@ lock_release() {
 }
 
 hold_exists() { tmux has-session -t "=$HOLD" 2>/dev/null; }
+
+# Close the gap a park leaves behind. `renumber-windows on` only fires when a
+# window is CLOSED — moving one to another session is not a close, so parking
+# tab 2 of 1,2,3 left 1,3 with a hole in it. `move-window -r` renumbers a
+# session sequentially.
+#
+# Ordering matters: this MUST run before save_state, because the sidecar is
+# keyed by window index and renumbering changes it. Callers renumber, then
+# publish.
+renumber() {
+    local sess
+    for sess in "$@"; do
+        [ -n "$sess" ] || continue
+        tmux has-session -t "=$sess" 2>/dev/null || continue
+        tmux move-window -r -t "=$sess" 2>/dev/null
+    done
+}
 # The `&&`/`||` form printed TWO lines when tmux failed: wc still printed 0 and
 # pipefail then propagated tmux's failure, firing the `|| echo 0` as well. A
 # two-line @stash_count broke both the statusline test and `[ "$(count)" -gt 1 ]`.
@@ -765,6 +782,7 @@ do_stash() {
     fi
     # Only ever kill a window this invocation created, and never the one just parked.
     [ -n "$boot" ] && [ "$boot" != "$win" ] && tmux kill-window -t "$boot" 2>/dev/null
+    renumber "$sess" "$HOLD"
     publish
     lock_release
 
@@ -854,6 +872,7 @@ do_unstash() {
     tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
     tmux set-option -uw -t "$win" @stash_label 2>/dev/null
     tmux select-window -t "$win" 2>/dev/null
+    renumber "$HOLD" "$origin"
     publish
     lock_release
 
