@@ -498,7 +498,7 @@ is_working() {
     # (a build, a test suite, a subagent), which writes no transcript for
     # minutes and has no `status` field on a session that never reported one.
     if [ -n "$pid" ] && ps -eo ppid=,command= 2>/dev/null \
-         | awk -v r="$pid" '$1==r && /caffeinate/{f=1} END{exit !f}'; then
+         | awk -v r="$pid" '$1==r && $2 ~ /(^|\/)caffeinate$/{f=1} END{exit !f}'; then
         return 0
     fi
     # The TAB'S OWN STATE settles it when it has an opinion, and the transcript
@@ -804,6 +804,24 @@ suspend_agent() {
         tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
         save_state
         log "text appeared in the composer after the first check — left running"
+        return 0
+    fi
+    # And is it STILL not working? The first is_working ran before
+    # has_unsent_input, the workflow and subagent walks, the cua fork, three
+    # set-options and a save_state — and in a range, before up to TERM_WAIT
+    # seconds per window ahead of this one, so ~36s stale on the fourth tab. A
+    # turn that started in that gap (a peer's message_agent paste, a queued
+    # message dequeuing, a subagent-completion wake) was never re-examined.
+    # `status` is the guard that actually holds through a live turn (measured
+    # 240/240 samples; caffeinate is a CHAIN of processes with sub-second holes
+    # between them), so re-read it fresh rather than trusting the copy.
+    local now_status; now_status=$(live_sessions | awk -F"$SEP" -v p="$a_pid" '$1==p{print $3; exit}')
+    if is_working "${now_status:-$a_status}" "$a_sid" "$a_pid" "$win"; then
+        tmux set-option -uw -t "$win" @stash_session 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_cwd 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
+        save_state
+        log "a turn started after the first check — left running"
         return 0
     fi
 
