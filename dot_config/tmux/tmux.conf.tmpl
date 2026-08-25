@@ -355,8 +355,8 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash"
 
 # ...and a range of adjacent tabs at once. prefix+Shift-Left/Right starts a
 # selection at the current tab and extends it one tab, tinting what is selected;
-# the client is then parked in the `stash` key table below, where bare
-# Shift-Left/Right keep extending and H parks the lot. The bring-back picker
+# the client is then parked in the `stash` key table below, where bare h/l
+# keep extending and H parks the lot. The bring-back picker
 # takes the same gesture (Shift-Up/Down there, since it is a vertical list).
 #
 # These four prefix+Shift-arrow keys are tmux defaults (refresh-client -L/-R/-U/-D
@@ -390,8 +390,10 @@ bind-key S-Left  switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scrip
 #
 # Each extend re-arms the table: a key table is one-shot, so a binding that does
 # not switch-client back into it drops you to root after one press.
-bind-key -T stash S-Right switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move right '#{window_id}'"
-bind-key -T stash S-Left  switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move left '#{window_id}'"
+# h/l, vim-style, once in the table. The ENTRY keys stay Shift-arrows because
+# prefix+h is the bring-back binding and prefix+l is last-window.
+bind-key -T stash l switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move right '#{window_id}'"
+bind-key -T stash h switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move left '#{window_id}'"
 bind-key -T stash H     run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 bind-key -T stash Enter run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
 bind-key -T stash Escape run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-cancel"
