@@ -437,6 +437,21 @@ PY
 # with no hint that another socket is the reason.
 # It also subsumes the stale-record and pid-reuse cases that `kill -0` plus
 # `ps -o comm=` would wave through.
+# The registered agent living in a window: "pid SEP sid SEP cwd", or nothing.
+# Prints only when exactly ONE agent is there — two is ambiguous, and every
+# caller treats ambiguity as "leave it alone".
+window_agent() {
+    local win="$1" pid sid status w pane cwd n=0 out=""
+    while IFS="$SEP" read -r pid sid status w pane cwd; do
+        [ "$w" = "$win" ] || continue
+        pid_in_window "$pid" "$win" || continue
+        n=$((n + 1)); out="${pid}${SEP}${sid}${SEP}${cwd}"
+    done < <(live_sessions)
+    [ "$n" -eq 1 ] && printf '%s' "$out"
+    return 0
+}
+agent_pid_in_window() { local r; r=$(window_agent "$1"); printf '%s' "${r%%"$SEP"*}"; }
+
 pid_in_window() {
     local pid="$1" win="$2" root p guard
     [ -n "$pid" ] && [ -n "$win" ] || return 1
@@ -530,20 +545,93 @@ is_working() {
 # workflows/<id>.json when it finishes, so live == dir without completion file.
 # The 1h mtime backstop is the watcher's too — transcripts go quiet during long
 # stalls, and the worst measured gap on this machine was 394s.
-has_live_workflow() {
-    local sid="$1" cwd="$2" proj base d wfid mt now
-    [ -n "$sid" ] && [ -n "$cwd" ] || return 1
+# Every runtime directory that can belong to this session — NOT just the one
+# named after its sid.
+#
+# The sid in ~/.claude/sessions/<pid>.json is the id the process was RESUMED
+# with, and after a compaction that is no longer where anything is written:
+# the continued conversation gets a fresh id, and the live transcript, its
+# subagents/ and its workflows/ all move under that one, while the session
+# file keeps reporting the old id. Measured 2026-08-25: a process reporting
+# 88d5cc09 had two reviewer subagents running under 42a666ca/subagents/, and
+# every guard that looked under 88d5cc09/ found nothing and let the park
+# SIGTERM it with both reviewers mid-run. `claude --resume <old id>` still
+# works (it follows the chain), so the recorded sid is fine for RESUMING —
+# it is only wrong for LOOKING.
+#
+# The chain is not stored anywhere structured, but a continued transcript
+# carries the old id in its compaction summary, so a fixed-string grep over
+# the project's transcripts finds every descendant. Once per park, not per
+# tick, so the cost of reading a few MB is fine here.
+session_dirs() {
+    local sid="$1" cwd="$2" proj f id
+    [ -n "$sid" ] && [ -n "$cwd" ] || return 0
+    # Munge the cwd ALONE, then join: applying the `.`→`-` rule to the joined
+    # path turned `.claude` into `-claude` and every lookup silently missed.
     proj="${cwd//\//-}"; proj="${proj//./-}"      # claude munges / and . to -
-    base="$HOME/.claude/projects/$proj/$sid"
-    [ -d "$base/subagents/workflows" ] || return 1
-    now=$(date +%s)
-    for d in "$base"/subagents/workflows/wf_*/; do
-        [ -d "$d" ] || continue
-        wfid="${d%/}"; wfid="${wfid##*/}"
-        [ -f "$base/workflows/$wfid.json" ] && continue    # completed
-        mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
-        [ -n "$mt" ] && [ $((now - mt)) -lt 3600 ] && return 0
+    proj="$HOME/.claude/projects/$proj"
+    [ -d "$proj" ] || return 0
+    printf '%s\n' "$proj/$sid"
+    for f in "$proj"/*.jsonl; do
+        [ -f "$f" ] || continue
+        id="${f##*/}"; id="${id%.jsonl}"
+        [ "$id" = "$sid" ] && continue
+        grep -qF -m1 -- "$sid" "$f" 2>/dev/null && printf '%s\n' "$proj/$id"
     done
+}
+
+has_live_workflow() {
+    local sid="$1" cwd="$2" base d wfid mt now
+    [ -n "$sid" ] && [ -n "$cwd" ] || return 1
+    now=$(date +%s)
+    while read -r base; do
+        [ -d "$base/subagents/workflows" ] || continue
+        for d in "$base"/subagents/workflows/wf_*/; do
+            [ -d "$d" ] || continue
+            wfid="${d%/}"; wfid="${wfid##*/}"
+            [ -f "$base/workflows/$wfid.json" ] && continue    # completed
+            mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
+            [ -n "$mt" ] && [ $((now - mt)) -lt 3600 ] && return 0
+        done
+    done < <(session_dirs "$sid" "$cwd")
+    return 1
+}
+
+# Is a background SUBAGENT (the Agent tool, not a Workflow) still running?
+#
+# These are in-process: no child pid, no caffeinate of their own, and the
+# parent's turn has usually ENDED — it dispatched them and replied "I'll report
+# back" — so status reads idle, the composer is empty, and every other guard
+# here says "safe". They die with the process, and a review that took twenty
+# minutes is gone. This is the guard that was missing on 2026-08-25.
+#
+# There is no completion record to key on, only the subagent's transcript, so
+# the rule is the tab watcher's, made stricter for a KILL decision: a transcript
+# touched in the last SUBAGENT_QUIET seconds is in flight regardless of what it
+# says, and one touched within the hour is in flight unless its last entry is a
+# final assistant text (the shape of a delivered report). The watcher uses 5s
+# for the first window; a subagent reading a large file or thinking at high
+# effort goes quiet for minutes — the two that died had been silent for 100s.
+SUBAGENT_QUIET=300
+has_live_subagent() {
+    local sid="$1" cwd="$2" base f mt now age last
+    [ -n "$sid" ] && [ -n "$cwd" ] || return 1
+    now=$(date +%s)
+    while read -r base; do
+        [ -d "$base/subagents" ] || continue
+        for f in "$base"/subagents/agent-*.jsonl; do
+            [ -f "$f" ] || continue
+            mt=$(stat -f %m "$f" 2>/dev/null); [ -n "$mt" ] || continue
+            age=$((now - mt))
+            [ "$age" -lt 3600 ] || continue
+            [ "$age" -ge "$SUBAGENT_QUIET" ] || return 0
+            last=$(tail -c 65536 "$f" 2>/dev/null | tail -n 1)
+            case "$last" in
+                *'"role":"assistant","content":[{"type":"text"'*) continue ;;
+            esac
+            return 0
+        done
+    done < <(session_dirs "$sid" "$cwd")
     return 1
 }
 
@@ -672,6 +760,9 @@ suspend_agent() {
     if [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] || has_live_workflow "$a_sid" "$a_cwd"; then
         log "background workflow still in flight — left running"; return 0
     fi
+    if has_live_subagent "$a_sid" "$a_cwd"; then
+        log "background subagent still running — left running"; return 0
+    fi
     if [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] || has_live_cua "$a_pid"; then
         log "driving an app through cua — left running"; return 0
     fi
@@ -796,7 +887,14 @@ resume_agent() {
         # Process substitution, not a pipe: `grep -q` exits at the first match,
         # and with pipefail a SIGPIPE'd python makes the pipeline nonzero even
         # though the session WAS found — reporting failure for a live resume.
-        local now_pid; now_pid=$(sid_pid "$sid")
+        # By WINDOW, not by sid. A resumed process does not reliably register
+        # under the id it was resumed with: after a compaction it reports the
+        # continued conversation's new id, so `sid_pid "$sid"` never matched, the
+        # poll ran out its 90s, and the record stayed on the tab — where the next
+        # park read "window already holds a session" and silently refused to
+        # suspend it, forever. Any agent that appears in this window and is not
+        # the one we killed IS the comeback, whatever id it reports.
+        local now_pid; now_pid=$(agent_pid_in_window "$win")
         if [ -n "$now_pid" ] && [ "$now_pid" != "$before_pid" ]; then
             # Do not erase a record that is no longer ours: the window may have
             # been re-parked and re-suspended while we polled (we run unlocked,
@@ -884,10 +982,40 @@ park_one() {
 # but the chip cannot say so" cases from the same family. needs-input, failed
 # and done are NOT running — those are precisely the tabs worth tidying away.
 agent_running() {
-    local win="$1"
-    [ "$(tmux show -wqv -t "$win" @agent_state 2>/dev/null)" = "running" ] && return 0
-    [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] && return 0
-    [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] && return 0
+    local win="$1" rec pid sid cwd tab flagged=0
+    tab=$(tmux show -wqv -t "$win" @agent_state 2>/dev/null)
+    case "$tab" in
+        ""|idle|done|needs-*|failed) : ;;
+        # `running`, and anything this script has never heard of. A state the
+        # watcher grows later must read as "working" here — is_working treats
+        # the unknown as unknown and falls back to its proxies, but a refusal
+        # has nothing to fall back to, so it errs the harmless way.
+        *) flagged=1 ;;
+    esac
+    [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] && flagged=1
+    [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] && flagged=1
+    # The one escape hatch a tab-derived refusal needs: the watcher can die
+    # (its own header says so) with `running` frozen on a window whose agent
+    # has long since exited — and that window would then be unparkable forever,
+    # with a message that is a lie. A flag only counts if an agent is actually
+    # registered in the window; a bare shell under a stale flag parks normally.
+    if [ "$flagged" = "1" ]; then
+        [ -n "$(window_agent "$win")" ] && return 0
+        return 1
+    fi
+    # The tab can be BLIND to background work, not merely stale: the watcher
+    # derives a session's runtime directory from the id in its session file,
+    # and after a compaction that is not where the subagents are (see
+    # session_dirs). So a tab with two reviewers in flight showed no gear at
+    # all, the tab-only test above passed, and the park went through. The
+    # same lineage-aware lookup the kill guard uses is applied here too, so
+    # that hiding is refused for the same reasons suspending would be — the
+    # alternative is hidden-but-alive, which is the outcome parking exists to
+    # prevent. One live_sessions fork per window, once per park.
+    rec=$(window_agent "$win"); [ -n "$rec" ] || return 1
+    IFS="$SEP" read -r pid sid cwd <<< "$rec"
+    has_live_workflow "$sid" "$cwd" && return 0
+    has_live_subagent "$sid" "$cwd" && return 0
     return 1
 }
 
@@ -896,7 +1024,7 @@ agent_running() {
 # per window, renumber per window, and let another park interleave halfway
 # through a group the user selected as one unit.
 do_stash_many() {
-    local w s sess="" wins=() total busy=0
+    local w s sess="" wins=() total busy=0 seen="" note=""
 
     # Everything from here to the moves reads tmux state and then acts on it, so
     # it runs under the lock. Released before the suspends, which are slow and
@@ -913,7 +1041,11 @@ do_stash_many() {
         case "$s" in "$HOLD") continue ;; esac                # already parked
         [ -n "$sess" ] || sess="$s"
         [ "$s" = "$sess" ] || continue                        # a range is one session by construction
-        case " ${wins[*]-} " in *" $w "*) continue ;; esac     # de-dupe
+        # De-dupe against everything SEEN, not just what was accepted: a busy
+        # window is never appended to wins, so testing wins let `@5 @5` count
+        # one working agent twice and report "all 2 of those agents".
+        case " $seen " in *" $w "*) continue ;; esac
+        seen="$seen $w"
         # Refuse to hide a working agent at all, rather than hiding it and then
         # declining to suspend it. That combination is the worst of both: the
         # tab is gone from the bar AND still holding its ~1GB and its share of a
@@ -925,9 +1057,10 @@ do_stash_many() {
 
     if [ "${#wins[@]}" -eq 0 ]; then
         lock_release
-        if [ "$busy" -gt 0 ]; then
-            [ "$busy" -eq 1 ] && msg "that agent is still working — not hiding it" \
-                              || msg "all $busy of those agents are still working — not hiding them"
+        if [ "$busy" -eq 1 ]; then
+            msg "that agent is still working — not hiding it"
+        elif [ "$busy" -gt 1 ]; then
+            msg "all $busy of those agents are still working — not hiding them"
         else
             msg "already parked"
         fi
@@ -970,7 +1103,10 @@ do_stash_many() {
         left=$(tmux list-windows -t "=$sess" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
         case "$left" in ''|*[!0-9]*) left=0 ;; esac
         if [ "$left" -le 1 ]; then
-            msg "stopped at ${#parked[@]} — the rest is all that's left in this session"
+            # Noted, not shown yet: display-message has no queue, each call
+            # overwrites the last, so every partial result is composed into ONE
+            # message at the end or only the final fragment is ever seen.
+            note="stopped — the rest is all that's left in this session"
             break
         fi
         if park_one "$w" "$sess"; then parked+=("$w"); else failed=$((failed + 1)); fi
@@ -983,7 +1119,16 @@ do_stash_many() {
         # parked and the next prefix+h would hand you.
         [ -n "$BOOT_WIN" ] && tmux kill-window -t "$BOOT_WIN" 2>/dev/null
         lock_release
-        msg "could not park it"
+        # Say WHY nothing was parked. "could not park it" on a batch where two
+        # tabs were deliberately left working and the third refused to move is
+        # both incomplete and, in the stopped case, simply wrong.
+        if [ -n "$note" ]; then
+            msg "nothing hidden: $note"
+        elif [ "$busy" -gt 0 ]; then
+            msg "could not park it — and left $busy still working"
+        else
+            msg "could not park it"
+        fi
         return 0
     fi
     # Only ever kill a window this invocation created, and never one just parked.
@@ -997,11 +1142,15 @@ do_stash_many() {
     publish
     lock_release
     # Never a silent partial: if part of a range stayed behind, say which and
-    # why, or the tab bar just looks like the gesture misfired.
-    if [ "$busy" -gt 0 ]; then
-        msg "hid ${#parked[@]} — left $busy still working"
+    # why, or the tab bar just looks like the gesture misfired. ONE message —
+    # see the note on `note` above.
+    if [ "$busy" -gt 0 ] || [ "$failed" -gt 0 ] || [ -n "$note" ]; then
+        local report="hid ${#parked[@]}"
+        [ "$busy" -gt 0 ]   && report="$report — left $busy still working"
+        [ "$failed" -gt 0 ] && report="$report — could not park $failed"
+        [ -n "$note" ]      && report="$report — $note"
+        msg "$report"
     fi
-    [ "$failed" -gt 0 ] && msg "parked ${#parked[@]}, could not park $failed"
 
     # After the moves, so the tabs disappear immediately and the (slower)
     # graceful shutdowns happen out of sight. Serial on purpose: each suspend
@@ -1030,9 +1179,7 @@ do_stash_many() {
 # the current window and tidies the tint, instead of parking one window that
 # then travels into the holding session still flagged and comes back mauve.
 do_stash() {
-    sel_clear
-    tmux set-option -gu @stash_anchor 2>/dev/null
-    tmux set-option -gu @stash_cursor 2>/dev/null
+    do_sel_cancel
     do_stash_many "$(sel_win "${1:-}")"
 }
 
