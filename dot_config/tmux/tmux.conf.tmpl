@@ -359,3 +359,12 @@ set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/
 # guard above does — assistant-resurrect's .tmux re-sets these hooks when tpm
 # loads it, so anything above would be silently replaced.
 set -ag @resurrect-hook-post-restore-all "; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/stash.sh' restore-state"
+
+# Keep the sidecar's key from going stale. It records windows by index, and
+# `renumber-windows on` means closing ANY window shifts its neighbours — so a
+# close the script did not perform left a row pointing at what is now a
+# different window, and a later restore stamped a suspended session's id onto
+# it. Refreshing on close means the index is never wrong for long. (Safe to run
+# during a park's own move-window: save_state merges rather than rebuilds, so
+# an interleaved snapshot cannot drop a session id.)
+set-hook -g 'window-unlinked[1]' 'run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh publish"'

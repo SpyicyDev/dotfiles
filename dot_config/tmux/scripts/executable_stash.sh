@@ -38,7 +38,7 @@ SELF="$HOME/.config/tmux/scripts/stash.sh"
 
 SESS_DIR="$HOME/.claude/sessions"
 TERM_WAIT=12          # seconds to allow for a graceful exit
-RESUME_WAIT=90        # a big transcript takes a while to replay before it registers
+RESUME_WAIT=360       # 0.25s ticks => 90s; a big transcript takes a while to replay
 ACTIVE_SECS=15        # a transcript written this recently means a turn is in flight
 
 # Records are delimited with the unit separator, NOT a tab: bash treats tab as
@@ -142,6 +142,44 @@ resurrect_dir() {
 STATE_FILE=""   # resolved per-call; the server this talks to decides it
 state_file() { [ -n "$STATE_FILE" ] || STATE_FILE="$(resurrect_dir)/stash-state.tsv"; printf '%s' "$STATE_FILE"; }
 
+# Does the window at <session>:<index> still look like the one a row describes?
+# ONE definition, used by both the save-time merge and the restore-time match,
+# so the two can never drift apart. Every recorded attribute must agree —
+# index alone is not identity (renumber-windows reshuffles it), and neither
+# name nor cwd alone discriminates (every claude window is named for the
+# version string; most sessions sit in $HOME).
+# Echoes the window id on a match; returns 1 otherwise.
+window_for_row() {
+    local sess="$1" idx="$2" name="$3" cwd="$4" pidx="${5:-}" win pcwd
+    tmux has-session -t "=$sess" 2>/dev/null || return 1
+    win=$(tmux list-windows -t "=$sess" -F '#{window_index} #{window_id}' 2>/dev/null \
+          | awk -v i="$idx" '$1==i{print $2}')
+    [ -n "$win" ] || return 1
+    if [ -n "$cwd" ]; then
+        # Compare against the AGENT'S pane, not the window's active one.
+        # `display-message -t <window-id>` resolves to whichever pane is active,
+        # so a multi-pane window whose active pane was an editor elsewhere in
+        # the tree failed its own cwd check and got orphaned on every single
+        # restart — even though @stash_pane_idx, recorded precisely because the
+        # agent may not be pane 0, was sitting right there unused.
+        pcwd=""
+        if [ -n "$pidx" ]; then
+            pcwd=$(tmux list-panes -t "$win" -F '#{pane_index} #{pane_current_path}' 2>/dev/null \
+                   | awk -v i="$pidx" '$1==i{ $1=""; sub(/^ /,""); print }')
+        fi
+        if [ -n "$pcwd" ]; then
+            [ "$pcwd" = "$cwd" ] || return 1
+        else
+            # No recorded pane (or it is gone): accept if ANY pane sits there.
+            tmux list-panes -t "$win" -F '#{pane_current_path}' 2>/dev/null | grep -qxF "$cwd" || return 1
+        fi
+    fi
+    if [ -n "$name" ]; then
+        [ "$(tmux display-message -p -t "$win" '#{window_name}' 2>/dev/null)" = "$name" ] || return 1
+    fi
+    printf '%s' "$win"
+}
+
 save_state() {
     local sf tmp rows
     sf=$(state_file)
@@ -155,6 +193,46 @@ save_state() {
         "#{session_name}${SEP}#{window_index}${SEP}#{window_name}${SEP}#{@stash_pane_idx}${SEP}#{@stash_origin}${SEP}#{@stash_label}${SEP}#{@stash_session}${SEP}#{@stash_cwd}" \
         2>/dev/null) || return 0    # tmux unreachable: keep whatever is on disk
     rows=$(printf '%s\n' "$rows" | awk -F"$SEP" -v hold="$HOLD" '$1==hold || $7!=""')
+
+    # MERGE, never a blind rebuild.
+    #
+    # This used to regenerate the file purely from live state, so any sid the
+    # current server does not know about was simply not written back — and an
+    # empty result deleted the file outright. That erased every suspended
+    # conversation on the first park after a restart, because window options do
+    # not survive a restart and the post-restore hook had not repopulated them
+    # yet. Worse, on this machine the hook usually never runs at all: continuum
+    # skips auto-restore whenever a second tmux server exists, and there are
+    # always agent sockets around. So "restore did not run" is the normal case
+    # and the first prefix+H was destroying the file permanently.
+    #
+    # A sid in the old file that live state cannot account for is therefore
+    # kept, not dropped: in the sidecar if its window still plausibly exists
+    # and is simply awaiting restore, otherwise in the orphans file where
+    # `stash.sh list` prints the command to resume it by hand.
+    local of; of=$(orphan_file)
+    if [ -f "$sf" ]; then
+        local o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd
+        local fresh_sids; fresh_sids=$(printf '%s\n' "$rows" | awk -F"$SEP" '$7!=""{print $7}')
+        while IFS="$SEP" read -r o_sess o_idx o_name o_pidx o_origin o_label o_sid o_cwd; do
+            [ -n "$o_sid" ] || continue
+            printf '%s\n' "$fresh_sids" | grep -qx "$o_sid" && continue   # already represented
+            # Still a live agent? Then it is not suspended and needs no record.
+            grep -q "${SEP}${o_sid}${SEP}" < <(live_sessions) && continue
+            # Identity, not "some window has that index": after a close,
+            # renumber-windows slides a DIFFERENT window into the vacated slot,
+            # and carrying the row forward there is exactly how a suspended
+            # session's id ends up stamped on someone else.
+            if window_for_row "$o_sess" "$o_idx" "$o_name" "$o_cwd" "$o_pidx" >/dev/null; then
+                rows="${rows}"$'\n'"${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}"
+                log "carried forward suspended session ${o_sid%%-*} ($o_sess:$o_idx) — window exists but has no options yet"
+            else
+                mkdir -p "$(dirname "$of")" 2>/dev/null
+                printf '%s\n' "${o_sess}${SEP}${o_idx}${SEP}${o_name}${SEP}${o_pidx}${SEP}${o_origin}${SEP}${o_label}${SEP}${o_sid}${SEP}${o_cwd}" >> "$of" 2>/dev/null
+                log "suspended session ${o_sid%%-*} has no window any more — moved to $(basename "$of")"
+            fi
+        done < "$sf"
+    fi
 
     if [ -z "$rows" ]; then
         rm -f "$sf" 2>/dev/null
@@ -199,22 +277,9 @@ do_restore_state() {
     while IFS="$SEP" read -r sess idx name pidx origin label sid cwd; do
         [ -n "$sess" ] && [ -n "$idx" ] || continue
 
-        win=""
-        if tmux has-session -t "=$sess" 2>/dev/null; then
-            win=$(tmux list-windows -t "=$sess" -F '#{window_index} #{window_id}' 2>/dev/null \
-                  | awk -v i="$idx" '$1==i{print $2}')
-        fi
-
         local ok=1
+        win=$(window_for_row "$sess" "$idx" "$name" "$cwd" "$pidx") || ok=0
         [ -n "$win" ] || ok=0
-        if [ "$ok" = 1 ] && [ -n "$cwd" ]; then
-            wcwd=$(tmux display-message -p -t "$win" '#{pane_current_path}' 2>/dev/null)
-            [ "$wcwd" = "$cwd" ] || ok=0
-        elif [ "$ok" = 1 ] && [ -n "$name" ]; then
-            # No cwd recorded (a parked window that never held an agent): the
-            # name is all there is, and for those windows it is meaningful.
-            [ "$(tmux display-message -p -t "$win" '#{window_name}' 2>/dev/null)" = "$name" ] || ok=0
-        fi
         if [ "$ok" = 1 ]; then
             existing=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
             [ -z "$existing" ] || [ "$existing" = "$sid" ] || ok=0
@@ -273,6 +338,43 @@ for f in glob.glob(os.path.join(sys.argv[1], "*.json")):
     except Exception:
         continue
 PY
+}
+
+# Is <pid> a descendant of any pane in <window>? This is the server-local,
+# definitive answer to "does this session record belong to THIS window".
+#
+# ~/.claude/sessions/*.json is machine-global but records only a bare window id,
+# and every tmux server numbers windows from @0 — so on this machine, where
+# tmux-pty-mcp keeps 7-15 extra sockets alive, a record from another server
+# routinely collides with a local window id. The visible symptom today is
+# silent: the collision inflates the match count, suspend_agent says "window
+# holds 2 agents - left running", and parking simply stops suspending anything
+# with no hint that another socket is the reason.
+# It also subsumes the stale-record and pid-reuse cases that `kill -0` plus
+# `ps -o comm=` would wave through.
+pid_in_window() {
+    local pid="$1" win="$2" root p guard
+    [ -n "$pid" ] && [ -n "$win" ] || return 1
+    for root in $(tmux list-panes -t "$win" -F '#{pane_pid}' 2>/dev/null); do
+        p="$pid"; guard=0
+        while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ] && [ "$guard" -lt 30 ]; do
+            [ "$p" = "$root" ] && return 0
+            p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+            guard=$((guard + 1))
+        done
+    done
+    return 1
+}
+
+# The pid currently registered for a sessionId, or empty. Identity, not mere
+# existence — see the poll in resume_agent.
+sid_pid() {
+    local sid="$1" pid rest
+    [ -n "$sid" ] || return 0
+    while IFS="$SEP" read -r pid rest; do
+        case "$rest" in "$sid$SEP"*) printf '%s' "$pid"; return 0 ;; esac
+    done < <(live_sessions)
+    return 0
 }
 
 transcript_mtime() {
@@ -415,6 +517,9 @@ suspend_agent() {
     local a_pid="" a_sid="" a_pane="" a_cwd="" a_status=""
     while IFS="$SEP" read -r pid sid status w pane cwd; do
         [ "$w" = "$win" ] || continue
+        # Window id alone is per-server and collides across sockets; require the
+        # process to actually live in this window.
+        pid_in_window "$pid" "$win" || { log "ignoring session record pid $pid — window id $w matches but the process is not in this window (another tmux server?)"; continue; }
         n=$((n + 1)); a_pid=$pid; a_sid=$sid; a_pane=$pane; a_cwd=$cwd; a_status=$status
     done < <(live_sessions)
 
@@ -475,6 +580,32 @@ suspend_agent() {
     # would otherwise lose the id that was just written to a volatile option.
     save_state
 
+    # LAST-MOMENT RE-CHECK. do_stash releases the lock before calling this, so
+    # between the guards above and here the user can have pressed prefix+h and
+    # brought the window home — measured 0.3-0.6s from park to this point, and
+    # the guard chain's `find` over ~/.claude/projects dominates it. Killing
+    # then would SIGTERM an agent in a window that is focused and back on the
+    # tab bar. Re-read the two facts that can have changed rather than
+    # re-taking the lock: is it still parked, and is the composer still empty
+    # (the earlier check is ~1s stale by now, and anything typed in that second
+    # dies with the process).
+    if [ "$(tmux display-message -p -t "$win" '#{session_name}' 2>/dev/null)" != "$HOLD" ]; then
+        tmux set-option -uw -t "$win" @stash_session 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_cwd 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
+        save_state
+        log "window left the holding session before the kill — not suspending"
+        return 0
+    fi
+    if has_unsent_input "$a_pane"; then
+        tmux set-option -uw -t "$win" @stash_session 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_cwd 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
+        save_state
+        log "text appeared in the composer after the first check — left running"
+        return 0
+    fi
+
     kill -TERM "$a_pid" 2>/dev/null
     local i=0
     while [ "$i" -lt "$TERM_WAIT" ] && kill -0 "$a_pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
@@ -530,6 +661,16 @@ resume_agent() {
         msg "no working directory recorded — resume by hand: claude --resume $sid"
         return 1
     fi
+    # Whoever owns this sid right now — normally nobody, but if we are racing a
+    # still-exiting claude it is the CORPSE's pid. A SIGTERMed claude keeps its
+    # ~/.claude/sessions/<pid>.json for seconds while it reaps MCP children, so
+    # "the sid appears in live_sessions" was satisfied by the dying process and
+    # the poll below declared success, cleared @stash_session, and mirrored the
+    # erasure — then claude exited and deleted its own file, taking the last
+    # copy of the pointer with it. A resumed agent is a NEW process, so require
+    # the pid to differ.
+    local before_pid; before_pid=$(sid_pid "$sid")
+
     local cmd
     printf -v cmd 'cd %q && claude --resume %q' "$cwd" "$sid"
     tmux send-keys -t "$pane" C-u
@@ -538,21 +679,33 @@ resume_agent() {
     # Only drop the record once the session is actually back: it is the sole
     # remaining pointer to that conversation, and a resume can take a while on a
     # large transcript.
+    # Check BEFORE sleeping, in short steps: the old form paid a flat 2s even
+    # when the agent was already back.
     local waited=0
-    while [ "$waited" -lt "$RESUME_WAIT" ]; do
-        sleep 2; waited=$((waited + 2))
+    while :; do
         # Process substitution, not a pipe: `grep -q` exits at the first match,
         # and with pipefail a SIGPIPE'd python makes the pipeline nonzero even
         # though the session WAS found — reporting failure for a live resume.
-        if grep -q "${SEP}${sid}${SEP}" < <(live_sessions); then
+        local now_pid; now_pid=$(sid_pid "$sid")
+        if [ -n "$now_pid" ] && [ "$now_pid" != "$before_pid" ]; then
+            # Do not erase a record that is no longer ours: the window may have
+            # been re-parked and re-suspended while we polled (we run unlocked,
+            # in the background), in which case @stash_session now belongs to
+            # that newer suspend.
+            if [ "$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)" != "$sid" ]; then
+                log "resume of ${sid%%-*} finished but the window moved on — leaving its record alone"
+                return 0
+            fi
             tmux set-option -uw -t "$win" @stash_session 2>/dev/null
             tmux set-option -uw -t "$win" @stash_cwd 2>/dev/null
             tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
             save_state
             return 0
         fi
+        [ "$waited" -ge "$RESUME_WAIT" ] && break
+        sleep 0.25; waited=$((waited + 1))
     done
-    msg "agent did not come back after ${RESUME_WAIT}s — its session id is still on the tab"
+    msg "agent did not come back — its session id is still on the tab (stash.sh list)"
     return 1
 }
 
@@ -652,8 +805,9 @@ do_unstash() {
         # Nothing parked, but a pending resume may still be waiting.
         local p; p=$(pending_windows | head -1)
         if [ -n "$p" ]; then
-            resume_agent "$p"
-            return $?
+            # Backgrounded: see the note on the other hand-off below.
+            tmux run-shell -b "'$SELF' resume '$p'"
+            return 0
         fi
         msg "nothing is parked"
         return 0
@@ -703,9 +857,15 @@ do_unstash() {
     publish
     lock_release
 
-    # Outside the lock: the resume polls for up to RESUME_WAIT and concerns
-    # only this window.
-    resume_agent "$win"
+    # Handed to a BACKGROUNDED run-shell, never called inline. prefix+h is a
+    # foreground run-shell (it has to be — the picker needs a client to raise a
+    # popup on), and tmux dispatches key events through the same client command
+    # queue that a blocking run-shell item occupies. So polling inline froze the
+    # client's keyboard for the whole resume: measured 96.9s on a session that
+    # never registered, with everything dead — typing, prefix chords, even
+    # prefix+d — and keys typed during a 90s block discarded outright rather
+    # than replayed.
+    tmux run-shell -b "'$SELF' resume '$win'"
 }
 
 # Runs inside the popup, where there is a real terminal for fzf.
@@ -762,6 +922,7 @@ case "${1:-}" in
     count)   count ;;
     publish) publish ;;
     pick)    do_pick ;;
+    resume)  shift; resume_agent "${1:-}" ;;
     restore-state) do_restore_state ;;
     list)    do_list ;;
     *)       sed -n '/^#   stash.sh/,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//;$d' ;;
