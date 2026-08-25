@@ -276,7 +276,7 @@ save_state() {
     # yet. Worse, on this machine the hook usually never runs at all: continuum
     # skips auto-restore whenever a second tmux server exists, and there are
     # always agent sockets around. So "restore did not run" is the normal case
-    # and the first prefix+H was destroying the file permanently.
+    # and the first prefix+_ was destroying the file permanently.
     #
     # A sid in the old file that live state cannot account for is therefore
     # kept, not dropped: in the sidecar if its window still plausibly exists
@@ -949,7 +949,7 @@ resume_agent() {
 # `-P -F` is load-bearing: it reports the id of the window this call actually
 # created. Taking "the first window in the stash session" instead meant that if
 # new-session FAILED because the session already existed — which two concurrent
-# `prefix+H` presses reliably produce, since the bind is run-shell -b and both
+# `prefix+_` presses reliably produce, since the bind is run-shell -b and both
 # see hold_exists as false — `boot` resolved to somebody else's ALREADY-PARKED
 # window, and the kill below destroyed it, panes, scrollback, suspended agent
 # and all. Reproduced during review.
@@ -1200,7 +1200,7 @@ do_stash_many() {
 # It also clears any range selection first. tmux hands the prefix key back to
 # the prefix table WITHOUT consulting the `stash` table's bindings, so pressing
 # prefix mid-selection is the one exit that cannot run sel-cancel — and the
-# muscle-memory follow-up is prefix+H. Clearing here means that sequence parks
+# muscle-memory follow-up is prefix+_. Clearing here means that sequence parks
 # the current window and tidies the tint, instead of parking one window that
 # then travels into the holding session still flagged and comes back mauve.
 do_stash() {
@@ -1242,7 +1242,7 @@ do_stash() {
 # guard, and the keys silently did nothing (measured in the lab).
 #
 # So the bindings pass '#{window_id}', which tmux expands against the client's
-# current window, exactly as the prefix+H binding already did. TMUX_PANE (set by
+# current window, exactly as the prefix+_ binding already did. TMUX_PANE (set by
 # run-shell) is the fallback; a bare display-message is the last resort and is
 # only ever right when there is a single session.
 sel_win() {
