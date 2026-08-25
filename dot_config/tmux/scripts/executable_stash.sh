@@ -473,7 +473,7 @@ transcript_mtime() {
 # whatever the field says. Stale-BUSY only over-refuses (safe); stale-IDLE is
 # the dangerous direction, which the mtime check covers.
 is_working() {
-    local status="$1" sid="$2" pid="$3" mt
+    local status="$1" sid="$2" pid="$3" win="${4:-}" mt tab
     [ "$status" = "busy" ] && return 0
     # claude holds a `caffeinate -i -t 300` child while it works. Its 300s timer
     # means it lingers ~5min past a turn, which made it a bad signal for an
@@ -486,6 +486,31 @@ is_working() {
          | awk -v r="$pid" '$1==r && /caffeinate/{f=1} END{exit !f}'; then
         return 0
     fi
+    # The TAB'S OWN STATE settles it when it has an opinion, and the transcript
+    # mtime below is only the fallback for when it does not.
+    #
+    # The mtime check is a proxy for "a turn is in flight", and it is a bad one
+    # at the exact moment parking happens: a transcript write 2s before the
+    # press reads identical whether the turn is starting or has just finished.
+    # Measured — resuming a session and hiding it 19s later left it hidden AND
+    # still running, because startup wrote the transcript 2s before the press
+    # while `status` said idle and no caffeinate child existed. Hidden-but-alive
+    # is the one outcome parking exists to prevent.
+    #
+    # Trusting the tab here is safe in a way that trusting it for the KILL
+    # decision alone would not be, because it is not consulted alone: `busy`
+    # above and the caffeinate child are both still checked first, and
+    # caffeinate is the strong one — claude holds it for the whole turn and it
+    # lingers ~300s after, so a genuinely in-flight turn is caught there even if
+    # the watcher has died and frozen this option at a stale `idle`.
+    if [ -n "$win" ]; then
+        tab=$(tmux show -wqv -t "$win" @agent_state 2>/dev/null)
+        case "$tab" in
+            running)                    return 0 ;;   # definitely working
+            idle|done|needs-*|failed)   return 1 ;;   # definitely not; skip the proxy
+        esac
+    fi
+
     mt=$(transcript_mtime "$sid")
     case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
     [ "$mt" -gt 0 ] && [ $(( $(date +%s) - mt )) -lt "$ACTIVE_SECS" ]
@@ -637,7 +662,7 @@ suspend_agent() {
         log "window already holds session ${existing%%-*} — not suspending over it"; return 0
     fi
 
-    is_working "$a_status" "$a_sid" "$a_pid" && { log "agent is mid-turn — left running"; return 0; }
+    is_working "$a_status" "$a_sid" "$a_pid" "$win" && { log "agent is mid-turn — left running"; return 0; }
     has_unsent_input "$a_pane"      && { log "unsent input in the composer — left running"; return 0; }
     # A backgrounded workflow outlives its turn and computer-use spans turns;
     # both would die with the process. Checked TWO ways each — the watcher's
@@ -843,12 +868,35 @@ park_one() {
     return 1
 }
 
+# Is this window's agent working right now, per the TAB'S OWN STATE?
+#
+# Reads the options the tab watcher maintains — the same ones the tab bar
+# renders — rather than re-deriving from session files. That is a deliberate
+# exception to the rule has_live_workflow follows (never trust a watcher option,
+# it fails open if the watcher dies), and the difference is which way the
+# failure points: this gates a REFUSAL, not a kill. A dead watcher frozen at
+# `running` merely declines to hide the tab, which costs nothing; frozen at
+# `idle` the tab parks and suspend_agent's own guards — status, the caffeinate
+# child, the transcript — still stand between it and a SIGTERM. Nothing here can
+# end a turn.
+#
+# `running` is the state; @agent_workflow and @agent_cua are the two "in flight
+# but the chip cannot say so" cases from the same family. needs-input, failed
+# and done are NOT running — those are precisely the tabs worth tidying away.
+agent_running() {
+    local win="$1"
+    [ "$(tmux show -wqv -t "$win" @agent_state 2>/dev/null)" = "running" ] && return 0
+    [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] && return 0
+    [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] && return 0
+    return 1
+}
+
 # Park one or more windows as a single transaction: one lock, one renumber, one
 # publish. Looping the single-window path instead would take and drop the lock
 # per window, renumber per window, and let another park interleave halfway
 # through a group the user selected as one unit.
 do_stash_many() {
-    local w s sess="" wins=() total
+    local w s sess="" wins=() total busy=0
 
     # Everything from here to the moves reads tmux state and then acts on it, so
     # it runs under the lock. Released before the suspends, which are slow and
@@ -866,12 +914,23 @@ do_stash_many() {
         [ -n "$sess" ] || sess="$s"
         [ "$s" = "$sess" ] || continue                        # a range is one session by construction
         case " ${wins[*]-} " in *" $w "*) continue ;; esac     # de-dupe
+        # Refuse to hide a working agent at all, rather than hiding it and then
+        # declining to suspend it. That combination is the worst of both: the
+        # tab is gone from the bar AND still holding its ~1GB and its share of a
+        # core, with nothing on screen to say so. Parking is an explicit "not
+        # now", and "not now" is not a thing to say to a turn in flight.
+        if agent_running "$w"; then busy=$((busy + 1)); continue; fi
         wins+=("$w")
     done
 
     if [ "${#wins[@]}" -eq 0 ]; then
         lock_release
-        msg "already parked"
+        if [ "$busy" -gt 0 ]; then
+            [ "$busy" -eq 1 ] && msg "that agent is still working — not hiding it" \
+                              || msg "all $busy of those agents are still working — not hiding them"
+        else
+            msg "already parked"
+        fi
         return 0
     fi
 
@@ -937,6 +996,11 @@ do_stash_many() {
     renumber "$sess" "$HOLD"
     publish
     lock_release
+    # Never a silent partial: if part of a range stayed behind, say which and
+    # why, or the tab bar just looks like the gesture misfired.
+    if [ "$busy" -gt 0 ]; then
+        msg "hid ${#parked[@]} — left $busy still working"
+    fi
     [ "$failed" -gt 0 ] && msg "parked ${#parked[@]}, could not park $failed"
 
     # After the moves, so the tabs disappear immediately and the (slower)
