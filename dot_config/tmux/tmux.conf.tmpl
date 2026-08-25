@@ -183,7 +183,7 @@ set -g @catppuccin_window_current_fill "number"
 # tab sits on base #1e1e2e (blends into the status bar) and unselected tabs
 # get the surface0 #313244 gray pill.
 #
-# @stash_sel is the range-selection tint (prefix+H / prefix+L, see the
+# @stash_sel is the range-selection tint (prefix+v, see the
 # bindings near the bottom) and it wins over every agent state: while you are
 # choosing what to park, "about to be hidden" is the only thing the tab needs to
 # say, and it is a transient mode rather than a status. Mauve #cba6f7 is the one
@@ -347,23 +347,18 @@ unbind -n M-y
 
 # Park a tab out of the tab bar without stopping it (tmux has no hide/minimize
 # of its own — tmux/tmux#3047 — but move-window to a detached session is exactly
-# that). prefix+_ hides (the minimize glyph; it was prefix+H until the range
-# gesture took H), prefix+h brings one back. Not `run-shell -b` for unstash: it
-# may need to raise a popup for the picker, and a backgrounded run-shell has no
-# client to raise it on.
-bind-key _ run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh stash '#{window_id}'"
+# that). prefix+H hides, prefix+h brings one back; both verified unbound first.
+# Not `run-shell -b` for unstash: it may need to raise a popup for the picker,
+# and a backgrounded run-shell has no client to raise it on.
+bind-key H run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh stash '#{window_id}'"
 bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash"
 
-# ...and a range of adjacent tabs at once. prefix+H / prefix+L (shift-h /
-# shift-l: the vim pair, shifted) start a selection at the current tab and
-# extend it one tab left / right, tinting what is selected; the client is then
-# parked in the `stash` key table below, where bare h/l keep extending and H
-# parks the lot. The bring-back picker takes the nearest gesture fzf allows
-# (Shift-Up/Down or Tab — a plain letter there goes to the filter query).
-#
-# prefix+L took over tmux's default `switch-client -l` (last session), which
-# prefix+a's MRU switcher already covers. The Shift-arrow defaults
-# (refresh-client -L/-R, viewport panning) are back to stock.
+# ...and a range of adjacent tabs at once, vim-visual style. prefix+v enters
+# the mode with just the current tab selected (tinted); the client is then
+# parked in the `stash` key table below, where h/l extend the selection and H
+# — the same key that hides one tab — hides the lot. One key to enter, the
+# same hide key to finish. The bring-back picker takes the nearest gesture
+# fzf allows (Shift-Up/Down or Tab — a plain letter there is filter input).
 #
 # '#{window_id}' is passed for the same reason prefix+H passes it: a bare
 # `display-message -p` inside the script does NOT resolve to the client's
@@ -380,8 +375,7 @@ bind-key h run-shell "#{HOME}/.config/tmux/scripts/stash.sh unstash"
 # literal keystroke. Arming the table before the work closes the gap: a repeat
 # then dispatches from the `stash` table and queues behind the running job,
 # which is exactly the serialisation the foreground run-shell is here for.
-bind-key L switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start right '#{window_id}'"
-bind-key H switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start left '#{window_id}'"
+bind-key v switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-start here '#{window_id}'"
 
 # NOT run-shell -b: two quick taps backgrounded both read the same cursor and
 # both wrote cursor+1, so the selection stopped growing while the keys kept
@@ -391,7 +385,7 @@ bind-key H switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/sta
 #
 # Each extend re-arms the table: a key table is one-shot, so a binding that does
 # not switch-client back into it drops you to root after one press.
-# h/l, vim-style, once in the table — the unshifted pair of the entry keys.
+# h/l, vim-style, once in the table.
 bind-key -T stash l switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move right '#{window_id}'"
 bind-key -T stash h switch-client -T stash \; run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-move left '#{window_id}'"
 bind-key -T stash H     run-shell -b "#{HOME}/.config/tmux/scripts/stash.sh sel-commit '#{window_id}'"
@@ -420,10 +414,10 @@ bind-key -T stash Space  run-shell "#{HOME}/.config/tmux/scripts/stash.sh sel-ca
 #
 # That is survivable because the tint is self-healing rather than modal: every
 # sel-start clears the flag server-wide before selecting, and a single
-# prefix+_ clears it too (see do_stash), and prefix+H/L restart it. The one
+# prefix+H clears it too (see do_stash), and prefix+v restarts it. The one
 # escape this cannot catch is the prefix key itself, which tmux intercepts
 # before any binding lookup — so a binding for it in THIS table would never
-# run. prefix followed by any of those three is therefore the way out.
+# run. prefix followed by either of those is therefore the way out.
 
 bind C-l kill-pane
 # Initialize TMUX plugin manager (keep this line at the very bottom of tmux.conf)

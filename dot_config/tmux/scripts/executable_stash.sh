@@ -25,7 +25,7 @@
 #   stash.sh unstash [<window>]   bring one back; picker if several are parked
 #   stash.sh stash-many <w>...    park a group in one transaction
 #   stash.sh unstash-many <w>...  bring a group back in one transaction
-#   stash.sh sel-start left|right start a shift-arrow range at the current tab
+#   stash.sh sel-start here|left|right  start a range at the current tab
 #   stash.sh sel-move  left|right grow or shrink it
 #   stash.sh sel-cancel           drop the selection
 #   stash.sh sel-commit           park everything selected
@@ -276,7 +276,7 @@ save_state() {
     # yet. Worse, on this machine the hook usually never runs at all: continuum
     # skips auto-restore whenever a second tmux server exists, and there are
     # always agent sockets around. So "restore did not run" is the normal case
-    # and the first prefix+_ was destroying the file permanently.
+    # and the first prefix+H was destroying the file permanently.
     #
     # A sid in the old file that live state cannot account for is therefore
     # kept, not dropped: in the sidecar if its window still plausibly exists
@@ -949,7 +949,7 @@ resume_agent() {
 # `-P -F` is load-bearing: it reports the id of the window this call actually
 # created. Taking "the first window in the stash session" instead meant that if
 # new-session FAILED because the session already existed — which two concurrent
-# `prefix+_` presses reliably produce, since the bind is run-shell -b and both
+# `prefix+H` presses reliably produce, since the bind is run-shell -b and both
 # see hold_exists as false — `boot` resolved to somebody else's ALREADY-PARKED
 # window, and the kill below destroyed it, panes, scrollback, suspended agent
 # and all. Reproduced during review.
@@ -1200,7 +1200,7 @@ do_stash_many() {
 # It also clears any range selection first. tmux hands the prefix key back to
 # the prefix table WITHOUT consulting the `stash` table's bindings, so pressing
 # prefix mid-selection is the one exit that cannot run sel-cancel — and the
-# muscle-memory follow-up is prefix+_. Clearing here means that sequence parks
+# muscle-memory follow-up is prefix+H. Clearing here means that sequence parks
 # the current window and tidies the tint, instead of parking one window that
 # then travels into the holding session still flagged and comes back mauve.
 do_stash() {
@@ -1242,7 +1242,7 @@ do_stash() {
 # guard, and the keys silently did nothing (measured in the lab).
 #
 # So the bindings pass '#{window_id}', which tmux expands against the client's
-# current window, exactly as the prefix+_ binding already did. TMUX_PANE (set by
+# current window, exactly as the prefix+H binding already did. TMUX_PANE (set by
 # run-shell) is the fallback; a bare display-message is the last resort and is
 # only ever right when there is a single session.
 sel_win() {
@@ -1328,7 +1328,9 @@ do_sel_start() {
     # parked, and the tab bar it tints is not on screen to begin with.
     case "$sess" in "$HOLD") return 0 ;; esac
     sel_clear
-    nxt=$(sel_neighbour "$sess" "$cur" "$dir")
+    # `here` selects only the current tab — vim's `v` — and h/l grow it from
+    # there. left/right start already extended by one (the shift-arrow shape).
+    if [ "$dir" = "here" ]; then nxt="$cur"; else nxt=$(sel_neighbour "$sess" "$cur" "$dir"); fi
     # Global, not session-scoped: set-option's -t is a PANE target, so naming a
     # session with it ("=main") fails to resolve outright. A stale anchor left by
     # another session is harmless — sel_range looks the anchor up among THIS
