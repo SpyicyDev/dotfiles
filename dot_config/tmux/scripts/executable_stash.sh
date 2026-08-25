@@ -23,6 +23,12 @@
 #
 #   stash.sh stash   [<window>]   park it (default: current)
 #   stash.sh unstash [<window>]   bring one back; picker if several are parked
+#   stash.sh stash-many <w>...    park a group in one transaction
+#   stash.sh unstash-many <w>...  bring a group back in one transaction
+#   stash.sh sel-start left|right start a shift-arrow range at the current tab
+#   stash.sh sel-move  left|right grow or shrink it
+#   stash.sh sel-cancel           drop the selection
+#   stash.sh sel-commit           park everything selected
 #   stash.sh count                how many are parked (for the status line)
 #   stash.sh list                 what is parked, and where each came from
 #   stash.sh restore-state        re-apply parked state after a resurrect restore
@@ -34,7 +40,11 @@ HOLD=stash          # the detached holding session
 # `display-popup` does NOT expand #{...} formats in its command the way
 # run-shell does — a `#{HOME}/...` path reaches the popup's shell literally,
 # fails to exec, and the popup vanishes instantly with no error anywhere.
-SELF="$HOME/.config/tmux/scripts/stash.sh"
+#
+# Overridable so a copy of this script can be exercised against a scratch tmux
+# server without the re-entrant calls silently landing back in the installed
+# one — which would test the old code and report that the new code passed.
+SELF="${STASH_SELF:-$HOME/.config/tmux/scripts/stash.sh}"
 
 SESS_DIR="$HOME/.claude/sessions"
 TERM_WAIT=12          # seconds to allow for a graceful exit
@@ -726,76 +736,311 @@ resume_agent() {
     return 1
 }
 
-do_stash() {
-    local win="${1:-$(tmux display-message -p '#{window_id}')}"
-    local sess; sess=$(tmux display-message -p -t "$win" '#{session_name}')
+# A session cannot be created empty, so it is born with a placeholder that is
+# killed once the real windows are inside; the session then dies by itself when
+# the last window leaves, so nothing idles in the background.
+#
+# `-P -F` is load-bearing: it reports the id of the window this call actually
+# created. Taking "the first window in the stash session" instead meant that if
+# new-session FAILED because the session already existed — which two concurrent
+# `prefix+H` presses reliably produce, since the bind is run-shell -b and both
+# see hold_exists as false — `boot` resolved to somebody else's ALREADY-PARKED
+# window, and the kill below destroyed it, panes, scrollback, suspended agent
+# and all. Reproduced during review.
+#
+# Reports the placeholder in BOOT_WIN (empty if it created nothing) so the
+# caller can take it back out again if nothing ends up parked.
+BOOT_WIN=""
+ensure_hold() {
+    BOOT_WIN=""
+    hold_exists && return 0
+    BOOT_WIN=$(tmux new-session -d -s "$HOLD" -n _bootstrap -P -F '#{window_id}' 2>/dev/null) || BOOT_WIN=""
+    return 0
+}
 
-    # Everything from here to the move reads tmux state and then acts on it, so
-    # it runs under the lock. Released before the suspend, which is slow and
-    # touches only this one window.
-    lock_acquire || { msg "busy — try again"; return 1; }
-
-    # Never strand a client: taking a session's last window destroys it, and
-    # detach-on-destroy is on here, so that would drop the attached client to
-    # the shell. Counted INSIDE the lock — two concurrent parks both saw "2
-    # windows" and both moved, and the second one emptied the session.
-    if [ "$(tmux list-windows -t "=$sess" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')" -le 1 ]; then
-        lock_release
-        msg "that's the only tab in this session — not parking it"
-        return 1
-    fi
-    case "$sess" in "$HOLD") lock_release; msg "already parked"; return 0 ;; esac
-
+# Move one window into the holding session. Assumes the lock is held and the
+# holding session already exists.
+park_one() {
+    local win="$1" sess="$2" label
     # Origin travels with the window (see header). The label is captured too:
     # @agent_summary is maintained by the tab watcher and gets cleared once the
     # agent it describes is gone, so without this the picker would list a
     # suspended session as plain "zsh".
     tmux set-option -w -t "$win" @stash_origin "$sess"
-    local label; label=$(tmux show -wqv -t "$win" @agent_summary 2>/dev/null)
+    label=$(tmux show -wqv -t "$win" @agent_summary 2>/dev/null)
     [ -n "$label" ] && tmux set-option -w -t "$win" @stash_label "$label"
 
-    # A session cannot be created empty, so it is born with a placeholder that
-    # is killed once the real window is inside; the session then dies by itself
-    # when the last window leaves, so nothing idles in the background.
-    #
-    # `-P -F` is load-bearing: it reports the id of the window this call
-    # actually created. Taking "the first window in the stash session" instead
-    # meant that if new-session FAILED because the session already existed —
-    # which two concurrent `prefix+H` presses reliably produce, since the bind
-    # is run-shell -b and both see hold_exists as false — `boot` resolved to
-    # somebody else's ALREADY-PARKED window, and the kill below destroyed it,
-    # panes, scrollback, suspended agent and all. Reproduced during review.
-    local boot=""
-    if ! hold_exists; then
-        boot=$(tmux new-session -d -s "$HOLD" -n _bootstrap -P -F '#{window_id}' 2>/dev/null) || boot=""
+    tmux move-window -s "$win" -t "$HOLD": 2>/dev/null && return 0
+
+    # A window still sitting on the tab bar must not be left claiming it was
+    # parked: @stash_origin is what `list` and the restore hook read, and a
+    # stale one describes a park that never happened.
+    tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
+    tmux set-option -uw -t "$win" @stash_label 2>/dev/null
+    return 1
+}
+
+# Park one or more windows as a single transaction: one lock, one renumber, one
+# publish. Looping the single-window path instead would take and drop the lock
+# per window, renumber per window, and let another park interleave halfway
+# through a group the user selected as one unit.
+do_stash_many() {
+    local w s sess="" wins=() total
+
+    # Everything from here to the moves reads tmux state and then acts on it, so
+    # it runs under the lock. Released before the suspends, which are slow and
+    # touch only windows that are already parked.
+    lock_acquire || { msg "busy — try again"; return 1; }
+
+    # Resolve membership UNDER the lock. These ids come from a keypress that may
+    # be seconds old by now, so in between a window can have been closed, parked
+    # by another press, or moved to another session.
+    for w in "$@"; do
+        [ -n "$w" ] || continue
+        s=$(tmux display-message -p -t "$w" '#{session_name}' 2>/dev/null) || continue
+        [ -n "$s" ] || continue
+        case "$s" in "$HOLD") continue ;; esac                # already parked
+        [ -n "$sess" ] || sess="$s"
+        [ "$s" = "$sess" ] || continue                        # a range is one session by construction
+        case " ${wins[*]-} " in *" $w "*) continue ;; esac     # de-dupe
+        wins+=("$w")
+    done
+
+    if [ "${#wins[@]}" -eq 0 ]; then
+        lock_release
+        msg "already parked"
+        return 0
     fi
 
-    if ! tmux move-window -s "$win" -t "$HOLD": 2>/dev/null; then
+    # Never strand a client: taking a session's last window destroys it, and
+    # detach-on-destroy is on here, so that would drop the attached client to
+    # the shell. Counted INSIDE the lock — two concurrent parks both saw "2
+    # windows" and both moved, and the second one emptied the session.
+    total=$(tmux list-windows -t "=$sess" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ')
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    if [ "$total" -le "${#wins[@]}" ]; then
+        lock_release
+        if [ "${#wins[@]}" -eq 1 ]; then
+            msg "that's the only tab in this session — not parking it"
+        else
+            # Refused rather than quietly parking all but one: a partial result
+            # nobody asked for is worse than a clear no.
+            msg "that's every tab in this session — leave one out and try again"
+        fi
+        return 1
+    fi
+
+    ensure_hold
+    local parked=() failed=0
+    for w in "${wins[@]}"; do
+        if park_one "$w" "$sess"; then parked+=("$w"); else failed=$((failed + 1)); fi
+    done
+
+    if [ "${#parked[@]}" -eq 0 ]; then
         # If this call created the holding session and then failed to put
         # anything in it, take the placeholder back out rather than leaving a
         # session whose only window is a stray shell that `count` reports as
         # parked and the next prefix+h would hand you.
-        [ -n "$boot" ] && tmux kill-window -t "$boot" 2>/dev/null
+        [ -n "$BOOT_WIN" ] && tmux kill-window -t "$BOOT_WIN" 2>/dev/null
         lock_release
         msg "could not park it"
         return 1
     fi
-    # Only ever kill a window this invocation created, and never the one just parked.
-    [ -n "$boot" ] && [ "$boot" != "$win" ] && tmux kill-window -t "$boot" 2>/dev/null
+    # Only ever kill a window this invocation created, and never one just parked.
+    if [ -n "$BOOT_WIN" ]; then
+        case " ${parked[*]} " in
+            *" $BOOT_WIN "*) : ;;
+            *) tmux kill-window -t "$BOOT_WIN" 2>/dev/null ;;
+        esac
+    fi
     renumber "$sess" "$HOLD"
     publish
     lock_release
+    [ "$failed" -gt 0 ] && msg "parked ${#parked[@]}, could not park $failed"
 
-    # After the move, so the tab disappears immediately and the (slower)
-    # graceful shutdown happens out of sight.
-    suspend_agent "$win"
+    # After the moves, so the tabs disappear immediately and the (slower)
+    # graceful shutdowns happen out of sight. Serial on purpose: each suspend
+    # mirrors the sidecar, and concurrent writers would race a write-then-rename
+    # — the loser's session id simply would not be on disk.
+    for w in "${parked[@]}"; do suspend_agent "$w"; done
 
     # AGAIN, and this one is not redundant: the publish above ran before the
-    # agent was suspended, so the sidecar it wrote has an empty @stash_session.
+    # agents were suspended, so the sidecar it wrote has an empty @stash_session.
     # Leaving it at that meant a tmux restart came back with a suspended window
     # and no pointer to its conversation — the single worst outcome this whole
-    # mechanism exists to prevent. Re-mirror once the suspend has had its say.
+    # mechanism exists to prevent. Re-mirror once the suspends have had their say.
     save_state
+}
+
+do_stash() { do_stash_many "${1:-$(tmux display-message -p '#{window_id}')}"; }
+
+# --- selecting a range of tabs ------------------------------------------------
+#
+# prefix+S-Left / prefix+S-Right start a selection at the current tab and extend
+# it one tab; the client is then left in the `stash` key table where bare
+# S-Left/S-Right keep extending and H parks the lot.
+#
+# Modelled the way every list widget models shift-arrow: an ANCHOR that stays
+# put and a CURSOR that moves, with everything between them selected. That is
+# what makes shrinking fall out for free — walking the cursor back toward the
+# anchor and out the other side reverses the direction with no special case.
+# The range is contiguous because a contiguous range is the only kind the tab
+# bar can show unambiguously.
+#
+# Anchor and cursor are window IDs, never indexes: parking renumbers the session
+# (see renumber()), so an index captured beforehand names a different window
+# afterwards.
+#
+# The bindings that move the cursor are FOREGROUND run-shell. Backgrounded, two
+# quick taps both read the same cursor and both wrote cursor+1, so the selection
+# stopped growing while the keys kept registering. tmux runs foreground items
+# through the client's command queue in order, which serialises them for free —
+# and the freeze that makes a foreground run-shell dangerous elsewhere needs a
+# job that BLOCKS (the 90s resume poll); these are a handful of tmux calls.
+
+# The window the key was pressed in, and the session holding it.
+#
+# A bare `tmux display-message -p '#{session_name}'` does NOT mean "the session
+# the client is looking at". With no -t, tmux resolves the target by its own
+# most-recently-active rules, and the holding session is the newest thing on the
+# server the moment anything is parked — so with a client sitting in `main` and
+# three tabs parked, it answered `stash`, every selection landed on the HOLD
+# guard, and the keys silently did nothing (measured in the lab).
+#
+# So the bindings pass '#{window_id}', which tmux expands against the client's
+# current window, exactly as the prefix+H binding already did. TMUX_PANE (set by
+# run-shell) is the fallback; a bare display-message is the last resort and is
+# only ever right when there is a single session.
+sel_win() {
+    local w="${1:-}"
+    [ -n "$w" ] && { printf '%s' "$w"; return 0; }
+    if [ -n "${TMUX_PANE:-}" ]; then
+        tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null
+    else
+        tmux display-message -p '#{window_id}' 2>/dev/null
+    fi
+}
+sel_sess_of() { [ -n "${1:-}" ] && tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null; }
+
+# Clear the flag wherever it is, not merely where we believe it is. A selection
+# that leaked would tint tabs with no way to reach the mode that clears them.
+sel_clear() {
+    local w
+    for w in $(tmux list-windows -a -F '#{?#{@stash_sel},#{window_id},}' 2>/dev/null); do
+        tmux set-option -uw -t "$w" @stash_sel 2>/dev/null
+    done
+}
+
+# The ids the tab bar is currently showing as selected, in tab order.
+sel_ids() {
+    tmux list-windows -t "=$1" -F '#{?#{@stash_sel},#{window_id},}' 2>/dev/null | grep -v '^$'
+}
+
+# The window one step left/right of $2 in session $1 — or $2 itself at either
+# end, so holding the key down parks the selection against the edge instead of
+# silently wrapping around to the far side of the tab bar.
+sel_neighbour() {
+    tmux list-windows -t "=$1" -F '#{window_id}' 2>/dev/null |
+        awk -v w="$2" -v d="$3" '
+            { id[NR] = $0; if ($0 == w) i = NR }
+            END {
+                if (!i) { print w; exit }
+                j = (d == "left" ? i - 1 : i + 1)
+                if (j < 1 || j > NR) j = i
+                print id[j]
+            }'
+}
+
+# Every window between anchor and cursor inclusive, in tab order, whichever way
+# round the two are. Empty (and nonzero) if either has since gone.
+sel_range() {
+    tmux list-windows -t "=$1" -F '#{window_id}' 2>/dev/null |
+        awk -v a="$2" -v c="$3" '
+            { id[NR] = $0; if ($0 == a) ai = NR; if ($0 == c) ci = NR }
+            END {
+                if (!ai || !ci) exit 1
+                lo = (ai < ci ? ai : ci); hi = (ai < ci ? ci : ai)
+                for (k = lo; k <= hi; k++) print id[k]
+            }'
+}
+
+# Flag exactly $2.. and clear the flag everywhere else in session $1. Only
+# windows whose flag actually changes are touched, so holding an arrow down does
+# not fork a set-option per tab per keypress.
+sel_apply() {
+    local sess="$1"; shift
+    local want=" $* " wid flag
+    while IFS="$SEP" read -r wid flag; do
+        [ -n "$wid" ] || continue
+        case "$want" in
+            # Space-delimited on BOTH sides. A bare substring test matches @1
+            # inside @12 and would drag an unselected tab into the range — the
+            # same trap that made every window id ending in 1 a false positive
+            # in pending_windows().
+            *" $wid "*) [ -n "$flag" ] || tmux set-option -w -t "$wid" @stash_sel 1 2>/dev/null ;;
+            *)          [ -z "$flag" ] || tmux set-option -uw -t "$wid" @stash_sel 2>/dev/null ;;
+        esac
+    done < <(tmux list-windows -t "=$sess" -F "#{window_id}${SEP}#{@stash_sel}" 2>/dev/null)
+    # status-interval is 5s, so without this the tab bar keeps showing the
+    # previous selection until the next tick and the arrow key feels dead.
+    tmux refresh-client -S 2>/dev/null
+}
+
+do_sel_start() {
+    local dir="${1:-right}" cur sess nxt
+    cur=$(sel_win "${2:-}"); [ -n "$cur" ] || return 0
+    sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
+    # Selecting inside the holding session would offer to park what is already
+    # parked, and the tab bar it tints is not on screen to begin with.
+    case "$sess" in "$HOLD") return 0 ;; esac
+    sel_clear
+    nxt=$(sel_neighbour "$sess" "$cur" "$dir")
+    # Global, not session-scoped: set-option's -t is a PANE target, so naming a
+    # session with it ("=main") fails to resolve outright. A stale anchor left by
+    # another session is harmless — sel_range looks the anchor up among THIS
+    # session's windows, does not find it, and the selection simply restarts.
+    tmux set-option -g @stash_anchor "$cur" 2>/dev/null
+    tmux set-option -g @stash_cursor "$nxt" 2>/dev/null
+    sel_apply "$sess" $(sel_range "$sess" "$cur" "$nxt")
+}
+
+do_sel_move() {
+    local dir="${1:-right}" cur sess anchor cursor nxt
+    cur=$(sel_win "${2:-}"); [ -n "$cur" ] || return 0
+    sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
+    case "$sess" in "$HOLD") return 0 ;; esac
+    anchor=$(tmux show -gqv @stash_anchor 2>/dev/null)
+    cursor=$(tmux show -gqv @stash_cursor 2>/dev/null)
+    # No live selection, or one whose windows have since gone: start a fresh one
+    # rather than doing nothing, so a key in the table is never a dead end.
+    if [ -z "$anchor" ] || [ -z "$cursor" ] || [ -z "$(sel_range "$sess" "$anchor" "$cursor")" ]; then
+        do_sel_start "$dir" "$cur"
+        return
+    fi
+    nxt=$(sel_neighbour "$sess" "$cursor" "$dir")
+    tmux set-option -g @stash_cursor "$nxt" 2>/dev/null
+    sel_apply "$sess" $(sel_range "$sess" "$anchor" "$nxt")
+}
+
+do_sel_cancel() {
+    sel_clear
+    tmux set-option -gu @stash_anchor 2>/dev/null
+    tmux set-option -gu @stash_cursor 2>/dev/null
+    tmux refresh-client -S 2>/dev/null
+}
+
+do_sel_commit() {
+    local cur sess ids
+    cur=$(sel_win "${1:-}"); [ -n "$cur" ] || return 0
+    sess=$(sel_sess_of "$cur"); [ -n "$sess" ] || return 0
+    case "$sess" in "$HOLD") return 0 ;; esac
+    # Read the selection before clearing it, and clear it before parking: the
+    # flag is a window option, so it rides along into the holding session and
+    # would come back tinted on the next unstash.
+    ids=$(sel_ids "$sess")
+    do_sel_cancel
+    [ -n "$ids" ] || return 0
+    do_stash_many $ids
 }
 
 # Windows that are NOT parked but still carry a suspended session — a resume
@@ -843,38 +1088,84 @@ do_unstash() {
         fi
     fi
 
+    do_unstash_many "$win"
+}
+
+# Bring one or more parked windows back, in a single transaction for the same
+# reasons do_stash_many is one.
+do_unstash_many() {
+    local w win origin origins="" ordered=() wanted=" $* "
+
+    hold_exists || { msg "nothing is parked"; return 0; }
+
     lock_acquire || { msg "busy — try again"; return 1; }
+
     # Re-resolve under the lock. Picking "the only parked window" before taking
     # it meant two unstashes could select the same window, and the second
     # move-window then acted on one that had already gone home.
-    if [ -z "$win" ]; then
-        win=$(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null | head -1)
-    fi
-    # Process substitution, not a pipe: the same pipefail+SIGPIPE trap already
-    # fixed in resume_agent. A SIGPIPE'd tmux makes the pipeline nonzero even on
-    # a match, so this reported "nothing is parked" for a window that was.
-    if [ -z "$win" ] || ! grep -qx "$win" < <(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null); then
+    #
+    # Walking the holding session rather than the argument list does three jobs
+    # at once: it drops ids that are no longer parked, de-dupes, and puts the
+    # group back in the order it sits in — so tabs parked together come home in
+    # the same relative order rather than the order fzf happened to report them.
+    while read -r w; do
+        [ -n "$w" ] || continue
+        case "$wanted" in
+            "  ") ordered+=("$w"); break ;;      # no ids given: the first parked one
+            *" $w "*) ordered+=("$w") ;;
+        esac
+    done < <(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null)
+
+    if [ "${#ordered[@]}" -eq 0 ]; then
         lock_release
         msg "nothing is parked"
         return 0
     fi
 
-    # Home if it still exists, otherwise wherever we are now — a parked window
-    # must never become unreachable because its origin session was closed.
-    local origin; origin=$(tmux show -wqv -t "$win" @stash_origin 2>/dev/null)
-    if [ -z "$origin" ] || ! tmux has-session -t "=$origin" 2>/dev/null; then
-        origin=$(tmux display-message -p '#{session_name}')
-    fi
+    local restored=() failed=0
+    for win in "${ordered[@]}"; do
+        # Home if it still exists, otherwise wherever we are now — a parked
+        # window must never become unreachable because its origin session was
+        # closed. Resolved per window: a batch can span origins.
+        origin=$(tmux show -wqv -t "$win" @stash_origin 2>/dev/null)
+        if [ -z "$origin" ] || ! tmux has-session -t "=$origin" 2>/dev/null; then
+            origin=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+        fi
+        # ...but that fallback resolves by tmux's most-recently-active rules,
+        # not "the session the client is looking at", and the holding session is
+        # the newest thing on the server whenever anything is parked — so it can
+        # answer `stash`, and moving a parked window to `stash` succeeds while
+        # leaving it exactly where it was: parked, with its origin now cleared,
+        # and no way left to tell it had ever been anywhere else.
+        case "${origin:-}" in
+            "$HOLD"|"") origin=$(tmux list-sessions -F '#{session_name}' 2>/dev/null |
+                                 grep -vx "$HOLD" | head -1) ;;
+        esac
+        if [ -z "$origin" ]; then
+            failed=$((failed + 1))
+            log "no session left to bring $win back to"
+            continue
+        fi
+        if ! tmux move-window -s "$win" -t "$origin": 2>/dev/null; then
+            failed=$((failed + 1))
+            continue
+        fi
+        tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
+        tmux set-option -uw -t "$win" @stash_label 2>/dev/null
+        case " $origins " in *" $origin "*) : ;; *) origins="$origins $origin" ;; esac
+        restored+=("$win")
+    done
 
-    if ! tmux move-window -s "$win" -t "$origin": 2>/dev/null; then
+    if [ "${#restored[@]}" -eq 0 ]; then
         lock_release; msg "could not bring it back"; return 1
     fi
-    tmux set-option -uw -t "$win" @stash_origin 2>/dev/null
-    tmux set-option -uw -t "$win" @stash_label 2>/dev/null
-    tmux select-window -t "$win" 2>/dev/null
-    renumber "$HOLD" "$origin"
+    # Land on the first of the group, so a multi-tab restore leaves you at the
+    # left end of what just came back rather than on whichever one moved last.
+    tmux select-window -t "${restored[0]}" 2>/dev/null
+    renumber "$HOLD" $origins
     publish
     lock_release
+    [ "$failed" -gt 0 ] && msg "brought back ${#restored[@]}, could not bring back $failed"
 
     # Handed to a BACKGROUNDED run-shell, never called inline. prefix+h is a
     # foreground run-shell (it has to be — the picker needs a client to raise a
@@ -884,21 +1175,41 @@ do_unstash() {
     # never registered, with everything dead — typing, prefix chords, even
     # prefix+d — and keys typed during a 90s block discarded outright rather
     # than replayed.
-    tmux run-shell -b "'$SELF' resume '$win'"
+    #
+    # One per window, and deliberately concurrent: each polls for up to 90s for
+    # its OWN agent to register, so running them in series would make the last
+    # tab of a group wait out every tab before it. They touch different windows
+    # and the sidecar write they each trigger is a rename, so the worst case is
+    # a redundant mirror, not a lost id.
+    for win in "${restored[@]}"; do
+        tmux run-shell -b "'$SELF' resume '$win'"
+    done
 }
 
 # Runs inside the popup, where there is a real terminal for fzf.
+#
+# --multi so a group parked together can come back together. Shift-Up/Shift-Down
+# are bound alongside fzf's own Tab/Shift-Tab because shift+arrow is the gesture
+# this pairs with on the tab-bar side, and having the two halves of the feature
+# answer to the same key is most of what makes it memorable.
 do_pick() {
-    local win
-    win=$(tmux list-windows -t "=$HOLD" \
+    local wins
+    wins=$(tmux list-windows -t "=$HOLD" \
             -F '#{window_id}	#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}	#{pane_current_path}' \
           | fzf --with-nth=2.. --delimiter='\t' --reverse --prompt='bring back > ' \
-          | cut -f1)
-    # Hand off rather than doing the work here. do_unstash's resume polls for up
-    # to RESUME_WAIT, and display-popup -E keeps the popup on screen — holding
-    # the keyboard and covering the window it just restored — until its command
+                --multi \
+                --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
+                --header '⇧↑/⇧↓ or Tab to pick several · ⌃a all · ⏎ bring back' \
+          | cut -f1 | tr '\n' ' ')
+    # Hand off rather than doing the work here. the resume polls for up to
+    # RESUME_WAIT, and display-popup -E keeps the popup on screen — holding the
+    # keyboard and covering the windows it just restored — until its command
     # exits. Backgrounding lets the popup close the moment you pick.
-    [ -n "$win" ] && tmux run-shell -b "'$SELF' unstash '$win'"
+    #
+    # Unquoted on purpose: this is a list of ids for the command line to split.
+    # They are tmux window ids (@ plus digits), so there is nothing in them for
+    # a shell to interpret.
+    [ -n "${wins// /}" ] && tmux run-shell -b "'$SELF' unstash-many $wins"
 }
 
 do_list() {
@@ -938,6 +1249,12 @@ do_list() {
 case "${1:-}" in
     stash)   shift; do_stash "${1:-}" ;;
     unstash) shift; do_unstash "${1:-}" ;;
+    stash-many)   shift; do_stash_many "$@" ;;
+    unstash-many) shift; do_unstash_many "$@" ;;
+    sel-start)  shift; do_sel_start "${1:-right}" "${2:-}" ;;
+    sel-move)   shift; do_sel_move "${1:-right}" "${2:-}" ;;
+    sel-cancel) do_sel_cancel ;;
+    sel-commit) shift; do_sel_commit "${1:-}" ;;
     count)   count ;;
     publish) publish ;;
     pick)    do_pick ;;
