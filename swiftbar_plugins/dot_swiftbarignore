@@ -1,0 +1,11 @@
+# Plugins SwiftBar should not load. Same shape as .gitignore: one pattern per
+# line, `#` comments, `*` and `**/` globs, matched against the filename and the
+# path relative to this directory.
+#
+# claude-usage.30s.sh is superseded by UsageBar (~/code/projects/usagebar), a
+# native menu bar app that reads the same codexbar cache and draws the same
+# panel in a real popover instead of a PNG stuffed into a menu row. The plugin
+# still works; it is kept here because it is the fallback if UsageBar is ever
+# uninstalled, and because it is the reference for the drawing the app ported.
+# Delete the line below to bring it back.
+claude-usage.30s.sh
