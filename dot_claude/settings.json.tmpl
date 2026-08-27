@@ -1,0 +1,295 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__codegraph_search",
+      "mcp__codegraph__codegraph_context",
+      "mcp__codegraph__codegraph_callers",
+      "mcp__codegraph__codegraph_callees",
+      "mcp__codegraph__codegraph_impact",
+      "mcp__codegraph__codegraph_node",
+      "mcp__codegraph__codegraph_status",
+      "Bash(git -C {{ .chezmoi.homeDir }}/.local/share/chezmoi commit:*)",
+      "Bash(git -C {{ .chezmoi.homeDir }}/.local/share/chezmoi push:*)",
+      "mcp__cua"
+    ],
+    "deny": [
+      "mcp__claude-in-chrome",
+      "Bash"
+    ],
+    "defaultMode": "auto"
+  },
+  "model": "opus[1m]",
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' needs-approval claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' needs-approval claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__pty__run|mcp__pty__spawn_pty",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' heartbeat claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__pty__run|mcp__pty__spawn_pty",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__pty__run",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/pty-plan-mode.ts",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/hooks/claude-session-cleanup.sh'"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 -X POST -H \"Authorization: Bearer $(cat \\\"$HOME/.local/state/tmux-pty-mcp/token\\\" 2>/dev/null)\" --data \"$PPID\" http://127.0.0.1:7997/claude-session-end >/dev/null 2>&1; rm -f \"$HOME/.local/state/tmux-pty-mcp/sids/$PPID\" 2>/dev/null || true # tmux-pty-mcp-cleanup",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' clear claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/plugins/tmux-assistant-resurrect/hooks/claude-session-track.sh'"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "umask 077; mkdir -p \"$HOME/.local/state/tmux-pty-mcp/sids\" && jq -r .session_id > \"$HOME/.local/state/tmux-pty-mcp/sids/$PPID\" 2>/dev/null || true # tmux-pty-mcp-sid"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' idle claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' done claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "nohup bash \"$HOME/.config/tmux/scripts/codexbar-usage-push.sh\" >/dev/null 2>&1 &",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' failed claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.bun/bin/bun {{ .chezmoi.homeDir }}/.claude/hooks/chezmoi-guard.ts"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-tab-indicator.sh' running claude"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.local/bin/cua-notch-agent-hook",
+            "timeout": 10,
+            "async": true
+          }
+        ]
+      }
+    ]
+  },
+  "disableAgentView": true,
+  "statusLine": {
+    "type": "command",
+    "command": "{{ .chezmoi.homeDir }}/.claude/statusline.sh",
+    "padding": 2
+  },
+  "enabledPlugins": {
+    "lua-lsp@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true
+  },
+  "effortLevel": "high",
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true,
+  "theme": "dark",
+  "editorMode": "vim",
+  "remoteControlAtStartup": true,
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true
+}
