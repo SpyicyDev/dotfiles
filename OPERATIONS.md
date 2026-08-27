@@ -32,6 +32,7 @@ For the public-facing intro and architecture, see [README.md](./README.md).
 21. [Disaster recovery](#disaster-recovery)
 22. [Decision tree: when to use what](#decision-tree-when-to-use-what)
 23. [Hygiene checklist before tracking new files](#hygiene-checklist-before-tracking-new-files)
+24. [Agent guards and the drift indicator](#agent-guards-and-the-drift-indicator)
 
 ---
 
@@ -47,6 +48,8 @@ chezmoi add ~/.foo        # start tracking a new file
 chezmoi re-add ~/.foo     # propagate live edits to source (PLAIN FILES ONLY - silently skips templates)
 chezmoi forget --force ~/.bar  # stop tracking
 chezmoi cd                # cd into source dir for git ops
+cmc                       # chezmoi-commit: group pending source changes into commits + push
+cmc --dry-run             # show the planned commits, change nothing
 chezmoi update            # git pull + apply
 chezmoi managed           # list everything chezmoi controls
 chezmoi data              # dump all template data
@@ -79,7 +82,7 @@ After making a config change you want to track:
 # Universal pattern (works for plain, templated, encrypted, op:// files)
 chezmoi edit --apply ~/.zshrc      # opens source in $EDITOR, auto-applies on save
 chezmoi cd && git diff             # review
-chezmoi cd && git add . && git commit -m "..." && git push
+cmc                                # chezmoi-commit: group, commit, push (`--dry-run` to preview)
 
 # Alternative ONLY for plain (non-templated) files
 $EDITOR ~/.bashrc                  # edit the LIVE file directly
@@ -91,6 +94,19 @@ chezmoi re-add ~/.bashrc           # mirror back to source
 
 `chezmoi edit --apply` is the safe default — it edits the source (handling
 template/encryption transparently), auto-applies, no re-add gotchas.
+
+This edit-source → apply → `cmc` loop is also the one the agent guards
+enforce: an agent that writes a managed live file directly is denied, and one
+that leaves source changes uncommitted gets pushed back to commit. See
+[Agent guards and the drift indicator](#agent-guards-and-the-drift-indicator).
+
+**Never `git add -A` / `git add .` in the source repo.** Other agents and
+sessions routinely hold uncommitted work in `~/.local/share/chezmoi`; blanket
+staging sweeps it into your commit. Stage explicit paths. `cmc` is **not** a
+way around this: it commits every path in `git status` for the whole tree
+(other agents' in-flight work included, just split into tidier commits), so
+run `git status` and make sure everything pending is yours before using it —
+see [`chezmoi-commit`](#chezmoi-commit-cmc).
 
 ---
 
@@ -165,7 +181,7 @@ This produces `encrypted_private_dot_zshenv.private.age` in the source dir
 5. Apply + commit:
    ```sh
    chezmoi apply
-   chezmoi cd && git add . && git commit -m "Add foo config (op:// templated)" && git push
+   cmc     # or: chezmoi cd && git add dot_config/foo/config.json.tmpl && git commit -m "..." && git push
    ```
 
 ### Step 3: ensure perms are right
@@ -180,8 +196,13 @@ Source filename prefix encodes target perms:
 ### Step 4: commit
 
 ```sh
+cmc                 # groups + commits + pushes; `cmc --dry-run` to preview.
+                    # Commits EVERYTHING in `git status`, other agents' work
+                    # included — check `git status` first (see Daily flow).
+
+# By hand instead? Stage EXPLICITLY — never `git add .` here (see Daily flow).
 chezmoi cd
-git add .
+git add dot_config/foo/config.toml
 git commit -m "Add ~/.config/foo/config.toml"
 git push
 ```
@@ -344,7 +365,18 @@ Useful when a tool autogenerates a file that shouldn't be tracked (e.g.,
 ```sh
 chezmoi cd
 git status
-git add -A
+cmc                 # chezmoi-commit: groups pending source changes into
+                    # logical commits, writes each message, pushes.
+                    # `cmc --dry-run` first to see the plan; `--no-push` to hold.
+                    # NOTE: cmc has the same blast radius as `git add -A` — it
+                    # commits every path in `git status`, including other
+                    # agents' in-flight work. Only use it when `git status`
+                    # above shows nothing but your own changes.
+
+# By hand instead (the safe choice when the tree is shared)? Stage EXPLICITLY.
+# Never `git add -A` / `git add .` here: other agents may have uncommitted
+# work in this same tree and blanket staging will sweep it into your commit.
+git add path/to/the/files/you/changed
 git commit -m "..."
 git push
 ```
@@ -494,9 +526,9 @@ done
 op item edit chezmoi-age-key-mackbook --vault Developer \
     "notesPlain=$(cat ~/.config/chezmoi/key.txt)"
 
-# 8. Commit + push
+# 8. Commit + push (explicit paths — never `git add -A` in this shared tree)
 chezmoi cd
-git add -A
+git add .chezmoi.toml.tmpl $(find . -name "*.age")
 git commit -m "Rotate age key"
 git push
 
@@ -746,7 +778,7 @@ chezmoi apply --force
 chezmoi cd
 git pull
 # resolve conflicts in source files
-git add .
+git add path/to/each/resolved/file    # not `git add .` — other agents' work may be here
 git commit
 exit
 chezmoi apply
@@ -942,3 +974,85 @@ tracked file, run through this checklist:
 - [ ] No new external repo URLs that point to private repos (people can't clone the bootstrap)
 - [ ] op:// references look reasonable (vault/item names will be public metadata)
 - [ ] Run `pre-commit run --all-files` if gitleaks hook is installed (`pre-commit install` once per machine)
+
+---
+
+## Agent guards and the drift indicator
+
+Overview in [README.md → Guard system](./README.md#guard-system). This is the
+operator's view.
+
+### Reading the prompt
+
+| Glyph | Meaning | Do |
+|---|---|---|
+| `~` | A managed **live** file differs from its source. The next `chezmoi apply` overwrites it. | `chezmoi diff`, then merge/port/discard — see [Recovering from "I accidentally edited the live file"](#recovering-from-i-accidentally-edited-the-live-file). |
+| `*` | Source repo has uncommitted changes. | `cmc` when you're at a stopping point (check `git status` first — see [`chezmoi-commit`](#chezmoi-commit-cmc)). |
+| `⇡` / `⇣` | Source repo ahead of / behind origin. | `git push` / `chezmoi update`. |
+| `?` | No successful fetch in 24h; `⇡`/`⇣` may be stale. | Ignore, or `chezmoi cd && git fetch`. |
+
+Colour carries the severity: `~` is bold red with a `⚠` (the only alarm),
+`*` yellow, `⇡`/`⇣` blue, `?` dim. `.zshrc` exports one env var per class
+(`STARSHIP_CHEZMOI_DRIFT_{LIVE,UNCOMMITTED,SYNC,STALE}`, via
+`_chezmoi_drift_export`) and `starship.toml` styles each one.
+
+The state lives in `~/.cache/chezmoi-drift/state`, refreshed in the
+background by a zsh precmd hook; the prompt itself only reads it. A nu tab
+never shows it. If it looks stuck, `rm -rf ~/.cache/chezmoi-drift` — the next
+zsh prompt rebuilds it.
+
+### What the guards block
+
+`chezmoi-guard` runs as a Claude Code hook, a Codex hook, and an opencode
+plugin. Same rules everywhere:
+
+- **Denied**: edit-class tools on any path in `chezmoi managed`; shell
+  commands writing to one (`>`, `tee`, `cp`/`mv` onto it, `sed -i`,
+  `perl -i`, `rm`, …); destructive git against `~/.local/share/chezmoi`
+  (`reset`, `rebase`, `merge`, force-push, `restore`, `checkout -- <path>`,
+  `clean -f`, `stash` push/pop/drop, `commit --amend`).
+- **Allowed**: reads of managed files (`cat`, `grep`, `sed -n`, `awk`),
+  edits to the **source** files, plain `git add <paths>` / `commit` /
+  non-force `push` / `status` / `diff` / `log` / `stash list`.
+- **Stop**: a session that wrote source files and left them uncommitted is
+  sent back once to commit + push (max 3 times per session, 2-minute window,
+  never in subagents).
+
+The guard does not catch `git add -A` — that is a convention, not a block.
+
+### State, logs, and reset
+
+| Guard | State dir | Log |
+|---|---|---|
+| Claude Code | `~/.claude/.chezmoi-guard/` | `chezmoi-guard.log` in it |
+| Codex | `~/.codex/.tmp/chezmoi-guard/` | `chezmoi-guard.log` in it |
+| opencode | (in-process) | `~/.local/share/opencode/chezmoi-guard.log` |
+
+State dirs hold `managed.json` (cache of `chezmoi managed`, refreshed every
+5 min off the tool-call hot path) and `sessions/<key>.json` (which source
+paths a session touched, continuation count). All disposable: deleting the
+dir forces a cold reload and forgets continuation history, nothing else. Logs
+rotate once at 1 MB; set `CHEZMOI_GUARD_DEBUG=1` for per-tool-call lines.
+
+Registration: Claude Code in `~/.claude/settings.json` (`hooks`), Codex in
+`~/.codex/hooks.json`, opencode by file presence in
+`~/.config/opencode/plugins/`. Claude Code holds newly changed hook commands
+for review — approve via `/hooks` or restart the session.
+
+### `chezmoi-commit` (`cmc`)
+
+```sh
+cmc --dry-run    # safe first run: prints the planned groups and messages
+cmc              # commit each group (explicit paths only) and push
+cmc --no-push    # commit, hold the push
+```
+
+It commits only paths that appear in `git status` — which, in a tree shared
+with other agents, may include their in-flight work. Check `git status` first
+and prefer running it when the tree is yours.
+
+It runs gitleaks over the pending changes before calling the model; a hit
+aborts with nothing committed (fix it or add the fingerprint to
+`.gitleaksignore`). Exit 1 also means "some group was rejected by the
+pre-commit hook" — the good groups are already pushed and the rejected files
+are still in `git status`. gitleaks is required (`brew install gitleaks`).

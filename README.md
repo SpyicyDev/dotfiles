@@ -17,6 +17,15 @@ fork, adapt, and steal patterns. Don't blindly apply this to your machine.
 ## What's inside
 
 - **Shell**: zsh with [antidote](https://github.com/mattmc3/antidote), [starship](https://starship.rs/), lazy-loaded language tooling
+- **Prompt drift indicator**: a zsh precmd hook runs a split `chezmoi verify`
+  in the background and publishes glyphs to `~/.cache/chezmoi-drift/state`,
+  rendered by starship. `~` live drift · `*` uncommitted source · `⇡`/`⇣`
+  ahead/behind · `?` no successful fetch in 24h. See [Guard system](#guard-system).
+- **Agent guards**: `chezmoi-guard` hooks for Claude Code, Codex, and opencode
+  hard-block agents editing managed live files and block Stop until chezmoi
+  source changes are committed and pushed.
+- **Commit driver**: `chezmoi-commit` (alias `cmc`) splits pending source
+  changes into logical commits, writes each message with a cheap model, pushes.
 - **Editor**: neovim (managed as a separate repo via [`.chezmoiexternal.toml`](./.chezmoiexternal.toml)) + ideavim
 - **Multiplexers**: tmux ([tpm](https://github.com/tmux-plugins/tpm)-managed plugins) and zellij
 - **Terminal**: [WezTerm](https://wezfurlong.org/wezterm/) primarily, iTerm2 fallback
@@ -293,6 +302,75 @@ today. To add a Linux machine:
 Shell, git, editor, and most CLI configs already work on Linux because they
 use `{{ .homebrew_prefix }}` and `{{ .chezmoi.homeDir }}` instead of
 literal paths.
+
+---
+
+## Guard system
+
+The contract this repo enforces: **never edit a managed live file; edit the
+source, apply, then commit with `cmc`.** Four pieces hold that line. Removing
+any of them just removes a safety net — nothing else depends on them.
+
+**Prompt drift indicator** (`dot_zshrc.tmpl`, "Tier C"). A precmd hook
+checks `~/.cache/chezmoi-drift/state` with a no-fork `$(<file)` read and
+exports its glyphs; a background job refreshes that file with a split
+`chezmoi verify` (fast plain files every cycle, secrets/templates less often)
+plus `git status`/`ahead-behind` on the source repo, and publishes atomically.
+The glyphs: `~` live drift (the next `chezmoi apply` will clobber a hand
+edit), `*` uncommitted source, `⇡`/`⇣` ahead/behind origin, `?` no fetch in
+24h. `.zshrc` exports one env var per class
+(`STARSHIP_CHEZMOI_DRIFT_{LIVE,UNCOMMITTED,SYNC,STALE}`) and
+`dot_config/starship.toml` styles each: `~` bold red with a `⚠`, `*` yellow,
+`⇡`/`⇣` blue, `?` dim — so the everyday "you have uncommitted source changes"
+never looks like the "your hand edit is about to be clobbered" alarm. The nu
+tab deliberately hides these vars (`dot_config/nushell/env.nu.tmpl`) rather
+than show a value frozen at launch.
+
+**Agent guards** (`dot_claude/hooks/chezmoi-guard.ts`,
+`dot_codex/hooks/chezmoi-guard.ts`,
+`dot_config/opencode/plugins/chezmoi-guard.ts`). One guard per agent
+runtime, same rules: edit-class tools targeting a chezmoi-managed live path
+are hard-denied (exact match against `chezmoi managed`), shell commands are
+denied when they carry write intent at a managed path (`>`, `tee`, `cp`,
+`mv`, `sed -i`, `perl -i`, `rm`, …; plain reads are allowed), and destructive
+git aimed at the source repo is denied (`reset`, `rebase`, `merge`, force-push,
+`restore`, `checkout -- <path>`, `clean -f`, `stash` push/pop/drop, `commit
+--amend`). Plain `add`/`commit`/`push`/`status`/`diff` are allowed. Each guard
+also remembers source files the session wrote and, at Stop, blocks once with a
+"commit and push" continuation (capped, loop-guarded). Everything fails open:
+a broken bun or chezmoi disables the guard rather than wedging the agent.
+Per-runtime details: [`dot_claude/hooks/README.md`](./dot_claude/hooks/README.md),
+[`dot_codex/hooks/README.md`](./dot_codex/hooks/README.md).
+
+**Commit driver** (`dot_local/bin/executable_chezmoi-commit`, alias `cmc`).
+Scans the pending changes with gitleaks first (the same `gitleaks git
+--staged` scan the pre-commit hook runs, on a throwaway index) and aborts
+before anything is sent to a model if it finds a secret. Then reads `git
+status` in the source repo, asks a cheap model (claude haiku, codex fallback)
+to group the changed paths into logical commits with messages, validates the
+grouping against the real changed set (falling back to `chore: update
+dotfiles` for a missing subject), commits each group staging only its own
+files, and pushes. If the pre-commit hook rejects a group, its files are left
+unstaged, the remaining groups are still committed and pushed, and it exits 1
+— so `cmc && …` does not mean the tree is clean. `cmc --dry-run` prints the
+plan and changes nothing; `--no-push` commits only. It never runs `chezmoi
+re-add`. Requires chezmoi, jq, gitleaks and claude or codex.
+
+**Editor intercept** (`~/.config/nvim/lua/chezmoi_workflow.lua`, in the
+separate nvim repo). Opening a managed live path in neovim swaps the buffer to
+its chezmoi source and auto-applies on save, so hand edits land in the repo.
+
+State and logs — all disposable, deleting any of it only forces a cold reload:
+
+| What | Where |
+|---|---|
+| Drift state file + refresh scratch | `~/.cache/chezmoi-drift/` |
+| Claude guard: managed-set cache, per-session state, log | `~/.claude/.chezmoi-guard/{managed.json,sessions/,chezmoi-guard.log}` |
+| Codex guard: same layout | `~/.codex/.tmp/chezmoi-guard/` |
+| opencode guard: log | `~/.local/share/opencode/chezmoi-guard.log` |
+
+Logs rotate once at 1 MB (`.1`); per-tool-call trace lines only appear with
+`CHEZMOI_GUARD_DEBUG=1`.
 
 ---
 
