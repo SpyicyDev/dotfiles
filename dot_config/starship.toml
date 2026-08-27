@@ -6,7 +6,10 @@ $directory\
 $git_branch\
 $git_state\
 $git_status\
-${env_var.STARSHIP_CHEZMOI_DRIFT}\
+${env_var.STARSHIP_CHEZMOI_DRIFT_LIVE}\
+${env_var.STARSHIP_CHEZMOI_DRIFT_UNCOMMITTED}\
+${env_var.STARSHIP_CHEZMOI_DRIFT_SYNC}\
+${env_var.STARSHIP_CHEZMOI_DRIFT_STALE}\
 $cmd_duration\
 ${env_var.STARSHIP_JOBS_STOPPED}\
 ${env_var.STARSHIP_JOBS_RUNNING}\
@@ -67,25 +70,58 @@ description = "Running background (&) jobs — set by zsh precmd from $jobstates
 format = "[⚙ $env_value]($style) "
 style = "bold cyan"
 
-# chezmoi drift indicator. The env var is maintained by the
-# `_chezmoi_drift_check` precmd hook in ~/.zshrc, which mirrors the
-# background-refreshed cache file into the env var via zsh's no-fork
-# `$(<file)` read. Zero subshell forks per prompt (previously this was
-# a [custom.*] block that ran sh+cat + sh+test per prompt).
-# Glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind, ? fetch >24h stale.
 # Nushell data-tab marker. $NU_TAB is set by ~/.config/nushell/env.nu and is
 # never set in zsh, so this renders only in a nu tab and costs zsh nothing.
-# Same [env_var.*] pattern as the three modules below — one starship config
+# Same [env_var.*] pattern as the modules below — one starship config
 # serving both shells rather than a second copy to keep in sync.
 #
-# The drift indicator below doubles as a second, passive marker: it is driven
-# by a zsh precmd hook that does not run here, so a nu tab simply never shows
-# it. Correct, since chezmoi drift is a zsh-tab concern.
+# The drift indicator is driven by a zsh precmd hook that does not run in nu.
+# A `prefix N` tab starts clean, but `nu` typed at a zsh prompt would inherit
+# the exported vars frozen at launch, so env.nu hide-env's them. Either way a
+# nu tab never shows drift — correct, since chezmoi drift is a zsh-tab concern.
 [env_var.NU_TAB]
 description = "Set to 'nu' by nushell's env.nu; marks the structured-data tab."
 format = "[$env_value](bold #cba6f7) "
 
-[env_var.STARSHIP_CHEZMOI_DRIFT]
-description = "chezmoi drift glyphs (set by zsh precmd from ~/.cache/chezmoi-drift/state)"
-format = "[ ⚠ chezmoi:$env_value]($style) "
+# chezmoi drift indicator. The env vars are maintained by the
+# `_chezmoi_drift_check` precmd hook in ~/.zshrc, which mirrors the
+# background-refreshed cache file (~/.cache/chezmoi-drift/state) into the env
+# via zsh's no-fork `$(<file)` read. Zero subshell forks per prompt (previously
+# this was a [custom.*] block that ran sh+cat + sh+test per prompt).
+# Glyphs: ~ live drift, * uncommitted, ⇡ ahead, ⇣ behind, ? fetch >24h stale.
+#
+# One [env_var] module = one style, so each glyph class gets its own var and
+# its own weight. The point: `*` (you edited a source file — the normal state
+# of a live dotfiles repo) must NOT look like `~` (a managed live file has
+# diverged from source and the next `chezmoi apply` will clobber it). Bold red
+# is reserved for `~`. Every module renders only while its var is set AND
+# non-empty on the zsh side (a set-but-empty var renders a bare prefix — the
+# `_chezmoi_drift_export` function in .zshrc exports a class's var only when
+# it has glyphs and unsets it otherwise; keep that discipline).
+#
+# Order in `format` above: live drift first (it is the alarm), then the
+# informational git state.
+
+# `~` — live drift. The one that should stop you.
+[env_var.STARSHIP_CHEZMOI_DRIFT_LIVE]
+description = "chezmoi live drift (~): a managed live file differs from its source."
+format = "[⚠ $env_value]($style) "
 style = "bold red"
+
+# `*` — uncommitted source changes. You have work to save, not a problem.
+[env_var.STARSHIP_CHEZMOI_DRIFT_UNCOMMITTED]
+description = "chezmoi source repo has uncommitted changes (*)."
+format = "[$env_value]($style) "
+style = "yellow"
+
+# `⇡` / `⇣` — source repo ahead of / behind origin.
+[env_var.STARSHIP_CHEZMOI_DRIFT_SYNC]
+description = "chezmoi source repo ahead (⇡) / behind (⇣) origin."
+format = "[$env_value]($style) "
+style = "blue"
+
+# `?` — no successful fetch in 24h, so ⇡/⇣ may be stale. Deliberately dim.
+[env_var.STARSHIP_CHEZMOI_DRIFT_STALE]
+description = "chezmoi source repo: no successful fetch in 24h (?)."
+format = "[$env_value]($style) "
+style = "bright-black"

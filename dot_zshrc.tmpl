@@ -308,6 +308,30 @@ zmodload -F zsh/files b:zf_mkdir b:zf_rm b:zf_mv 2>/dev/null || {
   zf_mv()    { /bin/mv "$@"; }
 }
 
+# Publish the state file's glyphs to starship as one env var PER CLASS so each
+# gets its own colour ([env_var.STARSHIP_CHEZMOI_DRIFT_*] in starship.toml):
+#   LIVE        ~      bold red   — a managed live file differs from source
+#   UNCOMMITTED *      yellow     — source repo has uncommitted changes
+#   SYNC        ⇡ ⇣    blue       — ahead / behind origin
+#   STALE       ?      dim        — no successful fetch in 24h
+# A var is exported only when its class has glyphs, otherwise unset — starship's
+# env_var module renders a set-but-empty var as a bare prefix, so the
+# unset discipline matters. `$(<file)` is zsh's no-fork file read; the split is
+# pure parameter expansion (`${s//[^~]/}` keeps only that class's glyphs).
+_chezmoi_drift_export() {
+  local s="" result="$HOME/.cache/chezmoi-drift/state"
+  [[ -s "$result" ]] && s="$(<"$result")"
+  local live="${s//[^~]/}" unc="${s//[^*]/}" sync="${s//[^⇡⇣]/}" stale="${s//[^?]/}"
+  if [[ -n "$live"  ]]; then export STARSHIP_CHEZMOI_DRIFT_LIVE="$live";        else unset STARSHIP_CHEZMOI_DRIFT_LIVE;        fi
+  if [[ -n "$unc"   ]]; then export STARSHIP_CHEZMOI_DRIFT_UNCOMMITTED="$unc";  else unset STARSHIP_CHEZMOI_DRIFT_UNCOMMITTED; fi
+  if [[ -n "$sync"  ]]; then export STARSHIP_CHEZMOI_DRIFT_SYNC="$sync";        else unset STARSHIP_CHEZMOI_DRIFT_SYNC;        fi
+  if [[ -n "$stale" ]]; then export STARSHIP_CHEZMOI_DRIFT_STALE="$stale";      else unset STARSHIP_CHEZMOI_DRIFT_STALE;      fi
+}
+_chezmoi_drift_unset() {
+  unset STARSHIP_CHEZMOI_DRIFT_LIVE STARSHIP_CHEZMOI_DRIFT_UNCOMMITTED \
+        STARSHIP_CHEZMOI_DRIFT_SYNC STARSHIP_CHEZMOI_DRIFT_STALE
+}
+
 _chezmoi_drift_check() {
   local cache="$HOME/.cache/chezmoi-drift"
   local result="$cache/state"
@@ -319,15 +343,10 @@ _chezmoi_drift_check() {
                           # holder is never misjudged dead and double-verified.
   # If chezmoi vanished mid-session (uninstalled / dropped from PATH), clear a
   # previously-exported indicator instead of leaving stale glyphs on the prompt.
-  (( ${+commands[chezmoi]} )) || { unset STARSHIP_CHEZMOI_DRIFT; return 0; }
-  # Expose current cache content to starship via env var, every prompt.
-  # `$(<file)` is zsh's no-fork file read. Empty/missing file → unset →
-  # [env_var.STARSHIP_CHEZMOI_DRIFT] in starship.toml renders nothing.
-  if [[ -s "$result" ]]; then
-    export STARSHIP_CHEZMOI_DRIFT="$(<"$result")"
-  else
-    unset STARSHIP_CHEZMOI_DRIFT
-  fi
+  (( ${+commands[chezmoi]} )) || { _chezmoi_drift_unset; return 0; }
+  # Expose current cache content to starship, every prompt (see
+  # _chezmoi_drift_export above — one env var per glyph class).
+  _chezmoi_drift_export
   # Throttle via separate marker file (not $result) so claiming the window
   # doesn't blank the indicator. $result stays at the last known glyphs
   # until the bg job atomically replaces it via mv-rename.
@@ -570,7 +589,7 @@ _chezmoi_drift_check() {
 # sitting idle at the prompt, redraws it via `zle reset-prompt` — so the
 # indicator updates the instant the ~3s verify finishes, with no keypress.
 # starship's PROMPT is a live `$(starship prompt)` command substitution
-# (prompt_subst), so reset-prompt re-reads STARSHIP_CHEZMOI_DRIFT fresh.
+# (prompt_subst), so reset-prompt re-reads the STARSHIP_CHEZMOI_DRIFT_* vars fresh.
 # While a command is running (not at the prompt) we only refresh the env var;
 # the next prompt renders it. The _CHEZMOI_AT_PROMPT flag (set by a precmd that
 # runs last, cleared by preexec) gates reset-prompt, and a bare `zle` test
@@ -581,12 +600,7 @@ _chezmoi_drift_check() {
 # falsy `&&` as the last statement would silently kill the user's loop.
 typeset -g _CHEZMOI_AT_PROMPT=0
 TRAPUSR1() {
-  local result="$HOME/.cache/chezmoi-drift/state"
-  if [[ -s "$result" ]]; then
-    export STARSHIP_CHEZMOI_DRIFT="$(<"$result")"
-  else
-    unset STARSHIP_CHEZMOI_DRIFT
-  fi
+  _chezmoi_drift_export
   if (( _CHEZMOI_AT_PROMPT )) && zle 2>/dev/null; then
     zle reset-prompt 2>/dev/null
   fi
