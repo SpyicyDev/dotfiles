@@ -84,14 +84,23 @@ bindkey '^[[Z' complete-word            # shift + tab  | autosuggest
 
 # ─── Lazy loaders for heavy tools ─────────────────────────────────────────
 
-# nvm (brew-installed)
-export NVM_DIR="$HOME/.nvm"
-_load_nvm() {
-  unset -f nvm 2>/dev/null
-  [[ -s "{{ .homebrew_prefix }}/opt/nvm/nvm.sh" ]] && source "{{ .homebrew_prefix }}/opt/nvm/nvm.sh"
-  [[ -s "{{ .homebrew_prefix }}/opt/nvm/etc/bash_completion.d/nvm" ]] && source "{{ .homebrew_prefix }}/opt/nvm/etc/bash_completion.d/nvm"
-}
-nvm() { _load_nvm; nvm "$@"; }
+# fnm — Fast Node Manager (brew-installed; replaced nvm on 2026-08-26).
+# `fnm env` costs a few ms, so it's eager rather than lazy. The default is
+# `system` (brew's node stays on PATH) until a directory (or ancestor)
+# carries a .nvmrc / .node-version / package.json "engines" — then the
+# chpwd hook switches automatically. Versions: `fnm ls`, `fnm install 24`.
+if (( $+commands[fnm] )); then
+  # --log-level quiet: `fnm env` otherwise prints "Bypassing fnm: using
+  # system node" on every shell start (even at `error`). Restore info
+  # afterwards so the cd hook still announces "Using Node vX".
+  eval "$(fnm --log-level quiet env --use-on-cd --version-file-strategy=recursive --resolve-engines --shell zsh)"
+  export FNM_LOGLEVEL=info
+  # fnm swaps a symlink rather than PATH, so zsh's command hash keeps
+  # pointing `node` at the previously resolved binary. Override the hook
+  # fnm registered (by name) to rehash after each switch.
+  _fnm_autoload_hook() { fnm use --silent-if-unchanged; rehash; }
+fi
+nvm() { print -u2 "nvm was replaced by fnm — try: fnm ${*:-ls}"; return 1; }
 
 # pyenv shell function + completion (lazy: fires on first `pyenv` call).
 # Shims are already on PATH from .zprofile's cached `pyenv init --path`, so
