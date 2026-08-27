@@ -6,6 +6,8 @@
 # AI backend: claude CLI (haiku) first; falls back to codex CLI if claude fails.
 # Does NOT run `chezmoi re-add` — it only commits what's already changed in the
 # chezmoi source repo (edit via `chezmoi edit` or directly, then run this).
+# Before any diff is sent to a model the pending changes are scanned with
+# gitleaks (same scan as the repo's pre-commit hook); a hit aborts the run.
 #
 # Usage:
 #   chezmoi-commit            # group, commit, and push
@@ -16,6 +18,17 @@
 #   CHEZMOI_COMMIT_CLAUDE_MODEL  (default: haiku)
 #   CHEZMOI_COMMIT_CODEX_MODEL   (default: gpt-5.4-mini, run at low reasoning
 #                                 effort to keep the fallback fast/cheap)
+#
+# Requires: chezmoi, jq, gitleaks, and claude or codex.
+#
+# Exit status:
+#   0  every group committed (and pushed unless --no-push), or nothing to do
+#   1  a hard failure (missing tool, gitleaks hit, model/validation failure —
+#      nothing committed), OR the pre-commit hook rejected at least one group:
+#      the other groups ARE committed and pushed, the rejected files are left
+#      unstaged, and the summary names them. Don't treat `cmc && …` as "the
+#      tree is clean" — check `git status`.
+#   2  unknown argument
 
 set -euo pipefail
 
@@ -25,7 +38,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --no-push) PUSH=0 ;;
-    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -48,24 +61,54 @@ if [ -z "$(git status --porcelain)" ]; then
 fi
 
 # The authoritative set of changed paths (tracked modifications + untracked),
-# NUL-safe. We only ever commit files that appear here.
-mapfile -d '' -t CHANGED < <(git status -z --porcelain | \
+# NUL-safe. We only ever commit files that appear here. `-uall` expands a new
+# directory into its individual files so CHANGED matches what the model is
+# shown via `git ls-files --others` (otherwise a group naming those files is
+# dropped as "hallucinated" and the dir falls into the catch-all commit).
+# A staged rename is emitted by `-z` as "R  <new>\0<orig>\0": keep BOTH halves
+# so the deletion of <orig> is committed with the rename, and remember the
+# pair so it stays in one commit (RENAME_PAIRS: "<new>\t<orig>" per line).
+RENAME_PAIRS=""
+mapfile -d '' -t CHANGED < <(git status -z --porcelain -uall | \
   while IFS= read -r -d '' entry; do
-    # entry looks like "XY path"; rename entries ("R  old -> new") need the new path.
     path="${entry:3}"
-    case "${entry:0:2}" in
-      R*|C*) read -r -d '' next || true; path="${path##* -> }" ;;
-    esac
     printf '%s\0' "$path"
+    case "${entry:0:2}" in
+      R*|C*) read -r -d '' orig || true; printf '%s\0' "$orig" ;;
+    esac
   done)
+RENAME_PAIRS="$(git status -z --porcelain -uall | \
+  while IFS= read -r -d '' entry; do
+    case "${entry:0:2}" in
+      R*|C*) read -r -d '' orig || true; printf '%s\t%s\n' "${entry:3}" "$orig" ;;
+    esac
+  done)"
 
 [ "${#CHANGED[@]}" -gt 0 ] || die "no changed files resolved"
+
+# --- Secret scan BEFORE anything leaves the machine ----------------------------
+# The repo's pre-commit hook runs `gitleaks protect --staged`, but that only
+# fires at commit time — after the diff below has already been shipped to the
+# model. Run the same staged scan first, against a throwaway copy of the index
+# so the real index (and whatever the user has staged) is never touched.
+command -v gitleaks >/dev/null || die "gitleaks not found (needed to scan changes before they are sent to the model)"
+TMP_INDEX="$(mktemp)"
+REAL_INDEX="$(git rev-parse --git-path index)"
+[ -f "$REAL_INDEX" ] && cp "$REAL_INDEX" "$TMP_INDEX"
+# `-A .` rather than the CHANGED list: a rename's old path exists in neither
+# the worktree nor the index copy, so a pathspec for it would fail.
+GIT_INDEX_FILE="$TMP_INDEX" git add -A -- . || { rm -f "$TMP_INDEX"; die "could not stage changes for the secret scan"; }
+if ! GIT_INDEX_FILE="$TMP_INDEX" gitleaks git --staged --verbose --redact --no-banner . ; then
+  rm -f "$TMP_INDEX"
+  die "gitleaks found a possible secret in the pending changes; nothing was sent to the model and nothing was committed. Fix (or .gitleaksignore) it and re-run."
+fi
+rm -f "$TMP_INDEX"
 
 # Build the context we hand to the model: porcelain status + a size-capped diff
 # (staged + unstaged) + names of untracked files so it can group them too.
 CONTEXT="$(
   printf '## git status\n'
-  git -c color.ui=never status --short
+  git -c color.ui=never status --short -uall
   printf '\n## diff (tracked changes, truncated)\n'
   git -c color.ui=never diff HEAD -- . | head -c 60000
   printf '\n## untracked files\n'
@@ -181,11 +224,16 @@ fi
 CHANGED_FILE="$(mktemp)"
 printf '%s\n' "${CHANGED[@]}" >"$CHANGED_FILE"
 
-# Keep only files that genuinely changed (drop hallucinated paths).
+# Keep only files that genuinely changed (drop hallucinated paths), and
+# replace a missing/null/blank message with a safe fallback subject so neither
+# a literal "null" nor an empty `-m ""` (which git rejects) reaches `git commit`.
 GROUPS_JSON="$(jq --rawfile changed "$CHANGED_FILE" '
   ($changed | rtrimstr("\n") | split("\n")) as $valid
   | {groups: [ .groups[]
       | .files |= map(select(. as $f | $valid | index($f)))
+      | .message = ((.message? | select(type == "string"
+            and ascii_downcase != "null"
+            and gsub("\\s"; "") != "")) // "chore: update dotfiles")
       | select(.files | length > 0) ]}
 ' <<<"$GROUPS_JSON")" || die "failed to validate grouping JSON"
 
@@ -200,6 +248,19 @@ if [ -n "$MISSING" ]; then
     --slurpfile m <(printf '%s\n' "$MISSING" | jq -R . | jq -s .) \
     '.groups += [{message: $msg, files: $m[0]}]' <<<"$GROUPS_JSON")"
   NGROUPS=$((NGROUPS + 1))
+fi
+
+# Keep each rename's two halves together: the old path always rides in the
+# group that holds the new path (wherever the model or the sweep put it).
+if [ -n "$RENAME_PAIRS" ]; then
+  PAIRS_JSON="$(printf '%s\n' "$RENAME_PAIRS" | jq -R 'split("\t")' | jq -s .)"
+  GROUPS_JSON="$(jq --argjson pairs "$PAIRS_JSON" '
+    reduce $pairs[] as [$new, $orig] (.;
+      .groups |= (map(.files -= [$orig])
+        | map(if (.files | index($new)) != null then .files += [$orig] else . end)))
+    | .groups |= map(select(.files | length > 0))
+  ' <<<"$GROUPS_JSON")" || die "failed to pair renamed files"
+  NGROUPS="$(jq '.groups | length' <<<"$GROUPS_JSON")"
 fi
 
 # --- Show the plan ------------------------------------------------------------
@@ -220,6 +281,7 @@ fi
 git reset -q
 
 COMMITS=0
+FAILED=()
 while IFS= read -r grp; do
   msg="$(jq -r '.message' <<<"$grp")"
   mapfile -t files < <(jq -r '.files[]' <<<"$grp")
@@ -228,10 +290,22 @@ while IFS= read -r grp; do
   if git diff --cached --quiet; then
     continue  # nothing actually staged for this group
   fi
-  git commit -q -m "$msg"
+  # A pre-commit rejection (e.g. gitleaks) must not abort the whole run under
+  # set -e: unstage this group, remember it, and carry on with the rest.
+  if ! git commit -q -m "$msg"; then
+    git reset -q -- "${files[@]}"
+    echo "✗ $msg (rejected by pre-commit; left uncommitted)" >&2
+    FAILED+=("$msg")
+    continue
+  fi
   echo "✓ $msg"
   COMMITS=$((COMMITS + 1))
 done < <(jq -c '.groups[]' <<<"$GROUPS_JSON")
+
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  echo "Committed $COMMITS of $NGROUPS group(s); ${#FAILED[@]} rejected by pre-commit:" >&2
+  printf '  - %s\n' "${FAILED[@]}" >&2
+fi
 
 [ "$COMMITS" -gt 0 ] || die "nothing was committed"
 
@@ -244,3 +318,6 @@ if [ "$PUSH" -eq 1 ]; then
 else
   echo "Committed $COMMITS group(s); skipped push (--no-push)."
 fi
+
+# Rejected groups are still pending in the worktree; make that an error exit.
+[ "${#FAILED[@]}" -eq 0 ] || exit 1
