@@ -21,12 +21,17 @@ When you need to change a managed dotfile:
 
 - **Never** edit a chezmoi-managed live file directly via `Edit`/`Write`/
   `apply_patch`/`multiedit`, or via shell redirection / `tee` / `sed -i` /
-  `cp` / `mv` in `bash`. Use the chezmoi flow above. The `chezmoi-guard`
-  plugin will block these attempts; treat the block as a guidepost, not an
-  obstacle to circumvent.
+  `perl -i` / `cp` / `mv` in `bash`. Use the chezmoi flow above. The
+  `chezmoi-guard` plugin will block these attempts; treat the block as a
+  guidepost, not an obstacle to circumvent. Read-only inspection of managed
+  files (`cat`, `grep`, `sed -n`, `awk '{print}'`, `perl -ne`) is allowed.
 - **Never** use destructive or history-rewriting git operations in the chezmoi
-  repo without explicit user approval: no `git reset`, `git rebase`,
-  `git merge`, `git push --force`, `git push --force-with-lease`, or `git push -f`.
+  repo without explicit user approval. Only `git add`, `git commit` (no
+  `--amend`), non-force `git push`, and read-only git (`status`, `diff`, `log`,
+  `stash list`/`show`) are permitted there. Other agents routinely have
+  uncommitted work in the same tree, so `git restore`, `git checkout -- <path>`,
+  `git checkout .`, `git clean -f/-d/-x`, and `git stash` destroy or hide work
+  that is not yours.
 - **Never** stage unrelated changes. Review the diff first and stage only the
   files that belong to the current task.
 
@@ -50,10 +55,18 @@ merge unless the user explicitly asks for that specific operation.
 The guard catches destructive/history-rewriting git intent across all of these
 vectors:
 
-- `git -C <chezmoi-src> reset/rebase/merge/push --force`
-- `git --git-dir=<chezmoi-src>/.git reset ...` and `--work-tree=<chezmoi-src>`
-- `chezmoi git -- reset/rebase/merge/push --force`
-- `cd <chezmoi-src> && git reset` (and subshell `(...)` / `pushd` variants)
+- `git -C <chezmoi-src> <hazard>` where hazard is any of: `reset`, `rebase`,
+  `merge`, `restore`, `checkout -- <path>` / `checkout <path>` / `checkout .` /
+  `checkout <treeish> -- <path>` / `checkout <treeish> .` / `checkout -f` /
+  `checkout -p` (plain branch switching `checkout main` / `-b x` / `HEAD~1` is
+  allowed), `switch -f` / `--force` / `--discard-changes` (bare `switch <branch>`
+  / `switch -c x` is allowed), `clean -f/-d/-x`
+  (`clean -n` / `--dry-run` / `-nd` is allowed), `stash` push/pop/drop/apply/clear (`stash list` and
+  `stash show` are allowed), `commit --amend`, and force pushes
+  (`--force`, `--force-with-lease`, `-f`, `--mirror`, `+ref`)
+- `git --git-dir=<chezmoi-src>/.git <hazard>` and `--work-tree=<chezmoi-src>`
+- `chezmoi git -- <hazard>`
+- `cd <chezmoi-src> && git <hazard>` (and subshell `(...)` / `pushd` variants)
 - **Bash-tool `workdir` parameter set to chezmoi-src** + a git write-verb in
   the command (e.g. `bash(workdir="~/.local/share/chezmoi", command="git reset")`).
   This bypass would otherwise sneak past every detector that scans the
@@ -61,21 +74,26 @@ vectors:
   the command shell.
 
 The guard also tracks chezmoi source files written by the current opencode
-session. If those same session-touched paths are still dirty when the session
-becomes idle at turn end, it
-submits a synthetic follow-up prompt so the agent continues and applies,
-inspects, stages, commits, and pushes before it actually stops, and it shows a
-toast so the user can see why the agent resumed. The synthetic prompt also
-instructs the agent to re-print any final summary or user-facing text it had
-already output before the guard fired. Before a later model turn, it also
-injects a reminder with the same instruction. This check is path-scoped to
-files written in the current session so simultaneous agents do not complain
-about unrelated chezmoi changes they did not make. Agents should ignore
-chezmoi dirty paths that appear unrelated to their own work; those are very
-likely from another concurrent agent.
+session. If those same session-touched paths are still dirty (uncommitted or
+unpushed) when the ROOT session becomes idle at turn end, it submits a
+synthetic follow-up prompt so the agent continues and applies, inspects,
+stages, commits, and pushes before it actually stops, and it shows a toast so
+the user can see why the agent resumed. The synthetic prompt also instructs
+the agent to re-print any final summary or user-facing text it had already
+output before the guard fired. Before a later model turn, it also injects a
+reminder with the same instruction. Writes made by a subagent are attributed
+to its root session (the continuation is never driven into a subagent). The
+continuation fires at most 3 times per session, at most once per 2 minutes;
+after that the session is allowed to stop and only the reminder remains. This
+check is path-scoped to files written in the current session so simultaneous
+agents do not complain about unrelated chezmoi changes they did not make.
+Agents should ignore chezmoi dirty paths that appear unrelated to their own
+work; those are very likely from another concurrent agent.
 
 Debug logs for this behavior are written to
-`~/.local/share/opencode/chezmoi-guard.log`.
+`~/.local/share/opencode/chezmoi-guard.log` (denies, continuations, managed-set
+refreshes and errors; rotated to `.1` at 1 MB; set `CHEZMOI_GUARD_DEBUG=1` in
+opencode's environment for per-tool-call trace lines).
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph

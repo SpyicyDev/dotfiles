@@ -5,11 +5,12 @@
 // call, branching on hook_event_name:
 //
 //   PreToolUse        - HARD-BLOCK edits (Edit/Write/MultiEdit/NotebookEdit) to
-//                       chezmoi-managed paths, Bash writes to managed live files,
+//                       chezmoi-managed paths, shell writes to managed live files,
 //                       and destructive/history-rewriting git ops on the chezmoi
 //                       source repo. Emits a permissionDecision:deny JSON.
 //   PostToolUse       - remember source-repo writes this session made; recompute
 //                       the dirty set (git status self-heals). Pure bookkeeping.
+//                       Also the home of the managed-set TTL refresh (see below).
 //   UserPromptSubmit  - inject the "uncommitted/unpushed chezmoi changes" complaint as
 //                       additionalContext (per-turn analog of system.transform).
 //   Stop              - if session-touched chezmoi paths are still uncommitted/unpushed, block
@@ -26,10 +27,18 @@
 // subagent cannot meaningfully commit/push mid-parent-task). The parent Stop,
 // sharing session state, is the backstop and sees all subagent-made dirty paths.
 //
-// This guard is best-effort, NAME-BASED interception of the five built-in write
-// tools (Edit/Write/MultiEdit/NotebookEdit) + Bash. It is NOT a sandbox: a
-// future write-capable MCP server or new CC built-in tool that bypasses these
-// tool names would not be intercepted.
+// This guard is best-effort, NAME-BASED interception of the four built-in edit
+// tools (Edit/Write/MultiEdit/NotebookEdit) + the shell tools (built-in Bash
+// and the MCP pty shell: mcp__pty__run / mcp__pty__spawn_pty, which is what
+// agents on this machine actually use — Bash is deny-listed). It is NOT a
+// sandbox: a future write-capable MCP server or new CC built-in tool that
+// bypasses these tool names would not be intercepted.
+//
+// LIMITATION (pty shell): mcp__pty__run has no per-call cwd — the persistent
+// pty shell's cwd is unknown to the hook. Relative paths are resolved against
+// the hook's top-level `cwd` (the Claude session cwd), exactly as for Bash, so
+// a relative write issued after a `cd` inside the pty may be misattributed.
+// Absolute / ~-prefixed paths and `cd <dir> && ...` chains are unaffected.
 //
 // Uses only node:child_process / node:fs / node:path, so the command may be
 // swapped from bun to node without code changes.
@@ -70,6 +79,17 @@ const SESSIONS_DIR = STATE_DIR + "/sessions"
 const MANAGED_FILE = STATE_DIR + "/managed.json"
 const MANAGED_REFRESH_LOCK = STATE_DIR + "/managed.refresh.lock"
 const LOG_FILE = STATE_DIR + "/chezmoi-guard.log"
+const LOG_ROTATE_BYTES = 1_000_000 // single rotation to chezmoi-guard.log.1
+// Per-tool-call bookkeeping lines (pretool/posttool/userpromptsubmit) are
+// only written when CHEZMOI_GUARD_DEBUG=1; deny/continuation/refresh/error
+// lines are always written.
+const VERBOSE = process.env.CHEZMOI_GUARD_DEBUG === "1"
+
+// Shell-family tool names whose tool_input.command is a shell command line.
+const SHELL_TOOL_RE = /^(Bash|mcp__pty__run|mcp__pty__spawn_pty)$/
+function isShellTool(name: unknown): boolean {
+  return typeof name === "string" && SHELL_TOOL_RE.test(name)
+}
 
 // Subprocess env. `which chezmoi` is a shell FUNCTION wrapper, absent in a
 // non-interactive subprocess; we must call the real binary. Hardcode the
@@ -224,6 +244,7 @@ function refreshManaged(prev: ManagedCache): ManagedCache {
       .map(normalizePath)
     const next: ManagedCache = { loadedAt: Date.now(), everLoaded: true, paths }
     writeManagedCache(next)
+    debugLog("managed set refreshed", { count: paths.length, previous: prev.paths.length })
     return next
   } catch (e) {
     if (CHEZMOI_BIN === "chezmoi") {
@@ -255,6 +276,8 @@ function refreshManaged(prev: ManagedCache): ManagedCache {
 //   chezmoi if everLoaded===false (genuine cold start). Never block the hot path
 //   on a steady-state refresh.
 //   coldSpawnOnly=false (PostToolUse/UserPromptSubmit/Stop): full TTL refresh.
+//   The block decision always serves the cache as-is; the TTL refresh runs from
+//   the non-blocking events (`refreshManagedIfStale`), at most once per TTL_MS.
 function loadManaged(opts?: { coldSpawnOnly?: boolean }): string[] {
   const coldSpawnOnly = opts?.coldSpawnOnly === true
   const cache = readManagedCache()
@@ -270,6 +293,18 @@ function loadManaged(opts?: { coldSpawnOnly?: boolean }): string[] {
   const ttl = cache.everLoaded ? TTL_MS : COLD_TTL_MS
   if (Date.now() - cache.loadedAt < ttl) return cache.paths
   return refreshManaged(cache).paths
+}
+
+// Off-hot-path TTL refresh. Called from PostToolUse / UserPromptSubmit / Stop:
+// a cheap read of managed.json when fresh, one `chezmoi managed` spawn when the
+// 300s TTL has lapsed. Never throws (a refresh failure must not affect the
+// bookkeeping that follows).
+function refreshManagedIfStale(): void {
+  try {
+    loadManaged()
+  } catch (e) {
+    debugLog("managed refresh error", { error: String(e) })
+  }
 }
 
 // EXACT match for patch/edit-class blocks (mirrors source `managed.has(p)`).
@@ -627,18 +662,19 @@ function managedPathError(p: string): string {
     `  2. Inspect git status/diff/log, stage only intended files, commit, and\n` +
     `     push automatically.\n` +
     `\n` +
-    `Do not use reset/rebase/merge or force-push; this guard blocks those\n` +
-    `operations. Use normal git outside this guard only after explicit\n` +
-    `manual handling if needed.`
+    `In the chezmoi source repo only add, commit, and non-force push are\n` +
+    `permitted (plus read-only status/diff/log). Anything that discards or\n` +
+    `rewrites work there is blocked by this guard.`
   )
 }
 
 const GIT_HAZARD_MESSAGE =
-  `[chezmoi-guard] bash command appears to run a destructive or\n` +
+  `[chezmoi-guard] shell command appears to run a destructive or\n` +
   `history-rewriting git operation in the chezmoi source repo.\n` +
   `\n` +
-  `Normal commit and non-force push are allowed. Do not reset,\n` +
-  `rebase, merge, or force-push; this guard blocks those actions.`
+  `Only add, commit, and non-force push are permitted there (plus\n` +
+  `read-only status/diff/log/stash list). Other agents may have\n` +
+  `uncommitted work in the same tree: leave it alone.`
 
 // ---------------------------------------------------------------------------
 // Bash write-intent + path extraction (verbatim from source)
@@ -656,6 +692,20 @@ function expandHomeVars(cmd: string): string {
 
 const PATH_TOKEN_RE = /(?:^|[\s|;&()<>=])(['"]?)([~/][^\s|;&()<>'"`]*)\1/g
 
+// In-place editor forms: `sed -i`/`--in-place`, `perl -i` (incl. clustered
+// `-pi`/`-pi.bak`), `ruby -i`, `awk -i inplace`.
+// The intermediate-token class is OPTION tokens only (`-\S*`), so the scan
+// cannot cross an operand or a pipe into a later `grep -i` and mistake it for
+// the editor's own flag (`sed -n 1p f | grep -i foo` is a read).
+const IN_PLACE_PATTERNS: RegExp[] = [
+  /(?:^|[\s|;&({`])sed\s+(?:-\S*\s+)*?(?:-[a-zA-Z]*[iI]|--in-place)/,
+  // The `i` must END the flag cluster (optionally followed by perl's attached
+  // backup suffix, `-i.bak` / `-pi.bak`), so `-Mstrict`, `-Ilib`, `-ne` are not
+  // mistaken for in-place edits.
+  /(?:^|[\s|;&({`])(?:perl|ruby)\s+(?:-\S+\s+)*-[a-zA-Z]*i(?:\.\S*)?(?=$|\s)/,
+  /(?:^|[\s|;&({`])awk\s+(?:-\S*\s+)*?-i\s+inplace/,
+]
+
 const WRITE_PATTERNS: RegExp[] = [
   /(?:[0-9]?&?>>?[\|!]?|&>[\|!]?)\s*['"]?[~/$]/,
   /(?:^|[\s|;&({`])tee\b/,
@@ -664,9 +714,7 @@ const WRITE_PATTERNS: RegExp[] = [
   /(?:^|[\s|;&({`])ln\b/,
   /(?:^|[\s|;&({`])install\b/,
   /(?:^|[\s|;&({`])rsync\b/,
-  /(?:^|[\s|;&({`])sed\s+(?:[^\s]+\s+)*?-[a-zA-Z]*[iI]/,
-  /(?:^|[\s|;&({`])(?:perl|ruby)\s+(?:-[a-zA-Z]*\s+)*-i/,
-  /(?:^|[\s|;&({`])awk\s+(?:[^\s]+\s+)*-i\s+inplace/,
+  ...IN_PLACE_PATTERNS,
   /(?:^|[\s|;&({`])truncate\b/,
   /(?:^|[\s|;&({`])(?:rm|unlink)\b/,
   /(?:^|[\s|;&({`])dd\s+[^|;&]*\bof=/,
@@ -674,6 +722,13 @@ const WRITE_PATTERNS: RegExp[] = [
 
 function bashHasWriteIntent(cmd: string): boolean {
   for (const re of WRITE_PATTERNS) if (re.test(cmd)) return true
+  return false
+}
+
+// A sed/perl/ruby/awk invocation is a WRITE only when it carries an in-place
+// flag; bare `sed -n`, `awk '{print}' file`, `perl -ne` are reads.
+function bashHasInPlaceEdit(cmd: string): boolean {
+  for (const re of IN_PLACE_PATTERNS) if (re.test(cmd)) return true
   return false
 }
 
@@ -690,7 +745,10 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
   const expanded = expandHomeVars(cmd)
   const out: string[] = []
   const push = (p?: string) => {
-    if (p) out.push(p.replace(/^['"]|['"]$/g, ""))
+    // An empty operand (e.g. BSD `sed -i ''`) must not become a target: it
+    // would normalize to the cwd and, from $HOME, match every managed file.
+    const stripped = p?.replace(/^['"]|['"]$/g, "")
+    if (stripped) out.push(stripped)
   }
 
   const redirectRe = /(?:^|[\s|;&({`])(?:[0-9]*&?>>?|&>>?)(?:\|?|!)?\s*([^\s|;&()<>`]+|['"][^'"]+['"])/g
@@ -708,7 +766,17 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
     else if (kind === "truncate") push(parts.at(-1))
     else if (kind === "install" || kind === "rsync" || kind === "ln") push(parts.at(-1))
     else if (kind === "sed" || kind === "perl" || kind === "ruby" || kind === "awk") {
+      // Stream editors mutate their operands ONLY in in-place mode. A plain
+      // read (`sed -n 1p file`) contributes no targets; a `>` redirect on the
+      // same segment is still picked up by redirectRe above.
+      if (!bashHasInPlaceEdit(m[0])) continue
       for (const p of parts) push(p)
+      // In-place mode edits EVERY file operand, so also take every absolute /
+      // ~ path token of the segment: the operand list above is cut short by a
+      // `(` inside the script (`ruby -pi -e 'gsub(/a/,"b")' ~/.zshrc`). Only
+      // tokens AFTER the editor, so an upstream `sed -n 1p ~/.zshrc |` is not
+      // blamed.
+      for (const p of pathsFromBashCommand(expanded.slice(m.index))) push(p)
     } else for (const p of parts) push(p)
   }
 
@@ -730,12 +798,56 @@ function splitBashSegments(cmd: string): string[] {
 // ---------------------------------------------------------------------------
 
 const GIT_PREFIX = String.raw`(?:^|[\s|;&(])git\s+(?:(?:-[cC]\s*\S+|-c\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+|--(?:no-pager|paginate|bare))\s+)*`
-const GIT_HAZARD_RE = new RegExp(
-  `${GIT_PREFIX}(?:(?:reset|rebase|merge)(?=$|[\\s|;&)])|push\\b[^|;&]*(?:\\s['"]?\\+\\S+['"]?|\\s(?:--force(?:-with-lease)?|-\\w*f\\w*|--mirror\\b)))`,
-)
+// Hazard verbs (after GIT_PREFIX). Blocked in the chezmoi source repo:
+//   reset / rebase / merge / restore        (any form)
+//   clean -f / -d / -x / --force            (a dry run — `-n`/`--dry-run`
+//                                            anywhere, incl. `-nd` — is allowed)
+//   stash  push/pop/drop/clear/apply/...    (`stash list` / `stash show` allowed)
+//   switch -f / --force / --discard-changes (bare `switch <branch>` / `-c` allowed)
+//   commit --amend
+//   push --force / +ref / --mirror
+// `checkout` file-restore forms are handled by gitCheckoutRestoresFiles below.
+const GIT_HAZARD_VERBS =
+  String.raw`(?:reset|rebase|merge|restore)(?=$|[\s|;&)])` +
+  String.raw`|clean\b(?![^|;&]*(?:--dry-run|\s-[a-zA-Z]*n))[^|;&]*\s(?:-[a-zA-Z]*[fdx][a-zA-Z]*|--force)(?=$|[\s|;&)])` +
+  // Anchored to the stash SUBCOMMAND so a message like `-m 'list of things'`
+  // cannot leak into the allowlist.
+  String.raw`|stash(?=$|[\s|;&)])(?!\s+(?:list|show)\b)` +
+  String.raw`|switch\b[^|;&]*\s(?:-f\b|--force\b|--discard-changes\b)` +
+  String.raw`|commit\b[^|;&]*\s--amend\b` +
+  String.raw`|push\b[^|;&]*(?:\s['"]?\+\S+['"]?|\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b))`
+const GIT_HAZARD_RE = new RegExp(`${GIT_PREFIX}(?:${GIT_HAZARD_VERBS})`)
+const GIT_CHECKOUT_RE = new RegExp(`${GIT_PREFIX}checkout\\b([^|;&]*)`, "g")
+
+// `git checkout` discards working-tree changes when given paths (`-- <path>`,
+// `.`, `-f`, or a bare operand that looks like a path). A plain branch switch
+// (`checkout main`, `checkout -b name`, `checkout HEAD~1`) stays allowed. When
+// in doubt (operand contains `/` or `.`) we treat it as a path: conservative.
+function gitCheckoutRestoresFiles(cmd: string): boolean {
+  let m: RegExpExecArray | null
+  GIT_CHECKOUT_RE.lastIndex = 0
+  while ((m = GIT_CHECKOUT_RE.exec(cmd)) !== null) {
+    const toks = m[1].trim().split(/\s+/).filter(Boolean)
+    let skipNext = false
+    for (const t of toks) {
+      if (skipNext) {
+        skipNext = false
+        continue
+      }
+      if (t === "--" || t === "-f" || t === "--force" || t === "-p" || t === "--patch") return true
+      if (t === "-b" || t === "-B" || t === "--orphan" || t === "-t" || t === "--track") {
+        skipNext = true
+        continue
+      }
+      if (t.startsWith("-")) continue
+      if (t === "." || t.startsWith("./") || t.startsWith("~") || t.includes("/") || /\.\w+$/.test(t)) return true
+    }
+  }
+  return false
+}
 
 function gitHasHazard(cmd: string): boolean {
-  return GIT_HAZARD_RE.test(cmd)
+  return GIT_HAZARD_RE.test(cmd) || gitCheckoutRestoresFiles(cmd)
 }
 
 function resolveAgainstWorkdir(raw: string, workdir?: string): string {
@@ -745,12 +857,12 @@ function resolveAgainstWorkdir(raw: string, workdir?: string): string {
 
 function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   const expanded = expandHomeVars(cmd)
-  if (
-    /(?:^|[\s|;&(])chezmoi\s+git\b\s+(?:--\s+)?(?:(?:reset|rebase|merge)(?=$|[\s|;&)])|push\b[^|;&]*(?:\s['"]?\+\S+['"]?|\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b)))/.test(
-      expanded,
-    )
-  ) {
-    return true
+  // `chezmoi git [--] <verb ...>` always runs in the source repo: re-test the
+  // tail with the same hazard set as a bare `git` (no duplicated alternation).
+  const chezmoiGitRe = /(?:^|[\s|;&(])chezmoi\s+git\b\s+(?:--\s+)?/g
+  let cm: RegExpExecArray | null
+  while ((cm = chezmoiGitRe.exec(expanded)) !== null) {
+    if (gitHasHazard("git " + expanded.slice(cm.index + cm[0].length))) return true
   }
   // Pattern A1: explicit `git -C <chezmoi-src>` + write-class git verb.
   const gitDashCRe = /(?:^|[\s|;&(])git\s+(?:(?:-[cC]\s*\S+|-c\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+|--(?:no-pager|paginate|bare))\s+)*-C\s*(['"]?)([^\s'"|;&]+)\1/g
@@ -877,7 +989,7 @@ function allow(): never {
 function handlePreToolUse(input: any): void {
   const ti = input.tool_input ?? {}
   const name = input.tool_name
-  debugLog("pretool", { session_id: input.session_id, name })
+  if (VERBOSE) debugLog("pretool", { session_id: input.session_id, name })
 
   // STEP A: edit-class tools (Edit/Write/MultiEdit/NotebookEdit). EXACT managed
   // match (mirrors the opencode BLOCKED_TOOLS path — NOT prefix; prefix on
@@ -907,7 +1019,10 @@ function handlePreToolUse(input: any): void {
     }
   }
 
-  const { cmd, workdir } = extractShell(ti)
+  // Shell branch: Bash and the MCP pty shell tools (mcp__pty__run has no
+  // per-call cwd, so relative paths resolve against the session cwd — see the
+  // LIMITATION note in the header).
+  const { cmd, workdir } = isShellTool(name) ? extractShell(ti) : { cmd: "", workdir: undefined }
   const resolvedWorkdir = workdir || input.cwd
 
   // STEP B: git-hazard against the chezmoi source repo.
@@ -944,7 +1059,11 @@ function handlePostToolUse(input: any): void {
   const ti = input.tool_input ?? {}
   const name = input.tool_name
   const sid = input.session_id
-  debugLog("posttool", { session_id: sid, name })
+  if (VERBOSE) debugLog("posttool", { session_id: sid, name })
+
+  // Managed-set TTL refresh lives here (non-blocking event): cheap when fresh,
+  // one `chezmoi managed` spawn per 300s otherwise. PreToolUse never spawns.
+  refreshManagedIfStale()
 
   withSessionLock(sid, (state) => {
     // STEP remember (always; no exit_code skip — git status self-heals).
@@ -963,7 +1082,7 @@ function handlePostToolUse(input: any): void {
     }
     if (editPaths.length > 0) {
       rememberSourceWrites(state, editPaths)
-    } else {
+    } else if (isShellTool(name)) {
       const { cmd, workdir } = extractShell(ti)
       const resolvedWorkdir = workdir || input.cwd
       if (cmd) {
@@ -998,7 +1117,8 @@ function handlePostToolUse(input: any): void {
 
 function handleUserPromptSubmit(input: any): void {
   const sid = input.session_id
-  debugLog("userpromptsubmit", { session_id: sid })
+  if (VERBOSE) debugLog("userpromptsubmit", { session_id: sid })
+  refreshManagedIfStale()
   let complaint: string | undefined
   withSessionLock(sid, (state) => {
     complaint = uncommittedChezmoiComplaint(state) // calls pendingTouchedPaths -> prune + persist
@@ -1025,6 +1145,8 @@ function handleStop(input: any): void {
     debugLog("stop loop guard (stop_hook_active)", { session_id: sid })
     process.exit(0) // allow stop, empty stdout
   }
+
+  refreshManagedIfStale()
 
   let prompt: string | undefined
   let block = false
@@ -1080,6 +1202,12 @@ function opportunisticGc(): void {
     const now = Date.now()
     const tmpMaxAge = 5 * 60 * 1000 // 5 min for *.tmp orphans
     const sessionMaxAge = 7 * 24 * 60 * 60 * 1000 // 7 days for session files
+    // Log rotation: single generation, rename over any existing `.1`.
+    try {
+      if (statSync(LOG_FILE).size > LOG_ROTATE_BYTES) renameSync(LOG_FILE, LOG_FILE + ".1")
+    } catch {
+      /* no log yet, or rename failed: ignore */
+    }
     // STATE_DIR-level *.tmp orphans
     for (const entry of readdirSync(STATE_DIR)) {
       if (!entry.endsWith(".tmp")) continue

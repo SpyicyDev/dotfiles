@@ -18,18 +18,52 @@
 //     (those are handled by Tier C drift detection in starship.toml)
 //
 // Cache: `chezmoi managed --path-style absolute` is invoked at plugin load
-// and refreshed on a 5-minute TTL. Newly-tracked files become blocked
-// within 5 minutes; force-refresh by restarting the opencode session.
+// and refreshed on a 5-minute TTL. Once loaded, a stale cache is served
+// as-is for the block decision and re-spawned in the BACKGROUND (never on
+// the tool-call critical path); newly-tracked files become blocked within
+// ~5 minutes of the next tool call. Force-refresh by restarting opencode.
+//
+// Log: ~/.local/share/opencode/chezmoi-guard.log — rotated to `.1` at 1 MB.
+// Only decisions (deny), continuations, refreshes and errors are logged;
+// set CHEZMOI_GUARD_DEBUG=1 for per-tool-call trace lines.
 
 import type { Plugin } from "@opencode-ai/plugin"
-import { execFileSync, execSync } from "node:child_process"
-import { appendFileSync, mkdirSync, realpathSync } from "node:fs"
+import { execFile, execFileSync } from "node:child_process"
+import { appendFileSync, mkdirSync, realpathSync, renameSync, statSync } from "node:fs"
 import { relative, resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
+const COLD_TTL_MS = 15_000 // cold-start retry window
+const MAX_CONTINUATIONS = 3
+const CONTINUATION_WINDOW_MS = 2 * 60 * 1000
+const LOG_ROTATE_BYTES = 1_000_000
+const TRACE = process.env.CHEZMOI_GUARD_DEBUG === "1"
 let managed = new Set<string>()
 let loaded = false
 let lastLoad = 0
+let refreshing = false
+
+// Subprocess env. opencode may be launched from a GUI/launchd context whose
+// PATH lacks /opt/homebrew/bin, and `chezmoi` is a shell FUNCTION wrapper in
+// the interactive shell — so pin the real binary (PATH lookup only as a
+// fallback, and log which one is in use) and the system git.
+const GIT_BIN = "/usr/bin/git"
+const SUBPROC_ENV = {
+  HOME: process.env.HOME ?? "",
+  PATH: "/opt/homebrew/bin:/usr/bin:/bin",
+}
+
+function isExecutable(p: string): boolean {
+  try {
+    statSync(p)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const CHEZMOI_BIN = isExecutable("/opt/homebrew/bin/chezmoi") ? "/opt/homebrew/bin/chezmoi" : "chezmoi"
+const CHEZMOI_MANAGED_ARGS = ["managed", "--include=files", "--path-style", "absolute"]
 
 // Normalize an arbitrary path string the agent passed (relative, ~-prefixed,
 // containing /./ or symlinks) into a canonical absolute path. We compare
@@ -46,6 +80,18 @@ function normalizePath(p: string): string {
   }
 }
 
+function applyManagedOutput(out: string, mode: "sync" | "async"): void {
+  managed = new Set(
+    out
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map(normalizePath),
+  )
+  loaded = true
+  debugLog("managed refreshed", { mode, size: managed.size, bin: CHEZMOI_BIN, loadedAt: new Date().toISOString() })
+}
+
 function refresh(): void {
   // TTL gating with two regimes:
   //   - Steady-state (loaded): throttle BOTH success and failure for
@@ -53,33 +99,52 @@ function refresh(): void {
   //     call. The time-only gate makes that throttle actually work — an
   //     earlier `loaded && timeElapsed` form let failures retry every
   //     call because `loaded` stays false on error.
+  //     The refresh itself is ASYNC: the current call is decided against
+  //     the stale set (never fail-open, since the stale set is a superset
+  //     of "known managed"), and the re-spawn lands before a later call.
   //   - Cold-start (not loaded): use a much shorter retry window (15s)
   //     so a chezmoi that's transiently unavailable at plugin load
   //     doesn't fail-open the entire 5min steady-state TTL. While the
   //     cache is empty, every Edit/Write tool would slip past silently
-  //     because `managed.has(p)` is always false on an empty Set.
-  const ttl = loaded ? TTL_MS : 15_000
+  //     because `managed.has(p)` is always false on an empty Set — so
+  //     this path stays SYNCHRONOUS (the only time we pay the spawn on
+  //     the critical path).
+  const ttl = loaded ? TTL_MS : COLD_TTL_MS
   if (Date.now() - lastLoad < ttl) return
+  lastLoad = Date.now()
+  if (loaded) {
+    if (refreshing) return
+    refreshing = true
+    execFile(
+      CHEZMOI_BIN,
+      CHEZMOI_MANAGED_ARGS,
+      { encoding: "utf-8", env: SUBPROC_ENV, timeout: 3000 },
+      (err, out) => {
+        refreshing = false
+        if (err) {
+          // Stale cache is better than no cache (steady-state).
+          debugLog("chezmoi managed failed", { mode: "async", bin: CHEZMOI_BIN, error: String(err), size: managed.size })
+          return
+        }
+        applyManagedOutput(out, "async")
+      },
+    )
+    return
+  }
   try {
-    const out = execSync("chezmoi managed --include=files --path-style absolute", {
+    const out = execFileSync(CHEZMOI_BIN, CHEZMOI_MANAGED_ARGS, {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "ignore"],
+      env: SUBPROC_ENV,
       timeout: 3000,
     })
-    managed = new Set(
-      out
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map(normalizePath),
-    )
-    loaded = true
-  } catch {
-    // Stale cache is better than no cache (steady-state). Cold-start
-    // failure leaves the cache empty for one short-TTL window — see
-    // the cold-start branch above for the rationale and trade-off.
+    applyManagedOutput(out, "sync")
+  } catch (err) {
+    // Cold-start failure leaves the cache EMPTY (fail-open) for one
+    // short-TTL window — say so loudly, this is the one state in which
+    // the guard silently protects nothing.
+    debugLog("chezmoi managed failed", { mode: "cold", bin: CHEZMOI_BIN, error: String(err), size: managed.size })
   }
-  lastLoad = Date.now()
 }
 
 const BLOCKED_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit"])
@@ -87,9 +152,21 @@ const BLOCKED_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit"])
 const CHEZMOI_SOURCE_DIR = normalizePath("~/.local/share/chezmoi")
 const LOG_FILE = normalizePath("~/.local/share/opencode/chezmoi-guard.log")
 
+// Single-slot rotation: once the log passes LOG_ROTATE_BYTES it is renamed
+// to `.1` (overwriting the previous `.1`) before the append. statSync is a
+// few microseconds; every failure is ignored.
+function rotateLogIfLarge(): void {
+  try {
+    if (statSync(LOG_FILE).size > LOG_ROTATE_BYTES) renameSync(LOG_FILE, LOG_FILE + ".1")
+  } catch {
+    // Missing log or rename failure: nothing to rotate.
+  }
+}
+
 function debugLog(message: string, data?: Record<string, unknown>): void {
   try {
     mkdirSync(resolve(LOG_FILE, ".."), { recursive: true })
+    rotateLogIfLarge()
     appendFileSync(
       LOG_FILE,
       `[${new Date().toISOString()}] ${message}${data ? ` ${JSON.stringify(data)}` : ""}\n`,
@@ -105,8 +182,13 @@ type SessionChezmoiState = {
   // path-scoped instead of repo-wide so simultaneous agents with unrelated
   // dotfile work do not complain about each other's uncommitted changes.
   touchedPaths: Set<string>
-  continuationPending: boolean
+  // Auto-continue bookkeeping (mirrors the Claude/Codex hooks' Stop backstop):
+  // `continuationPendingSince` is set when a continuation is submitted and is
+  // ONLY cleared by the idle handler (never by tool calls — a continuation
+  // turn always runs tools, so clearing there would defeat the window), and
+  // `continuationCount` caps the retries at MAX_CONTINUATIONS per session.
   continuationPendingSince?: number
+  continuationCount: number
 }
 
 const sessionState = new Map<string, SessionChezmoiState>()
@@ -114,10 +196,28 @@ const sessionState = new Map<string, SessionChezmoiState>()
 function stateForSession(sessionID: string): SessionChezmoiState {
   let state = sessionState.get(sessionID)
   if (!state) {
-    state = { touchedPaths: new Set(), continuationPending: false }
+    state = { touchedPaths: new Set(), continuationCount: 0 }
     sessionState.set(sessionID, state)
   }
   return state
+}
+
+// Session parentage, learned for free from `session.created`/`session.updated`
+// events (their payload is the full Session, which carries `parentID`; the
+// `session.idle` payload does NOT). Subagent sessions are children: their
+// source writes are attributed to the ROOT session, which is the one that
+// must commit and push, and the idle continuation is never driven into a
+// child (that would yank the TUI onto the subagent's session).
+const sessionParent = new Map<string, string | undefined>()
+
+function rootSessionID(sessionID: string): string {
+  let id = sessionID
+  for (let hops = 0; hops < 32; hops++) {
+    const parent = sessionParent.get(id)
+    if (!parent) return id
+    id = parent
+  }
+  return id
 }
 
 function isInChezmoiSource(p: string): boolean {
@@ -130,14 +230,30 @@ function sourceRelativePath(p: string): string {
 }
 
 function rememberSourceWrites(sessionID: string, rawPaths: string[]): void {
-  const state = stateForSession(sessionID)
+  // Attribute to the root session (see sessionParent) so a subagent's edits
+  // nag the parent that will actually finish the task.
+  const root = rootSessionID(sessionID)
+  const state = stateForSession(root)
   for (const raw of rawPaths) {
     const p = normalizePath(raw)
     if (isInChezmoiSource(p)) {
       state.touchedPaths.add(p)
-      debugLog("remembered source write", { sessionID, path: sourceRelativePath(p) })
+      debugLog("remembered source write", { sessionID: root, via: root === sessionID ? undefined : sessionID, path: sourceRelativePath(p) })
     }
   }
+}
+
+// Move a child's touchedPaths (recorded before its parentage was known) onto
+// the root session.
+function migrateTouchedPathsToRoot(sessionID: string): void {
+  const root = rootSessionID(sessionID)
+  if (root === sessionID) return
+  const child = sessionState.get(sessionID)
+  if (!child || child.touchedPaths.size === 0) return
+  const rootState = stateForSession(root)
+  for (const p of child.touchedPaths) rootState.touchedPaths.add(p)
+  debugLog("migrated child touched paths to root", { sessionID, root, count: child.touchedPaths.size })
+  child.touchedPaths.clear()
 }
 
 // unpushedRels: of the given session-touched rels, return the subset that
@@ -152,9 +268,9 @@ function unpushedRels(rels: string[]): Set<string> {
   const relsSet = new Set(rels)
   try {
     const raw = execFileSync(
-      "git",
+      GIT_BIN,
       ["-C", CHEZMOI_SOURCE_DIR, "log", "@{u}..HEAD", "--name-only", "--pretty=format:", "--", ...rels],
-      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], timeout: 3000 },
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"], env: SUBPROC_ENV, timeout: 3000 },
     )
     for (const line of raw.split("\n")) {
       const t = line.trim()
@@ -183,9 +299,10 @@ function pendingTouchedPaths(sessionID: string): { dirty: string[]; unpushed: st
 
   const dirty = new Set<string>()
   try {
-    const out = execFileSync("git", ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "--", ...rels], {
+    const out = execFileSync(GIT_BIN, ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "--", ...rels], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "ignore"],
+      env: SUBPROC_ENV,
       timeout: 3000,
     })
     for (const line of out.split("\n")) {
@@ -196,9 +313,10 @@ function pendingTouchedPaths(sessionID: string): { dirty: string[]; unpushed: st
       const renamed = raw.includes(" -> ") ? raw.split(" -> ").pop() : raw
       if (renamed) dirty.add(renamed)
     }
-  } catch {
+  } catch (err) {
     // If status fails, fail quiet rather than blame the agent for stale or
     // unverifiable state, and do NOT prune. The normal hard guards still run.
+    debugLog("git status failed", { sessionID, error: String(err) })
     return { dirty: [], unpushed: [] }
   }
 
@@ -335,16 +453,38 @@ const WRITE_PATTERNS: RegExp[] = [
   /(?:^|[\s|;&({`])ln\b/,
   /(?:^|[\s|;&({`])install\b/,
   /(?:^|[\s|;&({`])rsync\b/,
-  /(?:^|[\s|;&({`])sed\s+(?:[^\s]+\s+)*?-[a-zA-Z]*[iI]/,
-  /(?:^|[\s|;&({`])(?:perl|ruby)\s+(?:-[a-zA-Z]*\s+)*-i/,
-  /(?:^|[\s|;&({`])awk\s+(?:[^\s]+\s+)*-i\s+inplace/,
+  // In-place sed/perl/ruby/awk forms are appended below (INPLACE_PATTERNS).
   /(?:^|[\s|;&({`])truncate\b/,
   /(?:^|[\s|;&({`])(?:rm|unlink)\b/,
   /(?:^|[\s|;&({`])dd\s+[^|;&]*\bof=/,
 ]
 
+// In-place editor idioms. sed/perl/ruby/awk are READ tools unless they carry
+// an in-place flag; only then do their file operands count as write targets
+// (a bare `sed -n 1p ~/.zshrc` / `awk '{print}' file` / `perl -ne` must be
+// allowed). Flag forms: `sed -i`/`-i.bak`/`-I`/`--in-place`; `perl`/`ruby`
+// `-i`, `-i.bak` and clustered `-pi`/`-pi.bak` (the `i` must END the flag
+// cluster, optionally followed by an attached backup suffix, so
+// `-ne`/`-Mstrict`/`-Ilib` do not match); and `awk -i inplace` (gawk). An
+// explicit `>` redirect targeting the managed path is caught separately by
+// the redirect pattern above. Same three regexes as the Claude/Codex hooks.
+const INPLACE_PATTERNS: RegExp[] = [
+  // Intermediate tokens are restricted to OPTIONS (`-\S*`): a `[^\s]+` class
+  // would skip across `|` and find the `-i` of a later pipeline stage
+  // (`sed -n 1p ~/.zshrc | grep -i x`), since pipelines are one segment.
+  /(?:^|[\s|;&({`])sed\s+(?:-\S*\s+)*?(?:-[a-zA-Z]*[iI]|--in-place)/,
+  /(?:^|[\s|;&({`])(?:perl|ruby)\s+(?:-\S+\s+)*-[a-zA-Z]*i(?:\.\S*)?(?=$|\s)/,
+  /(?:^|[\s|;&({`])awk\s+(?:-\S*\s+)*?-i\s+inplace/,
+]
+WRITE_PATTERNS.push(...INPLACE_PATTERNS)
+
 function bashHasWriteIntent(cmd: string): boolean {
   for (const re of WRITE_PATTERNS) if (re.test(cmd)) return true
+  return false
+}
+
+function bashHasInPlaceEdit(cmd: string): boolean {
+  for (const re of INPLACE_PATTERNS) if (re.test(cmd)) return true
   return false
 }
 
@@ -361,7 +501,10 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
   const expanded = expandHomeVars(cmd)
   const out: string[] = []
   const push = (p?: string) => {
-    if (p) out.push(p.replace(/^['"]|['"]$/g, ""))
+    // An empty operand (e.g. BSD `sed -i ''`) must not become a target: it
+    // would normalize to the cwd and, from $HOME, match every managed file.
+    const stripped = p?.replace(/^['"]|['"]$/g, "")
+    if (stripped) out.push(stripped)
   }
 
   // Best-effort extraction for bare relative targets used by write/delete
@@ -384,10 +527,20 @@ function pathsFromBashWriteTargets(cmd: string): string[] {
     else if (kind === "truncate") push(parts.at(-1))
     else if (kind === "install" || kind === "rsync" || kind === "ln") push(parts.at(-1))
     else if (kind === "sed" || kind === "perl" || kind === "ruby" || kind === "awk") {
-      // In-place editors mutate their file operands. This is best-effort and
-      // intentionally broad after option filtering; complex scripts with
-      // additional non-file operands are acceptable false positives.
+      // Only an IN-PLACE invocation mutates its file operands; a read-only
+      // `sed -n`/`awk '{print}'`/`perl -ne` contributes no write target (so
+      // the segment falls through the write-intent gate and is allowed).
+      // When in-place, extraction is best-effort and intentionally broad
+      // after option filtering; the script/expression operand is an
+      // acceptable false positive.
+      if (!bashHasInPlaceEdit(m[0])) continue
       for (const p of parts) push(p)
+      // In-place mode edits EVERY file operand, so also take every absolute /
+      // ~ path token of the segment: the operand list above is cut short by a
+      // `(` inside the script (`ruby -pi -e 'gsub(/a/,"b")' ~/.zshrc`). Only
+      // tokens AFTER the editor, so an upstream `sed -n 1p ~/.zshrc |` is not
+      // blamed.
+      for (const p of pathsFromBashCommand(expanded.slice(m.index))) push(p)
     }
     else for (const p of parts) push(p)
   }
@@ -421,17 +574,81 @@ function splitBashSegments(cmd: string): string[] {
 // source repo. Normal `commit` and non-force `push` are intentionally allowed:
 // agents are expected to commit and push their completed dotfile changes.
 //
-// Blocked operations include `reset`, `rebase`, `merge`, and force pushes.
-// The repo target may be expressed with raw `git -C <chezmoi-src>`,
+// Blocked operations (GIT_HAZARD_VERBS, shared with the `chezmoi git` form):
+//   - `reset`, `rebase`, `merge` (any form)
+//   - `restore` (any form) and the file-restore forms of `checkout`:
+//     `checkout -- <path>`, `checkout -f`, `checkout -p`, `checkout .`,
+//     `checkout <path/with/slash>`, `checkout <dotted.name>`,
+//     `checkout <treeish> -- <path>`, `checkout <treeish> .`
+//     (plain branch switching `checkout main` / `checkout -b x` /
+//     `checkout HEAD~1` stays allowed; a branch name containing `/` is an
+//     accepted false positive) — see gitCheckoutRestoresFiles
+//   - `switch -f` / `--force` / `--discard-changes` (bare `switch <branch>`
+//     and `switch -c x` stay allowed)
+//   - `clean` with -f/-d/-x (a `-n`/`--dry-run` clean is allowed, incl. `-nd`)
+//   - `stash` push/pop/drop/clear/apply (NOT `stash list` / `stash show`)
+//   - `commit --amend`
+//   - force pushes: `--force`, `--force-with-lease`, `-f`, `--mirror`, `+ref`
+// Everything else — add, commit, non-force push, status, diff, log, branch — is
+// allowed. The repo target may be expressed with raw `git -C <chezmoi-src>`,
 // `git --git-dir=<chezmoi-src>/.git`, `chezmoi git -- ...`, cwd-changing
 // shell (`cd <chezmoi-src> && git reset`), or the bash tool's `workdir` arg.
+// Same hazard set and checkout walker as the Claude/Codex hooks.
 const GIT_PREFIX = String.raw`(?:^|[\s|;&(])git\s+(?:(?:-[cC]\s*\S+|-c\s+\S+|--(?:git-dir|work-tree)(?:=|\s+)\S+|--(?:no-pager|paginate|bare))\s+)*`
-const GIT_HAZARD_RE = new RegExp(
-  `${GIT_PREFIX}(?:(?:reset|rebase|merge)(?=$|[\\s|;&)])|push\\b[^|;&]*(?:\\s['"]?\\+\\S+['"]?|\\s(?:--force(?:-with-lease)?|-\\w*f\\w*|--mirror\\b)))`,
-)
+const GIT_HAZARD_VERBS =
+  String.raw`(?:reset|rebase|merge|restore)(?=$|[\s|;&)])` +
+  // Anchored to the stash SUBCOMMAND token so a message like `-m 'list of
+  // things'` cannot leak into the allowlist.
+  String.raw`|stash(?=$|[\s|;&)])(?!\s+(?:list|show)\b)` +
+  String.raw`|switch\b[^|;&]*\s(?:-f\b|--force\b|--discard-changes\b)` +
+  String.raw`|clean\b(?![^|;&]*(?:--dry-run|\s-\w*n))[^|;&]*\s(?:-\w*[fdx]\w*|--force)(?=$|[\s|;&)])` +
+  String.raw`|commit\b[^|;&]*\s--amend\b` +
+  String.raw`|push\b[^|;&]*(?:\s['"]?\+\S+['"]?|\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b))`
+const GIT_HAZARD_RE = new RegExp(`${GIT_PREFIX}(?:${GIT_HAZARD_VERBS})`)
+const GIT_CHECKOUT_RE = new RegExp(`${GIT_PREFIX}checkout\\b([^|;&]*)`, "g")
+// `chezmoi git [--] <verb ...>` always runs in the source repo; the tail is
+// re-tested with the same hazard set as a bare `git` (see bashHazardsChezmoiRepo).
+const CHEZMOI_GIT_RE = /(?:^|[\s|;&(])chezmoi\s+git\b\s+(?:--\s+)?/g
+
+// `git checkout` discards working-tree changes when given paths (`-- <path>`,
+// `<tree-ish> -- <path>`, `.`, `-f`, `-p`, or a bare operand that looks like a
+// path). A plain branch switch (`checkout main`, `checkout -b name`,
+// `checkout HEAD~1`) stays allowed. When in doubt (operand contains `/` or a
+// dotted suffix) we treat it as a path: conservative.
+function gitCheckoutRestoresFiles(cmd: string): boolean {
+  let m: RegExpExecArray | null
+  GIT_CHECKOUT_RE.lastIndex = 0
+  while ((m = GIT_CHECKOUT_RE.exec(cmd)) !== null) {
+    const toks = m[1].trim().split(/\s+/).filter(Boolean)
+    let skipNext = false
+    for (const t of toks) {
+      if (skipNext) {
+        skipNext = false
+        continue
+      }
+      if (t === "--" || t === "-f" || t === "--force" || t === "-p" || t === "--patch") return true
+      if (t === "-b" || t === "-B" || t === "--orphan" || t === "-t" || t === "--track") {
+        skipNext = true
+        continue
+      }
+      if (t.startsWith("-")) continue
+      if (t === "." || t.startsWith("./") || t.startsWith("~") || t.includes("/") || /\.\w+$/.test(t)) return true
+    }
+  }
+  return false
+}
+
+// Positive statement of the rule, shared by both deny messages so an agent is
+// never handed a blocklist to route around.
+const GIT_ALLOWED_RULE =
+  `In the chezmoi source repo only \`git add\`, \`git commit\` (no --amend),\n` +
+  `non-force \`git push\`, and read-only git (status/diff/log/stash list) are\n` +
+  `permitted. This guard blocks reset, rebase, merge, restore, checkout of\n` +
+  `paths, switch -f/--discard-changes, clean -f/-d/-x, stash, --amend and\n` +
+  `force-push.`
 
 function gitHasHazard(cmd: string): boolean {
-  return GIT_HAZARD_RE.test(cmd)
+  return GIT_HAZARD_RE.test(cmd) || gitCheckoutRestoresFiles(cmd)
 }
 
 function resolveAgainstWorkdir(raw: string, workdir?: string): string {
@@ -449,8 +666,10 @@ function touchesManagedPath(p: string): boolean {
 
 function bashHazardsChezmoiRepo(cmd: string, workdir?: string): boolean {
   const expanded = expandHomeVars(cmd)
-  if (/(?:^|[\s|;&(])chezmoi\s+git\b\s+(?:--\s+)?(?:(?:reset|rebase|merge)(?=$|[\s|;&)])|push\b[^|;&]*(?:\s['"]?\+\S+['"]?|\s(?:--force(?:-with-lease)?|-\w*f\w*|--mirror\b)))/.test(expanded)) {
-    return true
+  let cm: RegExpExecArray | null
+  CHEZMOI_GIT_RE.lastIndex = 0
+  while ((cm = CHEZMOI_GIT_RE.exec(expanded)) !== null) {
+    if (gitHasHazard("git " + expanded.slice(cm.index + cm[0].length))) return true
   }
   // Pattern A1: explicit `git -C <chezmoi-src>` + write-class git verb.
   // `-C\s*` (NOT `\s+`) accepts both `-C /path` AND the glued form `-C/path`
@@ -544,38 +763,78 @@ function managedPathError(p: string): Error {
       `  2. Inspect git status/diff/log, stage only intended files, commit, and\n` +
       `     push automatically.\n` +
       `\n` +
-      `Do not use reset/rebase/merge or force-push; this guard blocks those\n` +
-      `operations. Use normal git outside this guard only after explicit\n` +
-      `manual handling if needed.`,
+      GIT_ALLOWED_RULE,
   )
 }
 
-export const ChezmoiGuard: Plugin = async ({ client }) => {
+export const ChezmoiGuard: Plugin = async ({ client, directory }) => {
   refresh()
-  debugLog("initialized", { source: CHEZMOI_SOURCE_DIR })
+  debugLog("initialized", { source: CHEZMOI_SOURCE_DIR, directory, bin: CHEZMOI_BIN, managed: managed.size })
+
+  // Resolve a session's parent, from the event-fed cache first and the server
+  // as a fallback (one request per unknown session; result cached).
+  async function parentOf(sessionID: string): Promise<string | undefined> {
+    if (sessionParent.has(sessionID)) return sessionParent.get(sessionID)
+    try {
+      const res = await client.session.get({ path: { id: sessionID } })
+      const parent = res.data?.parentID || undefined
+      sessionParent.set(sessionID, parent)
+      return parent
+    } catch (err) {
+      debugLog("session lookup failed", { sessionID, error: String(err) })
+      return undefined
+    }
+  }
+
   return {
     event: async ({ event }) => {
+      if (event.type === "session.created" || event.type === "session.updated") {
+        const info = event.properties.info
+        sessionParent.set(info.id, info.parentID || undefined)
+        return
+      }
       if (event.type !== "session.idle") return
       const sessionID = event.properties.sessionID
+      // Subagent turn ending: never drive a continuation into a child session
+      // (it would select the child in the TUI and splice text into the user's
+      // prompt). Hand its touched paths to the root, whose own idle will nag.
+      if (await parentOf(sessionID)) {
+        migrateTouchedPathsToRoot(sessionID)
+        debugLog("idle skipped: subagent session", { sessionID, root: rootSessionID(sessionID) })
+        return
+      }
       const state = stateForSession(sessionID)
-      if (state.continuationPending) {
-        const age = Date.now() - (state.continuationPendingSince ?? 0)
-        if (age < 2 * 60 * 1000) {
+      if (state.continuationPendingSince !== undefined) {
+        const age = Date.now() - state.continuationPendingSince
+        if (age < CONTINUATION_WINDOW_MS) {
           debugLog("idle skipped: continuation already pending", { sessionID, age })
           return
         }
         debugLog("idle retrying stale continuation", { sessionID, age })
-        state.continuationPending = false
         state.continuationPendingSince = undefined
       }
       const prompt = uncommittedChezmoiContinuationPrompt(sessionID)
       if (!prompt) {
-        debugLog("idle clean", { sessionID })
+        if (state.continuationCount > 0 || state.continuationPendingSince !== undefined) {
+          debugLog("idle clean: continuation state reset", { sessionID, continuations: state.continuationCount })
+        } else if (TRACE) {
+          debugLog("idle clean", { sessionID })
+        }
+        state.continuationCount = 0
+        state.continuationPendingSince = undefined
         return
       }
-      state.continuationPending = true
+      if (state.continuationCount >= MAX_CONTINUATIONS) {
+        // Backstop: something (a rejected push, a hazard-blocked fix) keeps
+        // the session dirty. Let it stop rather than loop a model turn per
+        // idle forever; the system.transform reminder still covers the next
+        // real turn.
+        debugLog("idle dirty: continuation cap reached, allowing stop", { sessionID, continuations: state.continuationCount })
+        return
+      }
+      state.continuationCount += 1
       state.continuationPendingSince = Date.now()
-      debugLog("idle dirty: prompting continuation", { sessionID })
+      debugLog("idle dirty: prompting continuation", { sessionID, attempt: state.continuationCount })
       try {
         await client.tui.publish({
           body: {
@@ -614,16 +873,17 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
             properties: { command: "prompt.submit" },
           },
         })
-        debugLog("submitted continuation through tui", { sessionID })
+        debugLog("submitted continuation through tui", { sessionID, attempt: state.continuationCount })
       } catch (err) {
-        state.continuationPending = false
         state.continuationPendingSince = undefined
         debugLog("tui continuation submit failed", { sessionID, error: String(err) })
       }
     },
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
-      const complaint = uncommittedChezmoiComplaint(input.sessionID)
+      // Root-keyed: a subagent's writes live on the root's state (see
+      // rememberSourceWrites), and either session may do the commit.
+      const complaint = uncommittedChezmoiComplaint(rootSessionID(input.sessionID))
       if (complaint) {
         debugLog("system reminder injected", { sessionID: input.sessionID })
         output.system.push(complaint)
@@ -635,9 +895,16 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
       if (BLOCKED_TOOLS.has(input.tool)) {
         refresh()
         const paths = pathsFromArgs(input.tool, output.args)
+        if (TRACE) debugLog("pretool", { sessionID: input.sessionID, tool: input.tool, paths })
         for (const raw of paths) {
-          const p = normalizePath(raw)
-          if (managed.has(p)) throw managedPathError(p)
+          // Relative operands (common for apply_patch) are what the tool will
+          // resolve against the session directory — the plugin instance is
+          // per-directory, so `directory` is that base, not process.cwd().
+          const p = normalizePath(resolveAgainstWorkdir(raw, directory))
+          if (managed.has(p)) {
+            debugLog("deny managed path", { sessionID: input.sessionID, tool: input.tool, path: p })
+            throw managedPathError(p)
+          }
         }
         return
       }
@@ -652,14 +919,15 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
         // enough that whole-command match is appropriate here. The optional
         // `workdir` parameter is consulted for Pattern A3 (bash-tool
         // workdir-set git operations with no syntactic chezmoi reference).
+        if (TRACE) debugLog("pretool", { sessionID: input.sessionID, tool: "bash", cmd: cmd.slice(0, 240) })
         if (bashHazardsChezmoiRepo(cmd, workdir)) {
+          debugLog("deny git hazard", { sessionID: input.sessionID, cmd: cmd.slice(0, 240) })
           throw new Error(
             `[chezmoi-guard] bash command appears to run a destructive or\n` +
               `history-rewriting git operation in the chezmoi source repo.\n` +
               `\n` +
-              `Normal commit and non-force push are allowed. Do not reset,\n` +
-              `rebase, merge, or force-push; this guard blocks those actions.\n` +
-              `\n` +
+              GIT_ALLOWED_RULE +
+              `\n\n` +
               `Command (truncated): ${cmd.slice(0, 240)}`,
           )
         }
@@ -678,21 +946,29 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
           if (!bashHasWriteIntent(seg) && writeTargets.length === 0) continue
           // Prefer explicit write targets; fall back to all path tokens only when
           // a write-intent segment produced no parseable target (exotic quoting).
+          // In-place editors already union the rooted paths from their own
+          // position onward inside pathsFromBashWriteTargets.
           const candidatePaths = writeTargets.length > 0 ? writeTargets : pathsFromBashCommand(seg)
           if (!refreshed) { refresh(); refreshed = true }
           for (const raw of candidatePaths) {
             const p = normalizePath(resolveAgainstWorkdir(raw, workdir))
-            if (touchesManagedPath(p)) throw managedPathError(p)
+            if (touchesManagedPath(p)) {
+              debugLog("deny bash write managed", { sessionID: input.sessionID, path: p, cmd: cmd.slice(0, 240) })
+              throw managedPathError(p)
+            }
           }
         }
       }
     },
     "tool.execute.after": async (input) => {
-      const state = stateForSession(input.sessionID)
-      state.continuationPending = false
-      state.continuationPendingSince = undefined
+      // NOTE: continuation state is deliberately NOT touched here — see
+      // SessionChezmoiState. A continuation turn always runs tools, so
+      // clearing the window per tool call made it unreachable.
       if (BLOCKED_TOOLS.has(input.tool)) {
-        rememberSourceWrites(input.sessionID, pathsFromArgs(input.tool, input.args))
+        rememberSourceWrites(
+          input.sessionID,
+          pathsFromArgs(input.tool, input.args).map((p) => resolveAgainstWorkdir(p, directory)),
+        )
         return
       }
       if (input.tool !== "bash") return
@@ -716,7 +992,7 @@ export const ChezmoiGuard: Plugin = async ({ client }) => {
       }
       // Recompute after every bash command so successful commits/pushes by this
       // or another process clear the session's pending reminder promptly.
-      pendingTouchedPaths(input.sessionID)
+      pendingTouchedPaths(rootSessionID(input.sessionID))
     },
   }
 }
