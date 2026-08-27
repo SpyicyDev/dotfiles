@@ -234,23 +234,45 @@ y() {
 # `chezmoi verify`'s op:// 1Password prompts; that constraint is gone
 # (op CLI no longer needs a TTY in this setup).
 #
-# Cost: verify templates every managed file (~3s for ~260 files here).
-# Acceptable because (a) it runs detached in a `&!` subshell so prompt
-# latency is zero, and (b) the 60s throttle caps load. The stale-lock
-# reclaim threshold (lock_max_age, 300s) is decoupled from this so a slow
-# verify is never misjudged dead and double-run.
+# Cost: a plain `chezmoi verify` over ~285 managed entries takes ~3s wall
+# here, but only ~0.2s of that is CPU — the rest is the 4 templates that
+# call onepasswordRead, each of which shells out to `op read` (~0.75s
+# apiece). Every other entry verifies in ~50-70ms total. So the bg job runs
+# a split verify: the FAST set (everything except op-dependent targets)
+# every cycle, and the op-dependent set only when one of those files'
+# source or target changed since the last full check, or every 30 min as a
+# backstop. The secret-set verdict is persisted in `last-full` so the fast
+# cycles keep reporting it. Even on a full cycle the fast verdict (plus git
+# glyphs, plus the PREVIOUS secret verdict) is published first, ~150ms in,
+# and the secret verify only re-publishes ~3s later if its verdict changed —
+# so a cold cache or a secret edit never leaves the prompt stale for 3s.
+# Net effect: the indicator lands ~150ms after the prompt instead of 3s
+# later, and the in-place redraw is invisible. The stale-lock reclaim
+# threshold (lock_max_age, 300s) still exceeds the worst-case full verify
+# so a slow-but-live holder is never double-run. A cycle still forks grep,
+# chezmoi (managed / target-path / verify) and one git; only the file
+# plumbing (mkdir, rm, mv) is fork-free, via zsh/files builtins under their
+# zf_ names so the system rm/mv/mkdir are never shadowed.
 #
 # Cache layout under ~/.cache/chezmoi-drift/ :
 #   state       — current drift glyphs. Only ever written atomically
-#                 (tmp + mv-rename) by the bg job, so the indicator
+#                 (tmp + zf_mv rename) by the bg job, so the indicator
 #                 NEVER flickers — readers see the last complete state
-#                 until the next bg job replaces it.
+#                 until the next bg job replaces it. Written once per fast
+#                 cycle, up to twice per full cycle (fast-first, then the
+#                 secret verdict if it changed).
 #   last-check  — throttle marker. Touched by the parent shell to claim
 #                 the 60s refresh window. Lives separately from `state`
 #                 so claiming the window doesn't blank the indicator
 #                 (the old impl truncated `state` itself, causing a
 #                 visible flicker each minute).
-#   lock/       — mkdir-mutex acquired by the bg job. Atomic across
+#   last-full   — mtime = when the op-dependent (slow) targets were last
+#                 verified; content = "<verdict> <fingerprint>" where verdict
+#                 is "1" if that verify found drift else "0", and fingerprint
+#                 is the mtime+size of every secret source/target at that
+#                 time. Fast cycles reuse the verdict while the fingerprint
+#                 still matches, instead of re-paying the `op read` cost.
+#   lock/       — zf_mkdir-mutex acquired by the bg job. Atomic across
 #                 shells via mkdir(2) — if N shells fire precmd at the
 #                 same instant, only one bg verify runs; the rest exit
 #                 silently. Released via EXIT trap in the subshell.
@@ -271,11 +293,20 @@ zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
 # $sysparams[pid] is the REAL pid inside `( ) &!` subshells (plain $$ stays the
 # parent pid there), used for collision-free temp/reclaim names below.
 zmodload -F zsh/system p:sysparams 2>/dev/null
-# zsh builtin mkdir/rm/mv work in `&!` subshells where the command-hash
-# table is empty and the /usr/bin equivalents would be "not found".
-# `mv` is loaded too so the atomic state publish (tmp + mv-rename) stays
-# fork-free and works even when PATH lacks coreutils.
-zmodload -F zsh/files b:mkdir b:rm b:mv 2>/dev/null
+# zsh/files builtins work in `&!` subshells where the command-hash table is
+# empty and the /usr/bin equivalents would be "not found"; zf_mv also keeps
+# the atomic state publish (tmp + rename) fork-free even when PATH lacks
+# coreutils. Loaded under their zf_ names ONLY: `b:mkdir b:rm b:mv` would
+# install builtins literally named rm/mv/mkdir that shadow the system tools
+# for the whole interactive session (`rm -v`, `mv -n` → "bad option").
+# If the module is unavailable, fall back to the external tools by absolute
+# path (two zf_mkdir call sites run in the parent shell, un-redirected — a
+# "command not found" there would print above every prompt).
+zmodload -F zsh/files b:zf_mkdir b:zf_rm b:zf_mv 2>/dev/null || {
+  zf_mkdir() { /bin/mkdir "$@"; }
+  zf_rm()    { /bin/rm "$@"; }
+  zf_mv()    { /bin/mv "$@"; }
+}
 
 _chezmoi_drift_check() {
   local cache="$HOME/.cache/chezmoi-drift"
@@ -284,8 +315,8 @@ _chezmoi_drift_check() {
   local lockdir="$cache/lock"
   local max_age=60        # throttle window: at most one verify per shell per 60s
   local lock_max_age=300  # stale-lock reclaim; MUST exceed worst-case verify
-                          # (~3s for ~260 files here) so a slow-but-live holder
-                          # is never misjudged dead and double-verified.
+                          # (~3-4s on a full cycle here) so a slow-but-live
+                          # holder is never misjudged dead and double-verified.
   # If chezmoi vanished mid-session (uninstalled / dropped from PATH), clear a
   # previously-exported indicator instead of leaving stale glyphs on the prompt.
   (( ${+commands[chezmoi]} )) || { unset STARSHIP_CHEZMOI_DRIFT; return 0; }
@@ -309,21 +340,23 @@ _chezmoi_drift_check() {
   # the command hash table, so `command FOO` fails with "command not found"
   # even when PATH is intact. Resolved absolute paths inherit cleanly.
   local git_bin="${commands[git]:-/usr/bin/git}"
+  local grep_bin="${commands[grep]:-/usr/bin/grep}"
   local chezmoi_bin="${commands[chezmoi]}"
   # Claim the 60s window for this shell. Other precmd calls in this shell
   # short-circuit on the fresh marker mtime; other shells likewise. The cache
   # dir is created here (not every prompt) — the throttle-fresh fast path above
   # writes nothing under $cache, so it needn't pay the mkdir syscall.
-  mkdir -p "$cache"
+  zf_mkdir -p "$cache"
   : >| "$marker"
   ( # Inter-shell mutex via mkdir(2), which is atomic. If another shell's
     # bg job already holds the lock, exit silently rather than racing —
     # otherwise N concurrent shells would all spawn `chezmoi verify`.
-    # zsh/files mkdir + rm are builtins loaded above (fork-free, work in
-    # `&!` where the command hash table is empty).
+    # zsh/files zf_mkdir + zf_rm + zf_mv are builtins loaded above
+    # (fork-free, work in `&!` where the command hash table is empty).
     #
     # Stale-lock recovery: if the lock dir is older than $lock_max_age, the
-    # previous holder must be dead (typical bg job is ~3s). Reclaim it.
+    # previous holder must be dead (a fast cycle is ~0.15s, a full one ~3-4s).
+    # Reclaim it.
     # Without this, a SIGKILL'd bg job would deadlock all future refreshes.
     # Reclaim atomically: rename-then-delete so that if two shells both see the
     # same stale lock, only the one whose `mv` wins removes it; the loser's mv
@@ -334,73 +367,201 @@ _chezmoi_drift_check() {
       local -A ls; zstat -L -H ls +mtime "$lockdir" 2>/dev/null
       if (( EPOCHSECONDS - ${ls[mtime]:-0} > lock_max_age )); then
         local reclaim="$lockdir.reclaim.$sysparams[pid]$RANDOM"
-        mv -- "$lockdir" "$reclaim" 2>/dev/null && rm -rf -- "$reclaim" 2>/dev/null
+        zf_mv -- "$lockdir" "$reclaim" 2>/dev/null && zf_rm -rf -- "$reclaim" 2>/dev/null
       fi
     fi
-    mkdir "$lockdir" 2>/dev/null || return
+    zf_mkdir "$lockdir" 2>/dev/null || return
     # Release the lock on every exit path including signals. Single-quoted so
     # $lockdir expands at trap-fire time (a stable local in this subshell) — no
     # expanded-path re-parse hazard if the cache path ever holds odd characters.
-    trap 'rm -rf -- "$lockdir" 2>/dev/null' EXIT INT TERM HUP
+    trap 'zf_rm -rf -- "$lockdir" 2>/dev/null' EXIT INT TERM HUP
     local drifted="" source_dir
-    # Glyph ~ : authoritative content drift via `chezmoi verify`.
-    # Returns 0 iff every managed live file matches its source. Catches
-    # content edits, deletions, mode/permission changes, symlink targets.
-    "$chezmoi_bin" verify >/dev/null 2>&1 || drifted+="~"
-    # Glyphs * / ⇡ / ⇣ : git state of the chezmoi source repo.
-    # We avoid invoking `chezmoi source-path` (slow, boots templater) and
-    # use the canonical XDG default with a one-shot fallback.
-    source_dir="$HOME/.local/share/chezmoi"
+    # Resolve the source dir first (needed by the split verify below and the
+    # git glyphs). We avoid invoking `chezmoi source-path` (boots the
+    # templater) and use the canonical XDG default with a one-shot fallback.
     # `rev-parse --git-dir` (not `[[ -d .git ]]`) so a source that is a git
     # worktree or submodule — where `.git` is a gitfile, not a dir — still
     # reports its git state instead of silently suppressing * / ⇡ / ⇣ / ?.
+    source_dir="$HOME/.local/share/chezmoi"
     "$git_bin" -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1 \
       || source_dir=$("$chezmoi_bin" source-path 2>/dev/null)
-    if "$git_bin" -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
-      if [[ -n "$("$git_bin" -C "$source_dir" status --porcelain 2>/dev/null)" ]]; then
-        drifted+="*"
+
+    # Glyph ~ : authoritative content drift via `chezmoi verify`.
+    # rc=0 iff every checked live file matches its source. Catches content
+    # edits, deletions, mode/permission changes, symlink targets.
+    #
+    # Split verify (see header): templates whose actions call a onepassword*
+    # function cost ~0.75s EACH in `op read`, everything else ~30ms total.
+    # 1. secret_src: source templates containing a template action that calls
+    #    a onepassword* function (the regex requires the action's opening
+    #    braces, so prose mentions of onepassword — like this — don't match;
+    #    it's also why this comment can't spell the braces out: this file is
+    #    itself a template).
+    # 2. secret_tgt: their live targets, via one `chezmoi target-path` call.
+    #    That call is purely lexical (it never checks that a source is a
+    #    managed target), so the list is intersected with `managed`: an
+    #    unmanaged source that mentions onepassword (a .chezmoiscripts/*.tmpl,
+    #    .chezmoi.toml.tmpl, an ignored template) would otherwise yield a
+    #    path that never exists → a permanent false `~`. If target-path fails
+    #    outright (empty output for a non-empty source list) we can't split,
+    #    so that cycle takes the degraded whole-tree path below instead of
+    #    silently paying the op cost on every fast cycle.
+    # 3. fast: every managed file/symlink/dir minus secret_tgt → verified
+    #    every cycle with --recursive=false. Dirs matter: a bare `chezmoi
+    #    verify` checks their mode, and secret_tgt can only ever hold files
+    #    (from *.tmpl sources) — but recursing INTO the dirs would pull the
+    #    secret files back in, hence the flag.
+    # 4. secret_tgt is verified only when it "could" have changed: the
+    #    fingerprint (mtime+size of every secret source AND target, plus the
+    #    path list itself) differs from the one recorded at the last full
+    #    check, or that check is >30 min old. Fingerprint-equality rather
+    #    than "mtime newer than marker" because zstat mtime is whole seconds:
+    #    a write landing in the same second as the marker would be invisible
+    #    to a > comparison, forever.
+    #    last-full holds "<verdict> <fingerprint>": verdict is "1" drift /
+    #    "0" clean, and fast cycles reuse it — otherwise a drifted secret
+    #    file would flag `~` once and then silently clear 60s later.
+    # A missing secret target (after the intersection, that can only be a
+    # managed target that vanished) is flagged directly (no op cost) rather
+    # than forcing a full verify every minute until it's restored.
+    local full_marker="$cache/last-full"
+    local -a secret_src secret_tgt managed fast
+    local degraded=0
+    secret_src=( ${(f)"$("$grep_bin" -rlE --exclude-dir=.git --include='*.tmpl' '\{\{[^}]*onepassword' "$source_dir" 2>/dev/null)"} )
+    (( ${#secret_src} )) && \
+      secret_tgt=( ${(f)"$("$chezmoi_bin" target-path "${secret_src[@]}" 2>/dev/null)"} )
+    managed=( ${(f)"$("$chezmoi_bin" managed --path-style=absolute --include=files,symlinks,dirs 2>/dev/null)"} )
+    # `chezmoi managed` failed (don't trust an empty fast set) or target-path
+    # failed (can't split) → whole-tree verify this cycle, last-full untouched.
+    (( ! ${#managed} )) && degraded=1
+    (( ${#secret_src} && ! ${#secret_tgt} )) && degraded=1
+    # Intersect AFTER the raw-count check above, so a genuine mapping failure
+    # isn't confused with "nothing managed mentions onepassword".
+    secret_tgt=( ${secret_tgt:*managed} )
+    fast=( ${managed:|secret_tgt} )
+
+    # Fingerprint: one token per file. Missing target → "-" token (and an
+    # immediate drift flag below); it still changes the fingerprint when the
+    # file comes back, which is exactly when a re-verify is due.
+    local need_full=0 secret_drift=0 f fp="" missing=0
+    local -A fm st
+    # (zstat accepts only ONE +attr per call, so take the whole hash.)
+    for f in "${secret_src[@]}"; do
+      zstat -L -H st "$f" 2>/dev/null && fp+="$st[mtime].$st[size]," || fp+="-,"
+    done
+    for f in "${secret_tgt[@]}"; do
+      zstat -L -H st "$f" 2>/dev/null && fp+="$st[mtime].$st[size]," || { fp+="-,"; missing=1; }
+    done
+    fp+="${#secret_src}/${#secret_tgt}"
+
+    # Previous secret verdict from last-full (0 if none). It is what the fast
+    # cycles report, and what the fast-first publish on a full cycle shows
+    # until the secret verify replaces it.
+    local prev=""
+    [[ -f "$full_marker" ]] && prev="$(<"$full_marker")"
+    [[ "$prev" == [01]\ * ]] && secret_drift=$(( ${prev%% *} ))
+    if (( degraded )); then
+      need_full=1
+    elif [[ ! -f "$full_marker" ]] || ! zstat -L -H fm +mtime "$full_marker" 2>/dev/null; then
+      need_full=1
+    elif (( EPOCHSECONDS - ${fm[mtime]:-0} > 1800 )); then
+      need_full=1
+    elif [[ "${prev#* }" != "$fp" ]]; then
+      need_full=1
+    fi
+
+    # Glyphs * / ⇡ / ⇣ : git state of the chezmoi source repo, from ONE
+    # `status --porcelain=v2 --branch` parsed in zsh. Any line not starting
+    # with "# " is a changed/untracked entry → '*'. The "# branch.ab +A -B"
+    # header exists only when an upstream is set: A>0 → '⇡', B>0 → '⇣'
+    # (local-only ref comparison; freshness depends on the periodic
+    # _chezmoi_remote_fetch hook below). No branch.ab → no upstream → ⇡/⇣ and
+    # the `?` staleness check are all skipped. A non-git source_dir yields no
+    # output and therefore no glyphs.
+    local git_glyphs="" line has_upstream=0 dirty=0 ahead=0 behind=0
+    for line in ${(f)"$("$git_bin" -C "$source_dir" status --porcelain=v2 --branch 2>/dev/null)"}; do
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == '# branch.ab '* ]]; then
+        has_upstream=1
+        line="${line#\# branch.ab +}"       # → "A -B"
+        ahead="${line%% *}"; behind="${line#* -}"
+      elif [[ "$line" != '# '* ]]; then
+        dirty=1
       fi
-      # Ahead/behind upstream → Pure '⇡' / '⇣'. Skip cleanly if no upstream.
-      # ⇣ uses local-only ref comparison; freshness depends on the periodic
-      # _chezmoi_remote_fetch hook below.
-      if "$git_bin" -C "$source_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-        if [[ -n "$("$git_bin" -C "$source_dir" rev-list '@{u}..HEAD' 2>/dev/null)" ]]; then
-          drifted+="⇡"
-        fi
-        if [[ -n "$("$git_bin" -C "$source_dir" rev-list 'HEAD..@{u}' 2>/dev/null)" ]]; then
-          drifted+="⇣"
-        fi
-        # If we *had* a successful fetch but it's been >24h, ⇣ knowledge is
-        # stale. Append "?" so the user can investigate network / SSH agent
-        # / git auth. Suppressed when last-fetch-ok is absent (cold cache /
-        # first fetch in flight) — give the 15-min cycle a chance to land
-        # before alarming.
-        local fetch_ok="$HOME/.cache/chezmoi/last-fetch-ok"
-        if [[ -f "$fetch_ok" ]]; then
-          local -A fs
-          if zstat -L -H fs +mtime "$fetch_ok" 2>/dev/null; then
-            (( EPOCHSECONDS - ${fs[mtime]:-0} > 86400 )) && drifted+="?"
-          fi
+    done
+    (( dirty )) && git_glyphs+="*"
+    if (( has_upstream )); then
+      (( ahead  > 0 )) && git_glyphs+="⇡"
+      (( behind > 0 )) && git_glyphs+="⇣"
+      # If we *had* a successful fetch but it's been >24h, ⇣ knowledge is
+      # stale. Append "?" so the user can investigate network / SSH agent
+      # / git auth. Suppressed when last-fetch-ok is absent (cold cache /
+      # first fetch in flight) — give the 15-min cycle a chance to land
+      # before alarming.
+      local fetch_ok="$HOME/.cache/chezmoi/last-fetch-ok"
+      if [[ -f "$fetch_ok" ]]; then
+        local -A fs
+        if zstat -L -H fs +mtime "$fetch_ok" 2>/dev/null; then
+          (( EPOCHSECONDS - ${fs[mtime]:-0} > 86400 )) && git_glyphs+="?"
         fi
       fi
     fi
-    # Atomic write: tmpfile in the same dir + mv. Readers never see a
-    # partial or empty $result — they see either the old state or the
-    # new state, never an in-between. zsh/files mv is a builtin (fork-free,
-    # loaded above). $sysparams[pid] gives a per-subshell-unique tmp name
-    # ($$ stays the parent pid here, so concurrent bg jobs would collide).
-    local tmp="$result.tmp.$sysparams[pid]$RANDOM"
+
+    # _publish <glyphs>: atomic write (tmpfile in the same dir + zf_mv).
+    # Readers never see a partial or empty $result — they see either the old
+    # state or the new state, never an in-between. $sysparams[pid] gives a
+    # per-subshell-unique tmp name ($$ stays the parent pid here, so
+    # concurrent bg jobs would collide). Then, if the glyphs actually changed,
+    # poke the shell that spawned us so it redraws the prompt now — no Enter
+    # needed. zsh keeps $$ = the parent's pid inside this subshell (verified),
+    # so this targets the interactive shell, not the subshell. `kill` is a
+    # builtin (works in this fork-free &! subshell); silent if the shell
+    # already exited. Skipping the signal when unchanged avoids needless
+    # redraws — $old tracks the last published value, so a second publish in
+    # the same cycle only signals if the secret verify changed the verdict.
     local old=""; [[ -f "$result" ]] && old="$(<"$result")"
-    print -n "$drifted" >| "$tmp"
-    mv -f -- "$tmp" "$result"
-    # Live in-place refresh: if the glyphs actually changed, poke the shell
-    # that spawned us so it redraws the prompt now — no Enter needed. zsh keeps
-    # $$ = the parent's pid inside this subshell (verified), so this targets the
-    # interactive shell, not the subshell. `kill` is a builtin (works in this
-    # fork-free &! subshell); silent if the shell already exited. Skipping the
-    # signal when unchanged avoids needless redraws every refresh cycle.
-    [[ "$drifted" != "$old" ]] && kill -USR1 $$ 2>/dev/null
-  ) &!
+    _publish() {
+      local tmp="$result.tmp.$sysparams[pid]$RANDOM"
+      print -n "$1" >| "$tmp"
+      zf_mv -f -- "$tmp" "$result"
+      [[ "$1" != "$old" ]] && kill -USR1 $$ 2>/dev/null
+      old="$1"
+    }
+
+    if (( degraded )); then
+      # Degraded: couldn't enumerate/split targets, fall back to a whole-tree
+      # verify. No fast/secret split → a single publish; last-full untouched.
+      "$chezmoi_bin" verify >/dev/null 2>&1 || drifted+="~"
+      _publish "$drifted$git_glyphs"
+    else
+      # Stage 1 (every cycle, ~150ms): fast verify + git glyphs + the PREVIOUS
+      # secret verdict. Published immediately so the prompt never waits on op.
+      local fast_drift=0
+      (( missing )) && secret_drift=1
+      # --recursive=false: the list already names every entry explicitly, and
+      # letting verify descend into the managed dirs would re-visit the
+      # op-dependent files inside them (measured: 1.6s vs 0.05s).
+      if (( ${#fast} )); then
+        "$chezmoi_bin" verify --recursive=false "${fast[@]}" >/dev/null 2>&1 || fast_drift=1
+      fi
+      (( fast_drift || secret_drift )) && drifted+="~"
+      _publish "$drifted$git_glyphs"
+      # Stage 2 (full cycles only, ~3s of `op read`): secret verify. The fast
+      # verdict and git glyphs are already known — reuse, don't re-run.
+      if (( need_full )); then
+        secret_drift=0
+        if (( ${#secret_tgt} )); then
+          "$chezmoi_bin" verify "${secret_tgt[@]}" >/dev/null 2>&1 || secret_drift=1
+        fi
+        # Plain write (not atomic): the only reader is this same lock-held job.
+        print -n "$secret_drift $fp" >| "$full_marker"
+        (( missing )) && secret_drift=1
+        drifted=""
+        (( fast_drift || secret_drift )) && drifted+="~"
+        _publish "$drifted$git_glyphs"   # signals only if the verdict changed
+      fi
+    fi
+  ) >/dev/null 2>&1 &!
 }
 
 # ── Live in-place refresh for the drift indicator ───────────────────────────
@@ -412,8 +573,12 @@ _chezmoi_drift_check() {
 # (prompt_subst), so reset-prompt re-reads STARSHIP_CHEZMOI_DRIFT fresh.
 # While a command is running (not at the prompt) we only refresh the env var;
 # the next prompt renders it. The _CHEZMOI_AT_PROMPT flag (set by a precmd that
-# runs last, cleared by preexec) gates reset-prompt so it's only called while
-# zle is active.
+# runs last, cleared by preexec) gates reset-prompt, and a bare `zle` test
+# (returns 0 only while the line editor is active) confirms it for real.
+# The trap MUST return 0: zsh treats a non-zero return from a TRAPNAL
+# function as "behave as if interrupted" — it breaks enclosing loops and
+# aborts the current command list — so a signal landing mid-command with a
+# falsy `&&` as the last statement would silently kill the user's loop.
 typeset -g _CHEZMOI_AT_PROMPT=0
 TRAPUSR1() {
   local result="$HOME/.cache/chezmoi-drift/state"
@@ -422,7 +587,10 @@ TRAPUSR1() {
   else
     unset STARSHIP_CHEZMOI_DRIFT
   fi
-  (( _CHEZMOI_AT_PROMPT )) && zle reset-prompt 2>/dev/null
+  if (( _CHEZMOI_AT_PROMPT )) && zle 2>/dev/null; then
+    zle reset-prompt 2>/dev/null
+  fi
+  return 0
 }
 _chezmoi_prompt_ready() { _CHEZMOI_AT_PROMPT=1; }  # precmd: about to show prompt
 _chezmoi_prompt_busy()  { _CHEZMOI_AT_PROMPT=0; }  # preexec: command running
@@ -444,7 +612,7 @@ _chezmoi_remote_fetch() {
   fi
   # Touch the marker NOW (parent shell) so we don't queue many
   # concurrent fetches if precmd fires repeatedly while one is in flight.
-  mkdir -p "${fetch_cache:h}" && : >| "$fetch_cache"
+  zf_mkdir -p "${fetch_cache:h}" && : >| "$fetch_cache"
   local git_bin="${commands[git]:-/usr/bin/git}"
   local chezmoi_bin="${commands[chezmoi]}"
   ( local source_dir="$HOME/.local/share/chezmoi"
