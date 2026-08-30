@@ -33,3 +33,11 @@ export OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=1
 
 # Secrets (chmod 600, gitignored)
 [[ -r "$HOME/.zshenv.private" ]] && source "$HOME/.zshenv.private"
+
+# Keep ANTHROPIC_API_KEY out of interactive shells. Anything started from a
+# terminal inherits this env, and an inherited key silently flips Claude Code
+# from the subscription to pay-per-token API billing. Non-interactive shells
+# (scripts, `zsh -c`, cron, LaunchAgents) keep it — they call the API directly.
+# Unset rather than guarding the export in .zshenv.private, so the encrypted
+# secrets file stays a plain list of secrets.
+[[ -o interactive ]] && unset ANTHROPIC_API_KEY
