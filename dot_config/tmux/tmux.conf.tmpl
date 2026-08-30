@@ -444,6 +444,12 @@ set -g @resurrect-hook-post-save-all "bash '{{ .chezmoi.homeDir }}/.config/tmux/
 # loads it, so anything above would be silently replaced.
 set -ag @resurrect-hook-post-restore-all "; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/stash.sh' restore-state"
 
+# The same options gap bites the `agents` session harder: tmux-pty-mcp owns
+# its windows by @pty_* options, so a restore brings back every agent shell as
+# an unownable idle zsh (80 of them on 2026-08-29). Prune those on arrival;
+# the server's own sweep is the backstop if this hook ever doesn't run.
+set -ag @resurrect-hook-post-restore-all "; bash '{{ .chezmoi.homeDir }}/.config/tmux/scripts/agent-restore-prune.sh'"
+
 # Keep the sidecar's key from going stale. It records windows by index, and
 # `renumber-windows on` means closing ANY window shifts its neighbours — so a
 # close the script did not perform left a row pointing at what is now a
