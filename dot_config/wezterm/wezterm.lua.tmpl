@@ -180,6 +180,43 @@ config.keys = {
         }
     },
 
+    -- CMD+SHIFT+U: label every URL currently on screen with a vimium-style rune,
+    -- then open the one whose rune you type. This is QuickSelect with a custom
+    -- action instead of its default copy-to-clipboard; CTRL+SHIFT+SPACE still
+    -- runs the stock copy-anything QuickSelect alongside it.
+    --
+    -- Deliberately at the WezTerm layer rather than a tmux plugin (tmux-thumbs
+    -- et al): QuickSelect is native and forks nothing, and it labels the whole
+    -- window at once -- every tmux pane plus the status line -- where a
+    -- tmux-level tool only ever sees the focused pane.
+    --
+    -- Scope is whatever is painted RIGHT NOW: scrollback_lines is 0 above, so
+    -- WezTerm keeps no history of its own. To hint a link that has scrolled
+    -- away, scroll up in tmux copy-mode first, then press this.
+    {
+        key = "U",
+        mods = "CMD",
+        action = wezterm.action.QuickSelectArgs {
+            label = "open url",
+            -- Supplying `patterns` REPLACES the default matcher set, so only
+            -- links get runes (not the stock hashes/paths/IPs/quoted strings).
+            -- Rust regex, in a long-bracket string to dodge Lua escaping: match
+            -- any scheme://, stop at whitespace/quotes/brackets, and require the
+            -- final character to be non-punctuation so a trailing ")" or "." in
+            -- prose is left out of the captured URL.
+            patterns = {
+                [==[\b[a-z][a-z0-9+.-]*://[^\s'"<>()\[\]]*[^\s'"<>()\[\].,;:!?]]==],
+            },
+            action = wezterm.action_callback(function(window, pane)
+                local url = window:get_selection_text_for_pane(pane)
+                if url and url ~= "" then
+                    wezterm.log_info("quickselect open: " .. url)
+                    wezterm.open_with(url)
+                end
+            end),
+        },
+    },
+
 }
 
 for i = 1, 9 do
