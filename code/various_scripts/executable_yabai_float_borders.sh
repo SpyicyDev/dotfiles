@@ -51,7 +51,13 @@ BORDERS_STYLE=(style=round width=2.0 active_color=0xffffffff inactive_color=0xff
 cmd="${1:-sync}"
 [ "$cmd" = "sync" ] || exit 64
 
-LOCK="${TMPDIR:-/tmp}/yabai_float_borders.lock"
+# shellcheck source=/dev/null  # required sibling: the shared state dir
+. "$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/yabai_common.sh"
+# Shared state dir, not ${TMPDIR:-/tmp}: this is called from yabai signals (which
+# have yabai's TMPDIR) AND from skhd's hyper+t (which has none) -- under TMPDIR the
+# two callers locked different directories and the single-flight was fiction.
+mkdir -p "$YABAI_STATE_DIR" 2>/dev/null
+LOCK="$YABAI_STATE_DIR/float_borders.lock"
 SETTLE="${YABAI_BORDERS_SETTLE:-0.15}"
 
 # Single-flight. Recover a lock orphaned by a crashed holder (older than 30s) using

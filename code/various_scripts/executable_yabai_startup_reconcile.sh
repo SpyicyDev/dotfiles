@@ -1,7 +1,12 @@
 #!/bin/bash
 
 # Startup reconciliation -- fixes pinned apps landing on the WRONG space, or landing
-# FLOATING, after login or a yabai restart.
+# FLOATING, after login or a yabai restart -- plus a deferred FLOAT SWEEP that keeps
+# retrying the un-float, event-driven, for as long as a pinned window stays floating.
+#
+#   yabai_startup_reconcile.sh [startup]   # poll from yabairc (backgrounded)
+#   yabai_startup_reconcile.sh float       # one un-float pass, from signals
+#   yabai_startup_reconcile.sh float --dry-run
 #
 # 1. WRONG SPACE. At login, macOS restores app windows around the same time yabai
 # starts. Windows created before yabai registered its signals get no window_created/
@@ -14,27 +19,46 @@
 # 2. FLOATING. yabai classifies every window it finds at startup BEFORE the config
 # runs (main.c: window_manager_begin() precedes exec_config_file()), so no rule can
 # influence that pass. A window it momentarily cannot move is flagged FLOAT for good
-# (window_manager.c: `if (... || !window_can_move(window) || ...) window_set_flag(
-# window, WINDOW_FLOAT)`) -- i.e. any window whose AX position attribute is not
-# settable at the instant yabai looks, which a window still settling after a restore
-# can be. Nothing clears the flag afterwards: `rule --apply` re-pins the SPACE but
-# leaves the window floating, so it sits unmanaged on that space indefinitely.
-# Observed 2026-08-21: Claude floating on `ai` after a yabai restart, while ChatGPT
-# on the same space tiled normally. `manage=on` on the space= rules does NOT fix
-# this -- see the comment on unfloat_pins() for why it makes things worse.
+# (window_manager.c:1505-1511: `sticky || !can_move || !is_standard || !level_is_
+# standard || (!can_resize && undersized)` -> WINDOW_FLOAT) -- i.e. any window whose
+# AX position attribute is not settable at the instant yabai looks, which a window
+# still settling after a restore (or an Electron app whose AX is slow after wake) can
+# be. Nothing clears the flag afterwards: `rule --apply` re-pins the SPACE but leaves
+# the window floating, so it sits unmanaged on that space indefinitely. Observed
+# 2026-08-21 and again 2026-08-28 (Claude floating on `ai` for 34h) while ChatGPT on
+# the same space tiled normally. `manage=on` on the space= rules does NOT fix this --
+# see the comment on unfloat_pins() for why it makes things worse.
 #
-# This POLLS UNTIL STABLE: re-load the scripting addition once, then repeatedly
-# re-apply the space= rules, re-pin Arc, and un-float any misclassified pinned window
-# until every RUNNING pinned app is home AND tiled (or a hard time cap). Polling
-# self-truncates on a fast login (exits in a couple of seconds) and self-extends for
-# slow-launching apps (Electron: ChatGPT, Notion Calendar, Messages) -- more robust
-# than a fixed ramp, which could miss an app that finishes restoring after the last
-# pass. The float pass needs the retry too: an un-float attempted while the window
-# still cannot be moved is silently dropped by yabai (window_manager.c:2187-2193).
+# WHY A STARTUP POLL ALONE CANNOT FIX (2): yabai CACHES can-move/role/subrole at
+# window creation and refreshes them only on minimize/deminimize/native-fullscreen
+# transitions (event_loop.c). `--toggle float` (force=false) is silently dropped --
+# exit 0, no error -- while the CACHED can_move is false (window_manager.c:2185-2192).
+# So ten retries over 20s against a cache that never refreshes are ten identical
+# drops, and the 2026-08-28 incident was exactly that: 11 passes (MAX_ATTEMPTS + 1,
+# counted from the arcSync launches in `log show`), gave up, and nothing on the
+# machine ever tried again. The startup poll therefore HANDS OFF to the float sweep:
+#
+# 3. FLOAT SWEEP (`float` mode). yabairc runs this from `space_changed` and
+# `window_deminimized`. It does ONE thing -- unfloat_pins() over the current state --
+# with no `rule --apply`, no arcSync, no sudo, and exits in one query + one jq when
+# nothing pinned is floating (the common path). Landing on the window's home space
+# is the no-flip direct route; a deminimize is the one event that refreshes the
+# cached flags. It keeps retrying, bounded by a per-window backoff memo, for as long
+# as the window floats, and LOGS every attempt with the window's pre/post state so
+# the next incident can be explained (this one could not be: there was no log).
+#
+# STARTUP mode POLLS UNTIL STABLE: re-load the scripting addition once, then
+# repeatedly re-apply the space= rules, re-pin Arc, and un-float any misclassified
+# pinned window until every RUNNING pinned app is home AND tiled (or a hard time cap).
+# Polling self-truncates on a fast login (exits in a couple of seconds) and
+# self-extends for slow-launching apps (Electron: ChatGPT, Notion Calendar, Messages).
 #
 # Run BACKGROUNDED from yabairc (`"$YABAI_STARTUP_RECONCILE" &`) so it NEVER blocks
-# yabai startup. Single-flighted (mkdir lock, like yabai_heal.sh) so repeated
-# restarts don't stack overlapping polls. Every action is idempotent.
+# yabai startup. Single-flighted per mode (mkdir locks under $YABAI_STATE_DIR) so
+# repeated restarts don't stack overlapping polls and a sweep never overlaps a live
+# poll. Every action is idempotent.
+#
+# Log: ~/Library/Logs/yabai/reconcile.log. State: ~/Library/Caches/yabai/.
 
 set -u
 
@@ -42,63 +66,97 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:
 export USER="${USER:-$(id -un)}"
 HS="/opt/homebrew/bin/hs"
 
+MODE="${1:-startup}"
+DRY_RUN=0
+[ "${2:-}" = "--dry-run" ] && DRY_RUN=1
+case "$MODE" in startup|float) ;; *) echo "usage: $0 [startup|float [--dry-run]]" >&2; exit 64 ;; esac
+
 CAP_SECONDS="${YABAI_RECONCILE_CAP:-90}"   # hard stop so a never-launching app can't poll forever
 
 # Required siblings, resolved by directory rather than $HOME so a chezmoi checkout or
-# a test copy runs against its own copies: yabai_common.sh (the agent app list and the
-# pinned-home map) and yabai_float_borders.sh (called after an un-float).
+# a test copy runs against its own copies: yabai_common.sh (the agent app list, the
+# pinned-home map, the eligibility filter, the state/log dirs) and
+# yabai_float_borders.sh (called after an un-float).
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/yabai_common.sh"
-LOCK="${TMPDIR:-/tmp}/yabai_startup_reconcile.lock"
 
-# Single-flight (mirrors yabai_heal.sh): one reconcile at a time. A concurrent
-# (re)start drops -- the in-flight poll already re-applies against current state.
-# Recover a lock orphaned by a crash, older than the cap + margin so a live poll is
-# never reaped.
-if ! mkdir "$LOCK" 2>/dev/null; then
+LOGN=reconcile
+STARTUP_LOCK="$YABAI_STATE_DIR/startup_reconcile.lock"
+SWEEP_LOCK="$YABAI_STATE_DIR/float_sweep.lock"
+MEMO="$YABAI_STATE_DIR/float_memo"            # lines: <window id> <consecutive fails> <epoch of last fail>
+KEEP_FLOAT="$YABAI_STATE_DIR/keep-float"      # one file per window id the user floated on purpose
+mkdir -p "$YABAI_STATE_DIR" 2>/dev/null
+
+# Seconds since a lock was last touched. A live startup poll touches $LOCK/alive
+# every pass, so "old" here means "orphaned" and never "busy".
+lock_age() {
+  local now m
   now=$(date +%s)
-  mtime=$(stat -f %m "$LOCK" 2>/dev/null || printf '%s' "$now")
-  if [ "$((now - mtime))" -ge "$((CAP_SECONDS + 30))" ]; then
-    rmdir "$LOCK" 2>/dev/null || true
-    mkdir "$LOCK" 2>/dev/null || exit 0
-  else
-    exit 0
+  m=$(stat -f %m "$1/alive" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '%s' "$now")
+  printf '%s' "$((now - m))"
+}
+
+if [ "$MODE" = float ]; then
+  # Never two writers. Defer to a LIVE startup poll only; an orphan (holder gone
+  # without its EXIT trap -- SIGKILL on a fast double restart) used to disable this
+  # sweep for the whole login session, silently, so it is reaped by age instead.
+  if [ -d "$STARTUP_LOCK" ]; then
+    [ "$(lock_age "$STARTUP_LOCK")" -lt 30 ] && exit 0
+    rm -rf "$STARTUP_LOCK" 2>/dev/null
+    yabai_log $LOGN "float reaped-orphan-startup-lock"
   fi
+  if ! mkdir "$SWEEP_LOCK" 2>/dev/null; then
+    [ "$(lock_age "$SWEEP_LOCK")" -ge 30 ] || exit 0
+    rm -rf "$SWEEP_LOCK" 2>/dev/null
+    mkdir "$SWEEP_LOCK" 2>/dev/null || exit 0
+  fi
+  LOCK="$SWEEP_LOCK"
+else
+  yabai_log_trim $LOGN
+  # Startup single-flight. A second restart while a poll from the PREVIOUS yabai is
+  # still running must NOT be dropped (the old poll is repairing against a daemon
+  # that no longer exists -- and "restart it again" is the natural human reaction to
+  # "it didn't fix it"). Same yabai + live holder -> let it run; otherwise ask the
+  # holder to stop between passes and take over.
+  if ! mkdir "$STARTUP_LOCK" 2>/dev/null; then
+    hp=$(cat "$STARTUP_LOCK/pid" 2>/dev/null || true)
+    hy=$(cat "$STARTUP_LOCK/yabai_pid" 2>/dev/null || true)
+    if [ -n "$hp" ] && kill -0 "$hp" 2>/dev/null && [ "$hy" = "$(pgrep -x yabai | head -n 1)" ]; then
+      exit 0
+    fi
+    : >"$STARTUP_LOCK/stop" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8; do [ -d "$STARTUP_LOCK" ] || break; sleep 0.25; done
+    rm -rf "$STARTUP_LOCK" 2>/dev/null
+    mkdir "$STARTUP_LOCK" 2>/dev/null || exit 0
+    yabai_log $LOGN "startup preempted-previous-holder pid=${hp:-?} yabai_pid=${hy:-?}"
+  fi
+  LOCK="$STARTUP_LOCK"
+  echo $$ >"$LOCK/pid"
+  pgrep -x yabai | head -n 1 >"$LOCK/yabai_pid"
+  # Post-restart float state is never the user's choice (yabai re-classified from
+  # scratch), and CGWindowIDs are session-scoped, so stale markers only ever block
+  # a repair. Same for the backoff memo.
+  rm -rf "$KEEP_FLOAT" "$MEMO" 2>/dev/null
 fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT
 
 # The pinned app -> home space map (JSON) comes from yabai_common.sh, which is where
 # this codebase keeps lists that more than one script needs. Computed ONCE at startup,
 # not per pass: it is a pure function of two constants, and the poll can run ~45 times.
 PIN_HOMES=$(yabai_home_map_json)
 
-# A window this script may un-float. yabai floats plenty of windows ON PURPOSE and
-# every one of them must be left alone -- a pinned app's non-standard second window
-# (settings sheet, save panel, palette), a sticky window, a scratchpad window, a
-# minimized or hidden one (which also reports can-move=false, so an un-float would be
-# dropped anyway), and a native-fullscreen window. This mirrors the eligibility filter
-# yabai_workspace_refresh.sh's space_for_app() already applies for the same reason.
-#
-# The filter is shared with pins_settled() BY CONSTRUCTION: if a window is ineligible
-# here it must not count as unsettled there either, or the poll spins to the cap every
-# 2s on a window this function will never touch.
-#
-# Deliberately NOT filtered on `can-move`: a window yabai cannot move right now is the
-# transient case this whole script exists for (that is what makes yabai flag FLOAT in
-# the first place), and it usually becomes movable a second later. Such a window stays
-# a candidate, its un-float is silently dropped, the verify catches that, and the poll
-# retries it -- bounded by MAX_ATTEMPTS so it cannot hold the loop open forever.
-JQ_ELIGIBLE='
-  select(.subrole == "AXStandardWindow")
-  | select(."root-window")
-  | select(."is-minimized" == false and ."is-hidden" == false)
-  | select(."is-sticky" == false and ."is-native-fullscreen" == false)
-  | select((.scratchpad // "") == "")'
-
-# ~20s of retries at the loop's 2s cadence -- long enough for a slow Electron window to
-# become movable, short enough that a permanently stuck one does not cost the full cap.
+# Startup-mode retry budget per window: ~20s at the loop's 2s cadence. Long enough
+# for a slow Electron window to become movable, short enough that a permanently
+# stuck one does not cost the full cap -- the float sweep takes it from there.
 MAX_ATTEMPTS=10
+
+# Float-mode backoff: after this many consecutive dropped un-floats, skip the window
+# for BACKOFF_SECONDS unless the triggering event is one that refreshes yabai's cache
+# (a deminimize). Without this a window stuck for good would cost a toggle + a query
+# on every space switch, forever.
+MAX_FAILS=3
+BACKOFF_SECONDS=600
 
 # Space index -> label, plus the label of the FOCUSED space. Focused, not merely
 # visible: yabai re-tiles an un-floated window onto space_manager_active_space(),
@@ -114,11 +172,12 @@ JQ_SPACE_MAPS='
 #
 # The float half is NOT re-derived here. unfloat_pins() runs first each pass and leaves
 # PENDING_FLOATS = how many windows it still intends to retry; anything it decided to
-# skip for good (ineligible, or floating on a bsp space it must not rebuild) is
-# deliberately NOT counted. Deriving that twice is how the predicate and the repair
-# drift apart, and a window the repair will never touch keeping the poll hot -- and
-# `rule --apply` + arcSync firing every 2s -- for the whole cap is the expensive kind
-# of drift. One decision point, in unfloat_pins; this just reads the tally.
+# skip for good (ineligible, floating on a bsp space it must not rebuild, or past its
+# attempt budget -- handed to the float sweep) is deliberately NOT counted. Deriving
+# that twice is how the predicate and the repair drift apart, and a window the repair
+# will never touch keeping the poll hot -- and `rule --apply` + arcSync firing every 2s
+# -- for the whole cap is the expensive kind of drift. One decision point, in
+# unfloat_pins; this just reads the tally. GAVE_UP is logged so the exit is honest.
 #
 # Takes the windows/spaces blobs so the poll queries yabai once per pass rather than
 # once per predicate.
@@ -144,6 +203,32 @@ pins_settled() {
   [ "${off:-1}" = "0" ]
 }
 
+# The fields the next incident will need: which of yabai's float predicates the
+# window was failing (cached can-move, subrole, level, has-ax-reference).
+pre_state() {
+  printf '%s' "$1" | jq -c --argjson id "$2" '
+    .[] | select(.id == $id)
+    | { app, cm: ."can-move", cr: ."can-resize", sr: .subrole, lvl: .level,
+        ax: ."has-ax-reference", f: ."is-floating", sp: .space }' 2>/dev/null
+}
+
+# Label, layout and display of the space that is focused RIGHT NOW (tab-separated).
+# Re-read immediately before each toggle: the tile target is evaluated inside yabai
+# when the message arrives, and a space switch, a transient `space --focus` from
+# yabai_reorder_spaces.sh / yabai_heal.sh, or a second display can all change it
+# between the pass's snapshot and the toggle.
+focused_now() {
+  yabai -m query --spaces --space 2>/dev/null \
+    | jq -r '"\(.label // "")\t\(.type // "")\t\(.display // "")"' 2>/dev/null
+}
+
+memo_get() { awk -v i="$1" '$1 == i { print $2, $3 }' "$MEMO" 2>/dev/null; }
+memo_set() {
+  { grep -v "^$1 " "$MEMO" 2>/dev/null
+    [ "$2" -gt 0 ] && echo "$1 $2 $(date +%s)"; } >"$MEMO.tmp" 2>/dev/null
+  mv "$MEMO.tmp" "$MEMO" 2>/dev/null || true
+}
+
 # Re-manage pinned windows that yabai misclassified as floating (see failure mode 2
 # in the header). `--toggle float` is the only lever, and it comes with a trap:
 #
@@ -164,7 +249,20 @@ pins_settled() {
 # WezTerm's view at stack-index 1/2) came back correct -- Todoist alone on `todo`,
 # WezTerm alone on `terminal` -- by flipping `todo` ALONE, addressed by label.
 #
-# The obvious alternative -- bounce the window through another space and back, so
+# Two routes, decided per window from the focus state read immediately before acting:
+#   direct  home IS the focused space (same display, no heal in flight): the toggle
+#           tiles it correctly by itself; a flip there would only churn the view the
+#           user is looking at.
+#   flip    home is a background STACK space AND the active space is also a stack:
+#           toggle, then rebuild home. The transient registration in the active view
+#           is frame-invisible on a stack (every node shares one frame); on a bsp
+#           active space it would visibly re-split the user's tiles, so that case is
+#           skipped and left for the direct route (yabai_skhd_mode.sh can make a
+#           space bsp; every space here is stack by default).
+#   skip    home is bsp and not focused: a flip re-derives a bsp tree from scratch,
+#           losing hand-tuned splits -- left floating, the benign failure.
+#
+# The obvious alternative -- bouncing the window through another space and back, so
 # send_window_to_space() re-tiles it on the destination -- was implemented first and is
 # WRONG here. It needs the scripting addition, which may not be loaded yet at login
 # (`window --space` then fails SILENTLY and exit-0, so the failure is undetectable and
@@ -176,77 +274,135 @@ pins_settled() {
 # yabai_workspace_refresh.sh's label-follows-app logic can see and re-label it. The
 # flip touches no window and needs no scripting addition.
 #
-# It costs one thing: a flip re-derives a bsp tree from scratch, losing hand-tuned
-# splits. So a window whose home space is bsp AND not the active space is SKIPPED
-# rather than repaired -- left floating, which is the benign failure. Every space in
-# this config is `stack` (yabairc sets `layout stack`), so that path is currently dead.
-#
 # This is also why `manage=on` on the yabairc space= rules is the wrong fix: it does
 # suppress the misclassification for windows created while yabai is already running
 # (window_manager.c:1498 skips the FLOAT classification for WINDOW_RULE_MANAGED), but
 # it cannot help at startup (rules do not exist yet during window discovery), and it
 # makes `rule --apply` -- which yabairc fires at startup and on every
 # application_launched -- take the un-float path above from whatever space happens to
-# be active. That trades a floating window for a corrupted cross-space stack.
+# be active. That trades a floating window for a corrupted cross-space stack. And a
+# one-off `rule --apply app=^X$ manage=on` as an escalation is worse still: it is
+# per-APP, sets WINDOW_RULE_MANAGED before the eligibility check, and force-tiles
+# every root window of the app (helpers included) into the ACTIVE view.
+#
+# Manual escape hatch for a window whose cached flags never refresh (never
+# minimized): `yabai -m window <managed sibling id> --stack <stuck id>` -- SIBLING
+# FIRST. It clears FLOAT without the can-move gate and joins the sibling's view on the
+# home space regardless of the active space (window_manager.c:1804-1816). Not
+# automated: it needs a managed sibling on the same space and changes stack order.
 unfloat_pins() {
-  local floaters id label layout focused attempts changed=0 pending=0
+  # shellcheck disable=SC2034  # snap_focused is the pass-time value; routes use focused_now
+  local floaters id label layout snap_focused disp attempts changed=0 pending=0
+  local fails when now fl ft fd route cur post
 
   PENDING_FLOATS=0
   [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 0
 
   # id, home LABEL (never an index -- indices renumber, and yabai_workspace_refresh.sh
   # / yabai_reorder_spaces.sh / yabai_displays.sh can all renumber them mid-poll; the
-  # siblings compare by label for exactly this reason), the home space's layout, and
-  # whether that space is the focused one.
-  floaters=$(jq -r -n --argjson w "$1" --argjson s "$2" --argjson home "$PIN_HOMES" "
+  # siblings compare by label for exactly this reason), the home space's layout,
+  # whether that space is the focused one, and its display. App names are never a
+  # positional field here (three pinned apps have spaces in theirs).
+  #
+  # Float mode only considers a floater already ON its home space: it runs no
+  # `rule --apply`, so a pinned window floating elsewhere is either the user's own
+  # (hyper+t is only allowed off home) or one the next application_launched will
+  # re-home first.
+  floaters=$(jq -r -n --argjson w "$1" --argjson s "$2" --argjson home "$PIN_HOMES" \
+      --argjson homeonly "$([ "$MODE" = float ] && echo true || echo false)" "
     $JQ_SPACE_MAPS
     | (\$s | map({ (.index|tostring): (.type // \"\") }) | add) as \$type
+    | (\$s | map({ (.index|tostring): (.display // 0) }) | add) as \$disp
     | \$w[]
     | select(\$home[.app] != null)
     | select(.\"is-floating\")
-    | $JQ_ELIGIBLE
-    | { l: (\$lbl[(.space|tostring)] // \"\"), t: (\$type[(.space|tostring)] // \"\") }
-      as \$sp
+    | $YABAI_JQ_PIN_ELIGIBLE
+    | { l: (\$lbl[(.space|tostring)] // \"\"), t: (\$type[(.space|tostring)] // \"\"),
+        d: (\$disp[(.space|tostring)] // 0) } as \$sp
     | select(\$sp.l != \"\")
-    | \"\(.id) \(\$sp.l) \(\$sp.t) \(if \$sp.l == \$focused then 1 else 0 end)\"
+    | select((\$homeonly | not) or \$sp.l == \$home[.app])
+    | \"\(.id) \(\$sp.l) \(\$sp.t) \(if \$sp.l == \$focused then 1 else 0 end) \(\$sp.d)\"
     " 2>/dev/null) || return 0
   [ -n "$floaters" ] || return 0
 
-  while read -r id label layout focused; do
+  now=$(date +%s)
+  while read -r id label layout snap_focused disp; do
     [ -n "$id" ] && [ -n "$label" ] || continue
 
-    # Decide repairability BEFORE touching anything: un-floating a window we then
-    # cannot re-home would leave the corruption instead of the float.
-    [ "$focused" = "1" ] || [ "$layout" = "stack" ] || continue
+    # The user's own float (hyper+t on a pinned app off home, later re-homed).
+    [ -e "$KEEP_FLOAT/$id" ] && continue
 
-    # Give up on a window that keeps refusing, so one stubborn case cannot keep the
-    # poll hot -- and the active space thrashing -- for the whole 90s cap.
-    attempts="ATTEMPT_${id}"
-    eval "attempts=\${$attempts:-0}"
-    [ "$attempts" -ge "$MAX_ATTEMPTS" ] && continue
-    eval "ATTEMPT_${id}=$((attempts + 1))"
+    if [ "$MODE" = startup ]; then
+      # Give up on a window that keeps refusing, so one stubborn case cannot keep the
+      # poll hot -- and the active space thrashing -- for the whole 90s cap. The float
+      # sweep owns it from here; say so once, with the state that explains the drops.
+      attempts="ATTEMPT_${id}"
+      eval "attempts=\${$attempts:-0}"
+      if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+        if [ "$attempts" -eq "$MAX_ATTEMPTS" ]; then
+          yabai_log $LOGN "startup gave-up id=$id home=$label attempts=$attempts pre=$(pre_state "$1" "$id") -> float sweep takes over"
+          eval "ATTEMPT_${id}=$((attempts + 1))"
+          GAVE_UP=$((GAVE_UP + 1))
+        fi
+        continue
+      fi
+      eval "ATTEMPT_${id}=$((attempts + 1))"
+    else
+      attempts=0
+      read -r fails when <<<"$(memo_get "$id")"
+      fails=${fails:-0}; when=${when:-0}
+      if [ "$fails" -ge "$MAX_FAILS" ] && [ $((now - when)) -lt "$BACKOFF_SECONDS" ] \
+         && [ "${YABAI_EVENT:-}" != window_deminimized ]; then
+        continue
+      fi
+    fi
+
+    # Route, from the focus state as of right now (see focused_now). During a heal
+    # (refresh/reorder focusing spaces transiently) never trust "focused": flip.
+    IFS=$'\t' read -r fl ft fd <<<"$(focused_now)"
+    if [ "$fl" = "$label" ] && [ "$fd" = "$disp" ] && [ ! -d "$YABAI_STATE_DIR/heal.lock" ]; then
+      route=direct
+    elif [ "$layout" = stack ] && [ "$ft" = stack ]; then
+      route=flip
+    else
+      yabai_log $LOGN "$MODE skip id=$id home=$label reason=$([ "$layout" = stack ] && echo active-bsp || echo home-bsp) focused=$fl"
+      continue
+    fi
+
+    if [ "$DRY_RUN" = 1 ]; then
+      echo "would unfloat id=$id home=$label route=$route pre=$(pre_state "$1" "$id")"
+      continue
+    fi
+
+    # Act on the window's state as of NOW, not the pass's snapshot: the user may have
+    # hyper+t'd it back in the meantime, and a toggle then would FLOAT a tiled window.
+    cur=$(yabai -m query --windows --window "$id" 2>/dev/null | jq -r '."is-floating"' 2>/dev/null)
+    [ "$cur" = "true" ] || { [ "$cur" = "false" ] && memo_set "$id" 0; continue; }
 
     yabai -m window "$id" --toggle float >/dev/null 2>&1 || { pending=$((pending + 1)); continue; }
-    # An un-float attempted too early is dropped SILENTLY and exit-0 (the force=false
-    # path returns without a daemon_fail), so the exit status proves nothing -- and a
-    # `--toggle` acts on a snapshot that may be stale by now, e.g. because the user
-    # just pressed hyper+t. Confirm the post-state, and undo an accidental float.
-    case "$(yabai -m query --windows --window "$id" 2>/dev/null \
-            | jq -r '."is-floating"' 2>/dev/null)" in
+    # An un-float attempted while the cached can-move is false is dropped SILENTLY
+    # and exit-0 (the force=false path returns without a daemon_fail), so the exit
+    # status proves nothing. Confirm the post-state.
+    post=$(yabai -m query --windows --window "$id" 2>/dev/null | jq -r '."is-floating"' 2>/dev/null)
+    yabai_log $LOGN "$MODE unfloat id=$id home=$label route=$route attempt=$((attempts + 1)) ev=${YABAI_EVENT:-} pre=$(pre_state "$1" "$id") post_floating=${post:-?}"
+    case "$post" in
       false) : ;;
-      true)  yabai -m window "$id" --toggle float >/dev/null 2>&1 || true
+      *)     [ "$MODE" = float ] && memo_set "$id" $((fails + 1))
              pending=$((pending + 1)); continue ;;
-      *)     pending=$((pending + 1)); continue ;;
     esac
+    memo_set "$id" 0
     changed=1
 
-    # Rebuild the home view unless the un-float already landed there (home == the
-    # focused space => yabai tiled it correctly and a flip would only churn the view
-    # the user is looking at). Cheap and idempotent on a stack space; a bsp home space
-    # never reaches here -- it was skipped above.
-    [ "$focused" = "1" ] && continue
-    yabai -m space "$label" --layout bsp   >/dev/null 2>&1 || continue
-    yabai -m space "$label" --layout stack >/dev/null 2>&1 || true
+    [ "$route" = direct ] && continue
+    # Rebuild the home view. Never die between the two flips (a startup takeover
+    # sends nothing, but a stray TERM here would strand the space in bsp).
+    trap '' TERM
+    if yabai -m space "$label" --layout bsp >/dev/null 2>&1; then
+      yabai -m space "$label" --layout stack >/dev/null 2>&1 || yabai_log $LOGN "$MODE flip-FAILED id=$id home=$label (space left bsp!)"
+    else
+      yabai_log $LOGN "$MODE flip-FAILED id=$id home=$label (bsp step)"
+    fi
+    trap - TERM
   done <<EOF
 $floaters
 EOF
@@ -265,17 +421,42 @@ EOF
   "$SCRIPT_DIR/yabai_float_borders.sh" sync >/dev/null 2>&1 || true
 }
 
+# ---------------------------------------------------------------------------------
+if [ "$MODE" = float ]; then
+  # Common path: nothing pinned and eligible is floating -> one query, one jq, exit.
+  win=$(yabai -m query --windows 2>/dev/null) || exit 0
+  printf '%s' "$win" | jq -e --argjson home "$PIN_HOMES" "
+      any(.[]; .\"is-floating\" and \$home[.app] != null and (($YABAI_JQ_PIN_ELIGIBLE) | true))
+    " >/dev/null 2>&1 || exit 0
+  spaces=$(yabai_spaces_json) || { yabai_log $LOGN "float spaces-query-failed ev=${YABAI_EVENT:-}"; exit 0; }
+  GAVE_UP=0
+  unfloat_pins "$win" "$spaces"
+  exit 0
+fi
+
 # Ensure the scripting addition is loaded (window->space moves need it). `-n` so a
 # stale NOPASSWD hash fast-fails instead of ever waiting on a prompt in this
 # TTY-less context.
-sudo -n yabai --load-sa >/dev/null 2>&1 || true
+if sudo -n yabai --load-sa >/dev/null 2>&1; then
+  yabai_log $LOGN "startup begin sa=ok yabai_pid=$(cat "$LOCK/yabai_pid" 2>/dev/null)"
+else
+  yabai_log $LOGN "startup begin sa=FAIL yabai_pid=$(cat "$LOCK/yabai_pid" 2>/dev/null)"
+fi
 
 # Re-assert pins until everything restored has landed home and tiled, or we hit the
 # cap. unfloat_pins runs AFTER `rule --apply` each pass so a window is already on its
 # home space before it is un-floated -- the space= move re-tiles on the destination
 # by itself, leaving only genuine misclassifications for unfloat_pins to repair.
-deadline=$(( $(date +%s) + CAP_SECONDS ))
+t0=$(date +%s)
+deadline=$((t0 + CAP_SECONDS))
+passes=0
+GAVE_UP=0
+reason=cap
 while :; do
+  touch "$LOCK/alive" 2>/dev/null
+  [ -e "$LOCK/stop" ] && { reason=preempted; break; }
+  passes=$((passes + 1))
+
   yabai -m rule --apply >/dev/null 2>&1 || true
   "$HS" -c "arcSync()" >/dev/null 2>&1 || true
 
@@ -291,7 +472,8 @@ while :; do
   # unfloat_pins mutates what pins_settled reads, so re-read rather than reuse the
   # blobs above -- otherwise a pass that just healed everything still reports unsettled
   # and the poll always costs one extra 2s sleep.
-  pins_settled "$(yabai -m query --windows 2>/dev/null)" "$spaces" && break
+  pins_settled "$(yabai -m query --windows 2>/dev/null)" "$spaces" && { reason=settled; break; }
   [ "$(date +%s)" -ge "$deadline" ] && break
   sleep 2
 done
+yabai_log $LOGN "startup end passes=$passes elapsed=$(( $(date +%s) - t0 ))s reason=$reason pending=${PENDING_FLOATS:-0} gave_up=$GAVE_UP"

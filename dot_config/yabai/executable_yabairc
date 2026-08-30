@@ -125,6 +125,19 @@ yabai -m rule --apply
 # BACKGROUNDED (&) so it never blocks yabai startup; idempotent once windows are home.
 "$YABAI_STARTUP_RECONCILE" &
 
+# Deferred float sweep (README: "Startup reconciliation"). The startup poll gives up
+# on a window yabai cannot un-float within ~20s -- yabai caches can-move at window
+# creation and `--toggle float` is silently dropped while that cache says false --
+# and before this NOTHING ever retried (Claude floated on `ai` for 34h, 2026-08-28).
+# Re-run only the un-float pass at two cheap moments: a space switch (landing on the
+# window's home space is the no-flip route; a background stack home gets the
+# verified bsp->stack rebuild) and a deminimize (the one event that refreshes
+# yabai's cached flags). Common path is one query + one jq, then exit. Own lock,
+# never overlaps a live startup poll, never touches focus, no rule --apply/arcSync.
+# Log: ~/Library/Logs/yabai/reconcile.log.
+yabai -m signal --add event=space_changed      label=float_sweep_space_changed action="YABAI_EVENT=space_changed '$YABAI_STARTUP_RECONCILE' float"
+yabai -m signal --add event=window_deminimized label=float_sweep_deminimized   action="YABAI_EVENT=window_deminimized '$YABAI_STARTUP_RECONCILE' float"
+
 # Border any floating windows that already exist at startup (e.g. a manage=off app
 # that macOS restored). Backgrounded; no-op if nothing floats / borders absent.
 "$YABAI_FLOAT_BORDERS" sync &

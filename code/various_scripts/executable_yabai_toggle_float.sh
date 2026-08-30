@@ -76,6 +76,24 @@ fi
 
 yabai -m window --toggle float >/dev/null 2>&1 || exit 0
 
+# Record a DELIBERATE float of a pinned app so the automated un-float in
+# yabai_startup_reconcile.sh (its `float` sweep) never fights it. Reaching here
+# with a pinned app that was tiled means it is OFF its home space (the guard above
+# exits otherwise); if a later `rule --apply` re-homes it while still floating, the
+# sweep would otherwise "repair" the user's own float. The marker is by window id;
+# cleared when the same window is un-floated here, and the whole dir is purged by
+# the startup poll (a float that survives a yabai restart is never a user choice --
+# yabai re-classifies from scratch). See yabai_common.sh for why the dir is fixed.
+wid=$(printf '%s' "$info" | jq -r '.id // empty' 2>/dev/null)
+if [ -n "$home" ] && [ -n "$wid" ]; then
+  keep="$YABAI_STATE_DIR/keep-float"
+  if [ "$floating" != "true" ]; then
+    mkdir -p "$keep" 2>/dev/null && : >"$keep/$wid" 2>/dev/null
+  else
+    rm -f "$keep/$wid" 2>/dev/null
+  fi
+fi
+
 # A float just flipped, but --toggle float emits no window_created/destroyed signal,
 # so reconcile the floating-window borders here (no-op if borders isn't installed).
 "$HOME/code/various_scripts/yabai_float_borders.sh" sync >/dev/null 2>&1 || true

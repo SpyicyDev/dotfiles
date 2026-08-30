@@ -53,6 +53,51 @@ YABAI_AGENT_APPS_RE="^($(printf '%s' "$YABAI_AGENT_APPS" | sed 's/[()]/\\&/g'))$
 # `case` copies; folding those in is a worthwhile follow-up, not a silent one.
 YABAI_PINNED_HOMES="wezterm-gui:terminal|WezTerm:terminal|Todoist:todo|Granola:schedule|Spark Mail:mail|Notion Calendar:calendar|Messages:messages|ChatGPT:ai|Claude:ai"
 
+# --- shared state + logs ---------------------------------------------------------
+# One FIXED directory for every lock, marker and memo the yabai_* scripts share.
+# NOT `${TMPDIR:-/tmp}`: the scripts are launched from three different parents
+# with three different environments -- yabai's signal actions and yabairc inherit
+# yabai's TMPDIR (/var/folders/.../T/), skhd's keybind actions have NO TMPDIR
+# (verified 2026-08-29: `ps -Eww -p $(pgrep -x skhd)`), and a Raycast/terminal run
+# has the user's. A marker written under one and read under another is simply never
+# seen, and a lock that lives in two places single-flights nothing.
+: "${YABAI_STATE_DIR:=$HOME/Library/Caches/yabai}"
+: "${YABAI_LOG_DIR:=$HOME/Library/Logs/yabai}"
+
+# yabai_log <name> <message>: append one timestamped line to $YABAI_LOG_DIR/<name>.log.
+# Never fails the caller (a signal handler must not die on a full disk). Pair with
+# yabai_log_trim from a rare path (startup) to keep a chatty log bounded.
+yabai_log() {
+  local f="$YABAI_LOG_DIR/$1.log"
+  mkdir -p "$YABAI_LOG_DIR" 2>/dev/null || return 0
+  printf '%s pid=%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$" "$2" >>"$f" 2>/dev/null || true
+}
+yabai_log_trim() {
+  local f="$YABAI_LOG_DIR/$1.log" size
+  [ -f "$f" ] || return 0
+  size=$(stat -f %z "$f" 2>/dev/null) || return 0
+  [ "${size:-0}" -gt 204800 ] || return 0
+  tail -n 2000 "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || true
+}
+
+# A pinned window an automated un-float may touch -- the SINGLE copy of that filter
+# (yabai_startup_reconcile.sh, both its startup poll and its float sweep). yabai
+# floats plenty of windows ON PURPOSE and every one of them must be left alone: a
+# pinned app's non-standard second window (settings sheet, save panel, palette), a
+# sticky window, a scratchpad window, a minimized/hidden one (also can-move=false,
+# so an un-float would be dropped anyway), a native-fullscreen window, and a window
+# that cannot be resized (yabai floats `!can_resize && undersized` deliberately,
+# window_manager.c:1510). Deliberately NOT filtered on `can-move`: a window yabai
+# cannot move right now is the transient case the repair exists for.
+# shellcheck disable=SC2034
+YABAI_JQ_PIN_ELIGIBLE='
+  select(.subrole == "AXStandardWindow")
+  | select(."root-window")
+  | select(."can-resize" != false)
+  | select(."is-minimized" == false and ."is-hidden" == false)
+  | select(."is-sticky" == false and ."is-native-fullscreen" == false)
+  | select((.scratchpad // "") == "")'
+
 # The same map as a JSON object, with the coding-agent apps folded in, for the jq
 # consumers. Emits nothing on failure so callers can test for an empty result.
 yabai_home_map_json() {

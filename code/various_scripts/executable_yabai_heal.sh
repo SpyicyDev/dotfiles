@@ -18,7 +18,14 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin:
 export USER="${USER:-$(id -un)}"
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-LOCK="${TMPDIR:-/tmp}/yabai_heal.lock"
+# shellcheck source=/dev/null  # required sibling: the shared state dir
+. "$SCRIPT_DIR/yabai_common.sh"
+# In the shared state dir (not ${TMPDIR:-/tmp}, see yabai_common.sh) so the float
+# sweep in yabai_startup_reconcile.sh can SEE a heal in progress: a refresh/reorder
+# focuses spaces transiently, and an un-float landing during one must take the
+# view-rebuild route rather than trust the focused space.
+mkdir -p "$YABAI_STATE_DIR" 2>/dev/null
+LOCK="$YABAI_STATE_DIR/heal.lock"
 SETTLE="${YABAI_HEAL_SETTLE:-0.4}"
 
 # Single-flight. Recover a lock orphaned by a crashed holder (older than 30s) using
