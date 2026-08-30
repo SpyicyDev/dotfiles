@@ -61,6 +61,37 @@ set -g @plugin 'tmux-plugins/tmux-sensible'
 set -g @plugin 'christoomey/vim-tmux-navigator'
 set -g @plugin 'tmux-plugins/tmux-yank'
 
+# ── tmux-thumbs: vimium-style runes over the focused pane ───────────────
+# Complements WezTerm's CMD+SHIFT+Y / CMD+SHIFT+U rather than replacing them.
+# WezTerm's version labels every pane at once and works inside full-screen
+# TUIs, but it scans RENDERED ROWS -- so a URL that wraps at a narrow pane's
+# right edge is two unrelated lines to it and only the first half matches, and
+# it cannot see history that has scrolled off. thumbs reads the pane buffer
+# instead, so it handles wrapped URLs and the full 50k-line scrollback, at the
+# cost of only ever seeing the one focused pane.
+set -g @plugin 'fcsonline/tmux-thumbs'
+
+# prefix+Space (was next-layout, unused). Lowercase rune copies; UPPERCASE rune
+# opens -- the shift goes on the RUNE, not the trigger, which is the only place
+# it can go: see the C-Space note below.
+set -g @thumbs-key Space
+set -g @thumbs-command 'echo -n "{}" | pbcopy && tmux set-buffer -- "{}" && tmux display-message "copied {}"'
+set -g @thumbs-upcase-command 'open "{}" && tmux display-message "opened {}"'
+
+# prefix+C-Space: same picker, but ANY rune opens -- for when you already know
+# you want to follow a link and would rather not think about case.
+#
+# This is deliberately NOT S-Space. `extended-keys` is off (tmux's default), so
+# the terminal sends 0x20 for both Space and Shift+Space and tmux can never
+# dispatch an S-Space binding -- tmux ACCEPTS the bind silently, it just never
+# fires. C-Space sends NUL, which is distinguishable with no global key-encoding
+# change. Turning `extended-keys on` would make S-Space work but re-encodes keys
+# for every app inside tmux, which is not worth it for one binding.
+bind-key C-Space run-shell -b "#{HOME}/.config/tmux/plugins/tmux-thumbs/target/release/tmux-thumbs \
+    --dir '#{HOME}/.config/tmux/plugins/tmux-thumbs' \
+    --command 'open \"{}\"' \
+    --upcase-command 'open \"{}\"'"
+
 # catppuccin
 set -g @plugin 'catppuccin/tmux#v0.2.0'
 # battery module disabled; plugin not needed.
