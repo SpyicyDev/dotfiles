@@ -1,3 +1,13 @@
+#!/bin/sh
+# chezmoi `modify_` script: receives the live ~/.claude/settings.json on stdin
+# and prints the desired contents. Claude Code rewrites this file itself at
+# runtime (model, effortLevel, tui, theme, enabledPlugins, notif toggles...),
+# so a static template drifted after every /model or /config change and every
+# `chezmoi apply` clobbered those choices. Here only MANAGED keys are owned by
+# chezmoi (replaced wholesale); DEFAULTS are seeded only when absent (fresh
+# machine); every other key is passed through untouched from the live file.
+set -eu
+FULL=$(cat <<'EOF'
 {
   "permissions": {
     "allow": [
@@ -293,3 +303,13 @@
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true
 }
+EOF
+)
+MANAGED='["permissions","hooks","statusLine","disableAgentView"]'
+jq -s --argjson full "$FULL" --argjson managed "$MANAGED" '
+  (.[0] // {}) as $live
+  | ($full | with_entries(select(.key as $k | $managed | index($k)))) as $m
+  | ($full | with_entries(select(.key as $k | $managed | index($k) | not))) as $d
+  | ($live * $m)
+  | . + ($d | with_entries(select(.key as $k | $live | has($k) | not)))
+'
