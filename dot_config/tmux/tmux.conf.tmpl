@@ -78,6 +78,16 @@ set -g @thumbs-key Space
 set -g @thumbs-command 'echo -n "{}" | pbcopy && tmux set-buffer -- "{}" && tmux display-message "copied {}"'
 set -g @thumbs-upcase-command 'open "{}" && tmux display-message "opened {}"'
 
+# Same palette as WezTerm's quick_select_* colors (catppuccin-mocha): loud
+# peach-on-crust rune, quieter surface1 band under the match. The binary reads
+# these @thumbs-* options itself, so they apply to the C-Space binding below
+# too. `contrast` wraps runes in [ ] for one more visual cue.
+set -g @thumbs-hint-bg-color '#fab387'   # peach
+set -g @thumbs-hint-fg-color '#11111b'   # crust
+set -g @thumbs-bg-color '#45475a'        # surface1
+set -g @thumbs-fg-color '#cdd6f4'        # text
+set -g @thumbs-contrast 1
+
 # prefix+C-Space: same picker, but ANY rune opens -- for when you already know
 # you want to follow a link and would rather not think about case.
 #
