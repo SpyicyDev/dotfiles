@@ -180,10 +180,32 @@ config.keys = {
         }
     },
 
+    -- The two rune modes live on adjacent keys: CMD+SHIFT+Y yanks anything,
+    -- CMD+SHIFT+U opens a URL.
+
+    -- CMD+SHIFT+Y: stock QuickSelect -- runes over every default matcher
+    -- (URLs, hashes, paths, IPs, quoted strings), chosen match goes to the
+    -- clipboard. This replaces WezTerm's built-in CTRL+SHIFT+Space, which is
+    -- turned off below so there is exactly one way in.
+    {
+        key = "Y",
+        mods = "CMD",
+        action = wezterm.action.QuickSelect,
+    },
+
+    -- Retire the stock binding this replaces. The default is registered against
+    -- the PHYSICAL Space key, so `phys:Space` is what actually shadows it --
+    -- a plain "Space" here would define an unrelated mapped-key entry and leave
+    -- the original live. Verify with `wezterm show-keys`.
+    {
+        key = "phys:Space",
+        mods = "CTRL|SHIFT",
+        action = wezterm.action.DisableDefaultAssignment,
+    },
+
     -- CMD+SHIFT+U: label every URL currently on screen with a vimium-style rune,
     -- then open the one whose rune you type. This is QuickSelect with a custom
-    -- action instead of its default copy-to-clipboard; CTRL+SHIFT+SPACE still
-    -- runs the stock copy-anything QuickSelect alongside it.
+    -- action instead of its default copy-to-clipboard.
     --
     -- Deliberately at the WezTerm layer rather than a tmux plugin (tmux-thumbs
     -- et al): QuickSelect is native and forks nothing, and it labels the whole
