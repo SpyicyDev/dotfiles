@@ -18,29 +18,6 @@ end
 
 config.color_scheme = "catppuccin-mocha"
 
--- Quick-select rune styling (CMD+SHIFT+Y and CMD+SHIFT+U, see config.keys).
--- `colors` merges over `color_scheme` field by field, so naming only these four
--- leaves catppuccin-mocha otherwise intact.
---
--- The match band is deliberately quieter than the rune. They answer different
--- questions: the band shows HOW MUCH text a hit will capture, while the rune is
--- the thing the eye actually hunts for, so it has to win against both the band
--- and the mocha background -- hence a warm bg no other UI element here uses,
--- with near-black on top. Colors are global to quick select; QuickSelectArgs has
--- no per-invocation color override, so both modes share this palette.
-config.colors = {
-    quick_select_label_bg = { Color = "#fab387" }, -- peach
-    quick_select_label_fg = { Color = "#11111b" }, -- crust
-    quick_select_match_bg = { Color = "#45475a" }, -- surface1
-    quick_select_match_fg = { Color = "#cdd6f4" }, -- text
-}
-
--- Drop the underlying text's own attributes while the overlay is up, so every
--- hit renders in exactly the palette above. Otherwise a URL that ls, a prompt,
--- or a log line has already colored keeps that styling and competes with the
--- match band, so hits look inconsistent and the runes read as less distinct.
-config.quick_select_remove_styling = true
-
 config.enable_tab_bar = false
 config.enable_kitty_graphics = true
 -- RESIZE (no TITLE) keeps the borderless look but reports the window as
@@ -203,63 +180,19 @@ config.keys = {
         }
     },
 
-    -- The two rune modes live on adjacent keys: CMD+SHIFT+Y yanks anything,
-    -- CMD+SHIFT+U opens a URL.
-
-    -- CMD+SHIFT+Y: stock QuickSelect -- runes over every default matcher
-    -- (URLs, hashes, paths, IPs, quoted strings), chosen match goes to the
-    -- clipboard. This replaces WezTerm's built-in CTRL+SHIFT+Space, which is
-    -- turned off below so there is exactly one way in.
-    {
-        key = "Y",
-        mods = "CMD",
-        action = wezterm.action.QuickSelect,
-    },
-
-    -- Retire the stock binding this replaces. The default is registered against
-    -- the PHYSICAL Space key, so `phys:Space` is what actually shadows it --
-    -- a plain "Space" here would define an unrelated mapped-key entry and leave
-    -- the original live. Verify with `wezterm show-keys`.
+    -- No quick-select runes at the WezTerm layer: tmux-thumbs owns that
+    -- (prefix+Space / prefix+C-Space in tmux.conf). It reads the pane buffer,
+    -- so it handles URLs that wrap at a narrow pane edge and the full tmux
+    -- scrollback, both of which WezTerm's row-based QuickSelect could not.
+    -- The stock CTRL+SHIFT+Space QuickSelect is turned off so there is one
+    -- rune mode, not two that look alike and behave differently. The default
+    -- is registered against the PHYSICAL Space key, so `phys:Space` is what
+    -- actually shadows it -- a plain "Space" would add an unrelated mapped-key
+    -- entry and leave the original live. Verify with `wezterm show-keys`.
     {
         key = "phys:Space",
         mods = "CTRL|SHIFT",
         action = wezterm.action.DisableDefaultAssignment,
-    },
-
-    -- CMD+SHIFT+U: label every URL currently on screen with a vimium-style rune,
-    -- then open the one whose rune you type. This is QuickSelect with a custom
-    -- action instead of its default copy-to-clipboard.
-    --
-    -- Deliberately at the WezTerm layer rather than a tmux plugin (tmux-thumbs
-    -- et al): QuickSelect is native and forks nothing, and it labels the whole
-    -- window at once -- every tmux pane plus the status line -- where a
-    -- tmux-level tool only ever sees the focused pane.
-    --
-    -- Scope is whatever is painted RIGHT NOW: scrollback_lines is 0 above, so
-    -- WezTerm keeps no history of its own. To hint a link that has scrolled
-    -- away, scroll up in tmux copy-mode first, then press this.
-    {
-        key = "U",
-        mods = "CMD",
-        action = wezterm.action.QuickSelectArgs {
-            label = "open url",
-            -- Supplying `patterns` REPLACES the default matcher set, so only
-            -- links get runes (not the stock hashes/paths/IPs/quoted strings).
-            -- Rust regex, in a long-bracket string to dodge Lua escaping: match
-            -- any scheme://, stop at whitespace/quotes/brackets, and require the
-            -- final character to be non-punctuation so a trailing ")" or "." in
-            -- prose is left out of the captured URL.
-            patterns = {
-                [==[\b[a-z][a-z0-9+.-]*://[^\s'"<>()\[\]]*[^\s'"<>()\[\].,;:!?]]==],
-            },
-            action = wezterm.action_callback(function(window, pane)
-                local url = window:get_selection_text_for_pane(pane)
-                if url and url ~= "" then
-                    wezterm.log_info("quickselect open: " .. url)
-                    wezterm.open_with(url)
-                end
-            end),
-        },
     },
 
 }
