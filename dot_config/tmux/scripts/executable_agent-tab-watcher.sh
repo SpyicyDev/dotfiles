@@ -442,6 +442,16 @@ server_gone() { ! tmux list-sessions >/dev/null 2>&1; }
 # ticks as " @win=N @win=N " (see the hysteresis note in the loop).
 idle_streak=" "
 
+# Consecutive agent-LESS ticks per window, same " @win=N " shape, for the GC
+# below. A window is only garbage-collected after GC_TICKS ticks in a row
+# without an agent pane. One tick is not enough: tmux-thumbs (prefix+Space)
+# `swap-pane`s the active pane into a throwaway "[thumbs]" window for the
+# seconds the picker is up, and a single-tick GC read that as "agent gone",
+# wiped @agent_summary/@agent_state, and the tab label stayed blank until the
+# next hook refreshed it. A real exit is still collected, just GC_TICKS later.
+GC_TICKS=5
+gc_streak=" "
+
 while :; do
     # window_id<space>pane_tty for every pane.
     if ! panes=$(tmux list-panes -a -F '#{window_id} #{pane_tty}' 2>/dev/null); then
@@ -558,6 +568,7 @@ EOF
     # Rebuilt each tick; a window that stops reading idle drops out, so the
     # streak only ever counts CONSECUTIVE observations.
     idle_streak_next=" "
+    gc_streak_next=" "
     wez_front=""   # per tick, computed at most once, only if a tinted tab is watched
     while IFS=' ' read -r win state wac; do
         # SEEN-IT, CONTINUOUSLY. The hook discharges a yellow/green that lands
@@ -681,16 +692,26 @@ EOF
         if [ "$has_agent" = 1 ] && [ -z "$state" ]; then
             tmux set-option -w -t "$win" @agent_state idle 2>/dev/null && changed=1
         elif [ "$has_agent" = 0 ] && { [ -n "$state" ] || [ "$has_summary" = 1 ]; }; then
-            tmux set-option -uw -t "$win" @agent_state 2>/dev/null
-            tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
-            tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
-            tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
-            tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null
-            changed=1
+            n=0
+            for kv in $gc_streak; do
+                case "$kv" in "${win}="*) n="${kv#*=}"; break ;; esac
+            done
+            n=$((n + 1))
+            if [ "$n" -ge "$GC_TICKS" ]; then
+                tmux set-option -uw -t "$win" @agent_state 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_summary 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_summary_cond 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_pending 2>/dev/null
+                tmux set-option -uw -t "$win" @agent_rollout 2>/dev/null
+                changed=1
+            else
+                gc_streak_next="${gc_streak_next}${win}=${n} "
+            fi
         fi
     done <<EOF
 $states
 EOF
+    gc_streak="$gc_streak_next"
 
     idle_streak="$idle_streak_next"
 
