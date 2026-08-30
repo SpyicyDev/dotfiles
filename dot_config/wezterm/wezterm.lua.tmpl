@@ -18,6 +18,29 @@ end
 
 config.color_scheme = "catppuccin-mocha"
 
+-- Quick-select rune styling (CMD+SHIFT+Y and CMD+SHIFT+U, see config.keys).
+-- `colors` merges over `color_scheme` field by field, so naming only these four
+-- leaves catppuccin-mocha otherwise intact.
+--
+-- The match band is deliberately quieter than the rune. They answer different
+-- questions: the band shows HOW MUCH text a hit will capture, while the rune is
+-- the thing the eye actually hunts for, so it has to win against both the band
+-- and the mocha background -- hence a warm bg no other UI element here uses,
+-- with near-black on top. Colors are global to quick select; QuickSelectArgs has
+-- no per-invocation color override, so both modes share this palette.
+config.colors = {
+    quick_select_label_bg = { Color = "#fab387" }, -- peach
+    quick_select_label_fg = { Color = "#11111b" }, -- crust
+    quick_select_match_bg = { Color = "#45475a" }, -- surface1
+    quick_select_match_fg = { Color = "#cdd6f4" }, -- text
+}
+
+-- Drop the underlying text's own attributes while the overlay is up, so every
+-- hit renders in exactly the palette above. Otherwise a URL that ls, a prompt,
+-- or a log line has already colored keeps that styling and competes with the
+-- match band, so hits look inconsistent and the runes read as less distinct.
+config.quick_select_remove_styling = true
+
 config.enable_tab_bar = false
 config.enable_kitty_graphics = true
 -- RESIZE (no TITLE) keeps the borderless look but reports the window as
