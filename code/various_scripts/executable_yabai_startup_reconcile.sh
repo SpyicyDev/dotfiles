@@ -88,6 +88,20 @@ MEMO="$YABAI_STATE_DIR/float_memo"            # lines: <window id> <consecutive 
 KEEP_FLOAT="$YABAI_STATE_DIR/keep-float"      # one file per window id the user floated on purpose
 mkdir -p "$YABAI_STATE_DIR" 2>/dev/null
 
+# The running yabai's pid. `pgrep` can come back EMPTY in the first second of a
+# restart (seen 2026-08-29: `yabai_pid=` in the startup log line), and when this
+# script is launched from yabairc its grandparent IS yabai (yabai forks the config
+# shell), so fall back to that. Emits nothing only if both fail.
+yabai_pid_now() {
+  local p
+  p=$(pgrep -x yabai 2>/dev/null | head -n 1)
+  if [ -z "$p" ]; then
+    p=$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')
+    [ "$(ps -o comm= -p "${p:-0}" 2>/dev/null)" = "/opt/homebrew/bin/yabai" ] || p=""
+  fi
+  printf '%s' "$p"
+}
+
 # Seconds since a lock was last touched. A live startup poll touches $LOCK/alive
 # every pass, so "old" here means "orphaned" and never "busy".
 lock_age() {
@@ -122,7 +136,7 @@ else
   if ! mkdir "$STARTUP_LOCK" 2>/dev/null; then
     hp=$(cat "$STARTUP_LOCK/pid" 2>/dev/null || true)
     hy=$(cat "$STARTUP_LOCK/yabai_pid" 2>/dev/null || true)
-    if [ -n "$hp" ] && kill -0 "$hp" 2>/dev/null && [ "$hy" = "$(pgrep -x yabai | head -n 1)" ]; then
+    if [ -n "$hp" ] && [ -n "$hy" ] && kill -0 "$hp" 2>/dev/null && [ "$hy" = "$(yabai_pid_now)" ]; then
       exit 0
     fi
     : >"$STARTUP_LOCK/stop" 2>/dev/null
@@ -133,7 +147,7 @@ else
   fi
   LOCK="$STARTUP_LOCK"
   echo $$ >"$LOCK/pid"
-  pgrep -x yabai | head -n 1 >"$LOCK/yabai_pid"
+  yabai_pid_now >"$LOCK/yabai_pid"
   # Post-restart float state is never the user's choice (yabai re-classified from
   # scratch), and CGWindowIDs are session-scoped, so stale markers only ever block
   # a repair. Same for the backoff memo.
