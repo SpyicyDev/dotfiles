@@ -175,3 +175,15 @@ A clean command (e.g. `git -C ~/.local/share/chezmoi commit -m x` or
 `sed -n 1p ~/.zshrc`) produces empty stdout (allow). Use a throwaway
 `session_id` and delete `sessions/<id>-*.json` afterwards if you probe
 PostToolUse/Stop.
+
+## Evidence attribution and drift (2026-08-30)
+
+Same mechanism as the Claude Code hook — see `dot_claude/hooks/README.md`,
+"Evidence attribution". PostToolUse additionally attributes, by mtime inside
+the tool call's window (`lastSeenAt − 2s .. now`; first window from
+`transcript_path`'s birth time when codex supplies it, otherwise from the
+second tool call on), every changed source-tree path, every path in commits
+that moved HEAD, and every managed live target → `liveTouched`. Stop and
+UserPromptSubmit run `chezmoi status --recursive=false` over the session's
+targets and complain about live≠source drift alongside uncommitted/unpushed
+work. Session-state fields: `lastSeenAt`, `headSha`, `liveTouched`.

@@ -29,8 +29,8 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { execFile, execFileSync } from "node:child_process"
-import { appendFileSync, mkdirSync, realpathSync, renameSync, statSync } from "node:fs"
-import { relative, resolve } from "node:path"
+import { appendFileSync, lstatSync, mkdirSync, realpathSync, renameSync, statSync } from "node:fs"
+import { dirname, relative, resolve } from "node:path"
 
 const TTL_MS = 5 * 60 * 1000
 const COLD_TTL_MS = 15_000 // cold-start retry window
@@ -189,14 +189,24 @@ type SessionChezmoiState = {
   // `continuationCount` caps the retries at MAX_CONTINUATIONS per session.
   continuationPendingSince?: number
   continuationCount: number
+  // Evidence-based attribution (see attributeSessionWrites): the end of the
+  // last tool.execute.after we ran (window start for the next one), the source
+  // repo HEAD we last saw, and managed LIVE targets whose mtime landed inside
+  // one of this session's tool-call windows.
+  lastSeenAt: number
+  headSha: string
+  liveTouched: Set<string>
 }
 
 const sessionState = new Map<string, SessionChezmoiState>()
+// session.created timestamps: the attribution window for a session's FIRST
+// tool call starts here (the plugin sees the event before any tool runs).
+const sessionCreatedAt = new Map<string, number>()
 
 function stateForSession(sessionID: string): SessionChezmoiState {
   let state = sessionState.get(sessionID)
   if (!state) {
-    state = { touchedPaths: new Set(), continuationCount: 0 }
+    state = { touchedPaths: new Set(), continuationCount: 0, lastSeenAt: 0, headSha: "", liveTouched: new Set() }
     sessionState.set(sessionID, state)
   }
   return state
@@ -282,13 +292,186 @@ function unpushedRels(rels: string[]): Set<string> {
   return out
 }
 
+// ---------------------------------------------------------------------------
+// Evidence-based attribution (mirrors the Claude/Codex hooks).
+//
+// The bash-text heuristics only SEE writes spelled as redirects / cp / mv /
+// sed -i. A `python3 - <<EOF ... write_text()` heredoc, `chezmoi edit`, an
+// editor, or a relative path behind `cd $(chezmoi source-path) &&` is invisible
+// to them. So after EVERY tool call we also look at what actually changed on
+// disk during that call's window [lastSeenAt − slack, now] (first window from
+// session.created): (a) source working-tree paths by mtime, (b) source commits
+// if HEAD moved, (c) managed LIVE targets by mtime → liveTouched. Attribution
+// is by time, so a concurrent agent writing the same repo inside one of our
+// windows is misattributed — one extra nag, accepted over a silent miss.
+// ---------------------------------------------------------------------------
+
+const ATTRIB_SLACK_MS = 2000
+
+function attributeSessionWrites(sessionID: string): void {
+  const root = rootSessionID(sessionID)
+  const state = stateForSession(root)
+  const now = Date.now()
+  const start = state.lastSeenAt > 0 ? state.lastSeenAt : (sessionCreatedAt.get(root) ?? sessionCreatedAt.get(sessionID) ?? 0)
+  const since = start > 0 ? start - ATTRIB_SLACK_MS : 0
+  const inWindow = (ms: number) => since > 0 && ms >= since && ms <= now + 1000
+  let added = 0
+  const opts = { encoding: "utf-8" as const, stdio: ["pipe", "pipe", "ignore"] as ["pipe", "pipe", "ignore"], env: SUBPROC_ENV, timeout: 3000 }
+
+  // (a) working tree
+  try {
+    const out = execFileSync(GIT_BIN, ["-C", CHEZMOI_SOURCE_DIR, "status", "--porcelain", "-uall", "--no-renames"], opts)
+    for (const line of out.split("\n")) {
+      if (!line.trim()) continue
+      const rel = line.slice(3).replace(/^"|"$/g, "")
+      const abs = resolve(CHEZMOI_SOURCE_DIR, rel)
+      let t: number | undefined
+      try {
+        t = lstatSync(abs).mtimeMs
+      } catch {
+        try {
+          t = statSync(dirname(abs)).mtimeMs // deleted: the dir entry changed
+        } catch {
+          /* gone entirely */
+        }
+      }
+      if (t !== undefined && inWindow(t) && !state.touchedPaths.has(abs)) {
+        state.touchedPaths.add(abs)
+        added++
+      }
+    }
+  } catch {
+    /* git unavailable: heuristics alone */
+  }
+
+  // (b) commits since we last looked
+  try {
+    const head = execFileSync(GIT_BIN, ["-C", CHEZMOI_SOURCE_DIR, "rev-parse", "HEAD"], opts).trim()
+    if (state.headSha && head && head !== state.headSha) {
+      const args = ["-C", CHEZMOI_SOURCE_DIR, "log", `${state.headSha}..${head}`, "--name-only", "--pretty=format:"]
+      if (since > 0) args.push(`--since=${new Date(since).toISOString()}`)
+      for (const line of execFileSync(GIT_BIN, args, opts).split("\n")) {
+        const rel = line.trim()
+        if (!rel) continue
+        const abs = resolve(CHEZMOI_SOURCE_DIR, rel)
+        if (!state.touchedPaths.has(abs)) {
+          state.touchedPaths.add(abs)
+          added++
+        }
+      }
+    }
+    if (head) state.headSha = head
+  } catch {
+    /* old sha unreachable or git error: skip */
+  }
+
+  // (c) live managed targets written inside the window
+  if (since > 0) {
+    for (const p of managed) {
+      try {
+        if (inWindow(lstatSync(p).mtimeMs) && !state.liveTouched.has(p)) {
+          state.liveTouched.add(p)
+          added++
+        }
+      } catch {
+        /* target missing: chezmoi status reports it if it matters */
+      }
+    }
+  }
+  state.lastSeenAt = now
+  if (added > 0) debugLog("attributed by evidence", { sessionID: root, added, since })
+}
+
+// Fresh `chezmoi managed` list (files, dirs, symlinks; absolute). NOT the TTL
+// cache: a source file added seconds ago must count, and `chezmoi status`
+// aborts on the first target it does not manage.
+function currentManagedTargets(): Set<string> | undefined {
+  try {
+    const out = execFileSync(CHEZMOI_BIN, ["managed", "--include=files,dirs,symlinks", "--path-style=absolute"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "ignore"],
+      env: SUBPROC_ENV,
+      timeout: 5000,
+    })
+    return new Set(out.split("\n").map((s) => s.trim()).filter(Boolean).map(normalizePath))
+  } catch {
+    return undefined
+  }
+}
+
+// driftedTargets: `chezmoi status` over (live targets this session wrote) ∪
+// (targets of the source paths it touched); returns drifted home-relative
+// paths plus the SOURCE paths behind them (kept tracked even once pushed).
+// Prunes clean liveTouched entries. FAIL-QUIET on any chezmoi error.
+function driftedTargets(sessionID: string): { drifted: string[]; keepSources: Set<string> } {
+  const none = { drifted: [] as string[], keepSources: new Set<string>() }
+  const state = sessionState.get(sessionID)
+  if (!state) return none
+  const sources = [...state.touchedPaths].filter((p) => isInChezmoiSource(p))
+  if (sources.length === 0 && state.liveTouched.size === 0) return none
+
+  const targetToSource = new Map<string, string>()
+  if (sources.length > 0) {
+    try {
+      const out = execFileSync(CHEZMOI_BIN, ["target-path", ...sources], {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "ignore"],
+        env: SUBPROC_ENV,
+        timeout: 5000,
+      })
+      const lines = out.split("\n").map((s) => s.trim()).filter(Boolean)
+      if (lines.length === sources.length) lines.forEach((t, i) => targetToSource.set(normalizePath(t), sources[i]))
+    } catch {
+      /* one bad path aborts the batch: live targets only */
+    }
+  }
+  const managedNow = currentManagedTargets()
+  if (!managedNow) return none
+  const targets = new Set<string>()
+  for (const t of targetToSource.keys()) if (managedNow.has(t)) targets.add(t)
+  for (const t of state.liveTouched) {
+    const n = normalizePath(t)
+    if (managedNow.has(n)) targets.add(n)
+  }
+  if (targets.size === 0) {
+    state.liveTouched.clear()
+    return none
+  }
+  let out: string
+  try {
+    out = execFileSync(CHEZMOI_BIN, ["status", "--recursive=false", "--", ...targets], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "ignore"],
+      env: SUBPROC_ENV,
+      timeout: 20000, // a onepassword-templated target costs ~0.75s each
+    })
+  } catch (err) {
+    debugLog("chezmoi status failed in drift check", { sessionID, error: String(err) })
+    return none
+  }
+  const home = process.env.HOME ?? ""
+  const drifted: string[] = []
+  const driftedAbs = new Set<string>()
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue
+    const rel = line.slice(3).trim()
+    if (!rel) continue
+    drifted.push(rel)
+    driftedAbs.add(normalizePath(resolve(home, rel)))
+  }
+  for (const t of [...state.liveTouched]) if (!driftedAbs.has(normalizePath(t))) state.liveTouched.delete(t)
+  const keepSources = new Set<string>()
+  for (const [t, s] of targetToSource) if (driftedAbs.has(t)) keepSources.add(s)
+  return { drifted: drifted.sort(), keepSources }
+}
+
 // pendingTouchedPaths: classify the session-touched rels into the work still
 // outstanding — `dirty` (uncommitted working-tree changes) and `unpushed`
 // (committed but ahead of upstream). Prunes a path from tracking only once it is
 // BOTH clean in the working tree AND already pushed, so the self-heal boundary
 // moves from "committed" to "committed AND pushed" — the guard keeps nagging
 // until the push lands. Mutates the session's touchedPaths Set in place.
-function pendingTouchedPaths(sessionID: string): { dirty: string[]; unpushed: string[] } {
+function pendingTouchedPaths(sessionID: string, keep: Set<string> = new Set()): { dirty: string[]; unpushed: string[] } {
   const state = sessionState.get(sessionID)
   if (!state || state.touchedPaths.size === 0) return { dirty: [], unpushed: [] }
   const rels = [...state.touchedPaths]
@@ -328,15 +511,19 @@ function pendingTouchedPaths(sessionID: string): { dirty: string[]; unpushed: st
   }
   // Self-heal at the PUSH boundary: drop a path only when it is neither
   // uncommitted (working-tree dirty) nor committed-but-unpushed.
+  // ...and only when its live target is not drifted (`keep`): pushed but never
+  // applied is still unfinished work.
   for (const p of rels) {
-    if (!dirty.has(p) && !unpushed.has(p)) state.touchedPaths.delete(resolve(CHEZMOI_SOURCE_DIR, p))
+    const abs = resolve(CHEZMOI_SOURCE_DIR, p)
+    if (!dirty.has(p) && !unpushed.has(p) && !keep.has(abs)) state.touchedPaths.delete(abs)
   }
   return { dirty: [...dirty], unpushed: [...unpushed] }
 }
 
 function uncommittedChezmoiComplaint(sessionID: string): string | undefined {
-  const { dirty, unpushed } = pendingTouchedPaths(sessionID)
-  if (dirty.length === 0 && unpushed.length === 0) return undefined
+  const { drifted, keepSources } = driftedTargets(sessionID)
+  const { dirty, unpushed } = pendingTouchedPaths(sessionID, keepSources)
+  if (dirty.length === 0 && unpushed.length === 0 && drifted.length === 0) return undefined
   const fmt = (paths: string[]) => {
     const shown = paths.slice(0, 12).map((p) => `- ${p}`).join("\n")
     const more = paths.length > 12 ? `\n- ...and ${paths.length - 12} more` : ""
@@ -345,8 +532,17 @@ function uncommittedChezmoiComplaint(sessionID: string): string | undefined {
   const sections: string[] = []
   if (dirty.length > 0) sections.push(`Uncommitted (working-tree) paths:\n${fmt(dirty)}`)
   if (unpushed.length > 0) sections.push(`Committed but UNPUSHED paths:\n${fmt(unpushed)}`)
+  if (drifted.length > 0) {
+    sections.push(
+      `LIVE != SOURCE drift (\`chezmoi status\`, home-relative) on paths this session worked on:\n${fmt(drifted)}\n` +
+        `For each one decide which side is right. If the SOURCE is right: ` +
+        `\`chezmoi apply --force -- ~/<path> </dev/null\` (without --force and </dev/null it prompts and hangs). ` +
+        `If the LIVE file is right: fold it back into the source (\`chezmoi re-add ~/<path>\` for a plain file, ` +
+        `or edit the template / modify_ script), then commit and push.`,
+    )
+  }
   return (
-    `CHEZMOI-GUARD: You made chezmoi source changes in this session that are not yet committed AND pushed.\n` +
+    `CHEZMOI-GUARD: chezmoi work from this session is unfinished (uncommitted, unpushed, or live!=source).\n` +
     `Before finishing this dotfile task, run chezmoi apply if needed, inspect git status/diff/log, ` +
     `stage only the intended files, commit, and push.\n` +
     `Committing and pushing these chezmoi changes is PRE-AUTHORIZED by the user (standing approval for all ` +
@@ -791,6 +987,7 @@ export const ChezmoiGuard: Plugin = async ({ client, directory }) => {
       if (event.type === "session.created" || event.type === "session.updated") {
         const info = event.properties.info
         sessionParent.set(info.id, info.parentID || undefined)
+        if (!sessionCreatedAt.has(info.id)) sessionCreatedAt.set(info.id, Date.now())
         return
       }
       if (event.type !== "session.idle") return
@@ -969,28 +1166,30 @@ export const ChezmoiGuard: Plugin = async ({ client, directory }) => {
           input.sessionID,
           pathsFromArgs(input.tool, input.args).map((p) => resolveAgainstWorkdir(p, directory)),
         )
-        return
+      } else if (input.tool === "bash") {
+        const cmd = bashCommandFromArgs(input.args)
+        if (cmd) {
+          const workdir = bashWorkdirFromArgs(input.args)
+          const paths: string[] = []
+          for (const seg of splitBashSegments(cmd)) {
+            const targetPaths = pathsFromBashWriteTargets(seg)
+            if (!bashHasWriteIntent(seg) && !(workdir && isInChezmoiSource(workdir) && targetPaths.length > 0)) continue
+            paths.push(...pathsFromBashCommand(seg), ...targetPaths)
+          }
+          // Common non-interactive source edit shape: bash tool workdir points at
+          // the chezmoi source and the command writes explicit rooted paths.
+          if (workdir && isInChezmoiSource(workdir)) {
+            rememberSourceWrites(input.sessionID, paths.map((p) => resolveAgainstWorkdir(p, workdir)))
+          } else {
+            rememberSourceWrites(input.sessionID, paths)
+          }
+        }
       }
-      if (input.tool !== "bash") return
-      const cmd = bashCommandFromArgs(input.args)
-      if (!cmd) return
-      const workdir = bashWorkdirFromArgs(input.args)
-      const paths: string[] = []
-      for (const seg of splitBashSegments(cmd)) {
-        const targetPaths = pathsFromBashWriteTargets(seg)
-        if (!bashHasWriteIntent(seg) && !(workdir && isInChezmoiSource(workdir) && targetPaths.length > 0)) continue
-        paths.push(...pathsFromBashCommand(seg), ...targetPaths)
-      }
-      // Common non-interactive source edit shape: bash tool workdir points at
-      // the chezmoi source and the command writes explicit rooted paths. We do
-      // not mark repo-wide dirtiness for unknown relative writes; doing so
-      // would falsely complain about unrelated changes from concurrent agents.
-      if (workdir && isInChezmoiSource(workdir)) {
-        rememberSourceWrites(input.sessionID, paths.map((p) => resolveAgainstWorkdir(p, workdir)))
-      } else {
-        rememberSourceWrites(input.sessionID, paths)
-      }
-      // Recompute after every bash command so successful commits/pushes by this
+      // Attribute by evidence after EVERY tool call: what actually changed on
+      // disk during the call's window (source tree, source commits, managed
+      // live targets) — catches every writer the text heuristics cannot see.
+      attributeSessionWrites(input.sessionID)
+      // Recompute after every tool call so successful commits/pushes by this
       // or another process clear the session's pending reminder promptly.
       pendingTouchedPaths(rootSessionID(input.sessionID))
     },
