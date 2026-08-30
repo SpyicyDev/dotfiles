@@ -9,3 +9,12 @@
 # uninstalled, and because it is the reference for the drawing the app ported.
 # Delete the line below to bring it back.
 claude-usage.30s.sh
+
+# yabai_layers.30s.sh is superseded by LayerBar (~/code/projects/layerbar), a
+# native menu bar app that reads yabai over its socket directly and refreshes
+# on the same yabai-signal pokes (now `notifyutil -p
+# com.mackhaymond.layerbar.refresh` -- see yabairc / yabai_skhd_mode.sh)
+# instead of swiftbar:// URL opens. The plugin still works and is kept as the
+# fallback if LayerBar is ever uninstalled (restore the swiftbar:// pokes too).
+# Delete the line below to bring it back.
+yabai_layers.30s.sh
