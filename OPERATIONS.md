@@ -1061,6 +1061,12 @@ paths a session touched, continuation count). All disposable: deleting the
 dir forces a cold reload and forgets continuation history, nothing else. Logs
 rotate once at 1 MB; set `CHEZMOI_GUARD_DEBUG=1` for per-tool-call lines.
 
+Since 2026-08-30 the Claude Code guard also attributes writes by evidence
+(mtime of source-tree / live-target changes inside each tool call's window,
+plus HEAD movement) and its Stop guard fires on any `chezmoi status` drift on
+targets the session worked on — see `dot_claude/hooks/README.md`, "Evidence
+attribution". The Codex and opencode guards still use text heuristics only.
+
 Registration: Claude Code in `~/.claude/settings.json` (`hooks`), Codex in
 `~/.codex/hooks.json`, opencode by file presence in
 `~/.config/opencode/plugins/`. Claude Code holds newly changed hook commands

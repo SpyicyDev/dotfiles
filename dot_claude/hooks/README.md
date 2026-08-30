@@ -16,15 +16,42 @@ reads the hook JSON from stdin, and branches on `hook_event_name`.
 | Event | Matcher | Behavior |
 |---|---|---|
 | **PreToolUse** | `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|mcp__pty__run\|mcp__pty__spawn_pty` | HARD-BLOCK (1) edit-class tools targeting a chezmoi-**managed** path (exact match), (2) shell commands that write to a managed live file (prefix-aware), and (3) destructive / history-rewriting git against the chezmoi source repo (see the git-hazard table below). Emits `permissionDecision:"deny"`. |
-| **PostToolUse** | `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|mcp__pty__run\|mcp__pty__spawn_pty` | Bookkeeping. Remembers chezmoi-**source** writes this session made and recomputes the dirty set via `git status` (self-healing). Also runs the managed-set TTL refresh. Empty stdout. |
+| **PostToolUse** | `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|mcp__pty__run\|mcp__pty__spawn_pty` | Bookkeeping. Remembers chezmoi-**source** writes this session made — by command-text heuristics AND by evidence (see *Evidence attribution* below) — and recomputes the dirty set via `git status` (self-healing). Also runs the managed-set TTL refresh. Empty stdout. |
 | **UserPromptSubmit** | *(none)* | If session-touched chezmoi source paths are still uncommitted, injects an "uncommitted chezmoi changes" complaint as `additionalContext`. Per-turn analog of opencode's `system.transform`. Also runs the managed-set TTL refresh. |
-| **Stop** | *(none)* | If session-touched chezmoi paths are still dirty, blocks the stop with a continuation prompt (`{"decision":"block","reason":...}`) telling the agent to commit + push. Loop-guarded. Also runs the managed-set TTL refresh. |
+| **Stop** | *(none)* | If session-touched chezmoi paths are still uncommitted, unpushed, **or `chezmoi status` reports live≠source for a target this session worked on** (what the zsh prompt's `~` glyph shows, scoped to this session), blocks the stop with a continuation prompt (`{"decision":"block","reason":...}`) telling the agent to apply/re-add, commit + push. Loop-guarded. Also runs the managed-set TTL refresh. |
 
 The shell tools are the built-in `Bash` **and** the MCP pty shell
 (`mcp__pty__run`, `mcp__pty__spawn_pty`) — on this machine `Bash` is
 deny-listed and every shell command goes through `mcp__pty__run`, so the
 matcher must name it or the shell guard never runs. `mcp__pty__send_keys` is
 not matched (its `keys`/`text` are keystrokes, not a command line).
+
+### Evidence attribution (why an opaque writer can't slip past the Stop guard)
+
+The shell-text heuristics only see writes spelled as redirects / `cp` / `mv` /
+`sed -i`. On 2026-08-30 a session edited the source tree with a
+`python3 - <<'PY' … write_text()` heredoc after `cd $(chezmoi source-path) &&`
+(a command substitution the hook cannot expand), left two commits unpushed and
+a source edit unapplied — and Stop logged `stop clean`, because `touchedPaths`
+was empty. So PostToolUse now ALSO attributes by what changed on disk during
+the tool call's window (`[lastSeenAt − 2s, now]`, where `lastSeenAt` is the
+end of the previous PostToolUse, falling back to the transcript file's birth
+time ≈ session start):
+
+1. source working tree: `git status --porcelain -uall` paths whose mtime (for a
+   deletion, the parent dir's mtime) is inside the window;
+2. source commits: if HEAD moved since last look, every path in `old..new`;
+3. managed **live** targets whose mtime is inside the window → `liveTouched`.
+
+Stop / UserPromptSubmit then run `chezmoi status --recursive=false` over
+`liveTouched ∪ target-path(touched sources)` (filtered through a fresh
+`chezmoi managed`, since one unmanaged arg aborts `status`) and report any
+drifted target; a touched source whose target is drifted is never pruned as
+"done" even once committed and pushed. Attribution is by time, so another
+agent writing the same repo inside one of this session's windows is
+misattributed — one extra nag, whose text already says to leave unrelated
+paths alone; accepted over the old silent blind spot. Session-state fields:
+`lastSeenAt`, `headSha`, `liveTouched`.
 
 ### Block detail
 
