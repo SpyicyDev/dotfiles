@@ -231,6 +231,33 @@ of whether it's plain, templated, encrypted, or op://-templated. It:
 - For op:// templates: same as templated — edit the `.tmpl`
 - On save, auto-applies the rendered output to the live target
 
+### `modify_` files: files an app rewrites at runtime (e.g. `~/.claude/settings.json`)
+
+Some targets are edited by the app that owns them, not just by you. Claude
+Code rewrites `~/.claude/settings.json` on every `/model`, effort, theme,
+plugin or notification toggle, so a static template drifted constantly and
+every `chezmoi apply` clobbered those choices. Such files are managed as
+chezmoi **`modify_` scripts** instead of plain/`.tmpl` files:
+
+| Target | Source |
+|---|---|
+| `~/.claude/settings.json` | `dot_claude/modify_settings.json.tmpl` |
+
+A `modify_` script receives the live file on stdin and prints the desired
+contents. The settings.json one (jq-based) splits the embedded JSON into
+**managed** keys that chezmoi replaces wholesale (`permissions`, `hooks`,
+`statusLine`, `disableAgentView` — the `MANAGED` list at the bottom of the
+script), **defaults** seeded only when the key is absent (fresh machine), and
+passes every other live key through untouched.
+
+- To change a hook or permission: edit the JSON block in the script
+  (`chezmoi edit ~/.claude/settings.json` opens it), then `chezmoi apply`.
+- To make a runtime-toggled key chezmoi-owned (or vice versa): move its name
+  in/out of `MANAGED`.
+- `chezmoi diff ~/.claude/settings.json` must be empty right after an apply;
+  if it isn't, the script's output (not the live file) is what's wrong.
+- Fresh-machine check: `chezmoi execute-template < <source> | sh < /dev/null | jq .`
+
 ### Editing the template directly (without `--apply`)
 
 If you want to verify the diff before applying:
