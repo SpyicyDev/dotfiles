@@ -638,14 +638,24 @@ has_live_workflow() {
 # here says "safe". They die with the process, and a review that took twenty
 # minutes is gone. This is the guard that was missing on 2026-08-25.
 #
-# There is no completion record to key on, only the subagent's transcript, so
-# the rule is the tab watcher's, made stricter for a KILL decision: a transcript
-# touched in the last SUBAGENT_QUIET seconds is in flight regardless of what it
-# says, and one touched within the hour is in flight unless its last entry is a
-# final assistant text (the shape of a delivered report). The watcher uses 5s
-# for the first window; a subagent reading a large file or thinking at high
-# effort goes quiet for minutes — the two that died had been silent for 100s.
-SUBAGENT_QUIET=300
+# There is no completion record to key on (the .meta.json beside each
+# transcript is written at SPAWN — agentType, description, model — and never
+# updated), only the transcript itself. Rule: a transcript touched in the last
+# SUBAGENT_QUIET seconds is in flight regardless of what it says; one touched
+# within the hour is in flight unless its last entry is a pure-text assistant
+# record — the shape of a delivered report.
+#
+# The shape test is reliable because content blocks are written ONE RECORD
+# EACH, text first (measured over a 9-reviewer workflow: zero records mixing
+# text and tool_use), so mid-turn a text record is followed by its tool_use
+# record within 2.13s worst-case. 30s of quiet after a pure-text ending is
+# therefore finished with ~15x margin. This was 300s as a blanket — which
+# locked every tab out of hiding for five minutes after any subagent finished,
+# and a 9-reviewer workflow ends staggered, so the lockout kept renewing;
+# reported as "it won't let me hide it" on a tab whose work was all done.
+# The genuinely-dangerous shape — a subagent silent for minutes INSIDE a tool
+# call — still reads live at any age, because its last record is the tool_use.
+SUBAGENT_QUIET=30
 has_live_subagent() {
     local sid="$1" cwd="$2" base f mt now age last
     [ -n "$sid" ] && [ -n "$cwd" ] || return 1
@@ -1032,8 +1042,12 @@ park_one() {
 # `running` is the state; @agent_workflow and @agent_cua are the two "in flight
 # but the chip cannot say so" cases from the same family. needs-input, failed
 # and done are NOT running — those are precisely the tabs worth tidying away.
+# Sets AGENT_RUNNING_WHY so refusals can be logged with a reason — a silent
+# "still working" on a tab that looks done is undebuggable from the outside.
+AGENT_RUNNING_WHY=""
 agent_running() {
     local win="$1" rec pid sid cwd tab flagged=0
+    AGENT_RUNNING_WHY=""
     tab=$(tmux show -wqv -t "$win" @agent_state 2>/dev/null)
     case "$tab" in
         ""|idle|done|needs-*|failed) : ;;
@@ -1051,7 +1065,10 @@ agent_running() {
     # with a message that is a lie. A flag only counts if an agent is actually
     # registered in the window; a bare shell under a stale flag parks normally.
     if [ "$flagged" = "1" ]; then
-        [ -n "$(window_agent "$win")" ] && return 0
+        if [ -n "$(window_agent "$win")" ]; then
+            AGENT_RUNNING_WHY="tab state [${tab:-flag}] with a live agent registered"
+            return 0
+        fi
         return 1
     fi
     # The tab can be BLIND to background work, not merely stale: the watcher
@@ -1065,8 +1082,8 @@ agent_running() {
     # prevent. One live_sessions fork per window, once per park.
     rec=$(window_agent "$win"); [ -n "$rec" ] || return 1
     IFS="$SEP" read -r pid sid cwd <<< "$rec"
-    has_live_workflow "$sid" "$cwd" && return 0
-    has_live_subagent "$sid" "$cwd" && return 0
+    has_live_workflow "$sid" "$cwd" && { AGENT_RUNNING_WHY="live workflow under ${sid%%-*}"; return 0; }
+    has_live_subagent "$sid" "$cwd" && { AGENT_RUNNING_WHY="live subagent transcript under ${sid%%-*}"; return 0; }
     return 1
 }
 
@@ -1102,7 +1119,10 @@ do_stash_many() {
         # tab is gone from the bar AND still holding its ~1GB and its share of a
         # core, with nothing on screen to say so. Parking is an explicit "not
         # now", and "not now" is not a thing to say to a turn in flight.
-        if agent_running "$w"; then busy=$((busy + 1)); continue; fi
+        if agent_running "$w"; then
+            log "refused to hide $w — $AGENT_RUNNING_WHY"
+            busy=$((busy + 1)); continue
+        fi
         wins+=("$w")
     done
 
