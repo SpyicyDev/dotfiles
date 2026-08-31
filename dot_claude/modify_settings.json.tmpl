@@ -283,6 +283,9 @@ FULL=$(cat <<'EOF'
       }
     ]
   },
+  "skillOverrides": {
+    "cua-driver": "user-invocable-only"
+  },
   "disableAgentView": true,
   "statusLine": {
     "type": "command",
@@ -305,7 +308,7 @@ FULL=$(cat <<'EOF'
 }
 EOF
 )
-MANAGED='["permissions","hooks","statusLine","disableAgentView"]'
+MANAGED='["permissions","hooks","statusLine","disableAgentView","skillOverrides"]'
 jq -s --argjson full "$FULL" --argjson managed "$MANAGED" '
   (.[0] // {}) as $live
   | ($full | with_entries(select(.key as $k | $managed | index($k)))) as $m
