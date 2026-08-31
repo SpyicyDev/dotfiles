@@ -539,144 +539,33 @@ is_working() {
     [ "$mt" -gt 0 ] && [ $(( $(date +%s) - mt )) -lt "$ACTIVE_SECS" ]
 }
 
-# Is a background Workflow still in flight for this session?
+# Background subagents and workflows — the "looks finished and is not" class.
+# A backgrounded Workflow outlives the turn that started it; an Agent-tool
+# subagent is in-process with no child pid, no caffeinate of its own, an
+# ended parent turn and an empty composer, so every OTHER guard in this file
+# reads "safe" while a twenty-minute review is still running (the guard that
+# was missing on 2026-08-25). Both die with the process, so the kill path
+# must see them even when the watcher is dead.
 #
-# Derived from the runtime's own files rather than from @agent_workflow. That
-# option is maintained by agent-tab-watcher.sh, so reading it alone means the
-# guard FAILS OPEN if the watcher has died — and its own header documents that
-# it can disappear silently after days of uptime. A backgrounded workflow
-# outlives the turn that started it and would be killed with the process, so
-# this is not a guard that may quietly stop working.
+# The detection — resolve_session_bases (the compaction-chain walk),
+# session_has_running_subagent (finished = the parent was TOLD the result)
+# and session_has_running_workflow (live = runtime dir without its
+# completion file) — is SHARED with agent-tab-watcher.sh via this lib, so
+# there is exactly one implementation of those rules on the machine. This
+# file used to carry its own private copies; they drifted (a one-level chain
+# walk blind to a double compaction or a quiet middle link, and a
+# transcript-shape finished-rule that a 101-transcript corpus later refuted
+# — the text→tool_use gap runs to 86s, past the 30s the shape rule waited),
+# which is why they are gone rather than kept as a second opinion.
 #
-# The rule (same one the watcher uses): the runtime creates
-# subagents/workflows/wf_<id>/ while a workflow runs and only writes
-# workflows/<id>.json when it finishes, so live == dir without completion file.
-# The 1h mtime backstop is the watcher's too — transcripts go quiet during long
-# stalls, and the worst measured gap on this machine was 394s.
-# Every runtime directory that can belong to this session — NOT just the one
-# named after its sid.
-#
-# The sid in ~/.claude/sessions/<pid>.json is the id the process was RESUMED
-# with, and after a compaction that is no longer where anything is written:
-# the continued conversation gets a fresh id, and the live transcript, its
-# subagents/ and its workflows/ all move under that one, while the session
-# file keeps reporting the old id. Measured 2026-08-25: a process reporting
-# 88d5cc09 had two reviewer subagents running under 42a666ca/subagents/, and
-# every guard that looked under 88d5cc09/ found nothing and let the park
-# SIGTERM it with both reviewers mid-run. `claude --resume <old id>` still
-# works (it follows the chain), so the recorded sid is fine for RESUMING —
-# it is only wrong for LOOKING.
-#
-# The chain is not stored anywhere structured, but it has one precise anchor:
-# the continued transcript's compaction record — a user entry flagged
-# `"isCompactSummary":true` whose text names the old transcript by PATH
-# (`…/<old sid>.jsonl`). Match on that, on that line only. A bare search for
-# the id was tried first and was wrong: transcripts mention other sessions'
-# ids in plain text all the time (a peer's transcript named this one dozens
-# of times), and measured, the bare match claimed four false descendants
-# where the anchor found exactly the real one. A false descendant is not
-# harmless: its running subagents would refuse a park of an unrelated tab.
-#
-# CHEAP, because this runs BEFORE the move and the user is waiting on it. The
-# first version grepped every transcript in the project dir in full — 76 files,
-# 198MB on this machine, ~1.5s — and was called twice per park, so prefix+H
-# took ~3s to hide a tab. Three cuts, each safe:
-#  - Only the HEAD of each file. The cross-file link is the continued
-#    transcript's FIRST user record (measured: line 9 of 2078); the compaction
-#    records found deeper in files all name the file itself (in-place
-#    compactions), which is not a link to anything. 512KB covers any summary.
-#  - Only files touched in the last day. Both callers only care about activity
-#    within the hour, and a descendant with live work under it was itself
-#    written when that work was dispatched.
-#  - Once per (sid, cwd) per run. Both callers ask for the same chain.
-# Measured after: 383ms for the head scan over ALL files, and the mtime filter
-# takes that to ~11 files.
-SESSION_DIRS_KEY=""; SESSION_DIRS_VAL=""
-session_dirs() {
-    local sid="$1" cwd="$2" proj f id out
-    [ -n "$sid" ] && [ -n "$cwd" ] || return 0
-    if [ "$SESSION_DIRS_KEY" = "${sid}${SEP}${cwd}" ]; then printf '%s' "$SESSION_DIRS_VAL"; return 0; fi
-    # Munge the cwd ALONE, then join: applying the `.`→`-` rule to the joined
-    # path turned `.claude` into `-claude` and every lookup silently missed.
-    proj="${cwd//\//-}"; proj="${proj//./-}"      # claude munges / and . to -
-    proj="$HOME/.claude/projects/$proj"
-    [ -d "$proj" ] || return 0
-    out="$proj/$sid"$'\n'
-    while IFS= read -r f; do
-        [ -n "$f" ] || continue
-        id="${f##*/}"; id="${id%.jsonl}"
-        [ "$id" = "$sid" ] && continue
-        head -c 524288 "$f" 2>/dev/null | grep -F '"isCompactSummary":true' | grep -qF -- "/$sid.jsonl" \
-            && out="${out}${proj}/${id}"$'\n'
-    done < <(find "$proj" -maxdepth 1 -name '*.jsonl' -mmin -1440 2>/dev/null)
-    SESSION_DIRS_KEY="${sid}${SEP}${cwd}"; SESSION_DIRS_VAL="$out"
-    printf '%s' "$out"
-}
-
-has_live_workflow() {
-    local sid="$1" cwd="$2" base d wfid mt now
-    [ -n "$sid" ] && [ -n "$cwd" ] || return 1
-    now=$(date +%s)
-    while read -r base; do
-        [ -d "$base/subagents/workflows" ] || continue
-        for d in "$base"/subagents/workflows/wf_*/; do
-            [ -d "$d" ] || continue
-            wfid="${d%/}"; wfid="${wfid##*/}"
-            [ -f "$base/workflows/$wfid.json" ] && continue    # completed
-            mt=$(stat -f %m "$d"/agent-*.jsonl "$d/journal.jsonl" 2>/dev/null | sort -rn | head -1)
-            [ -n "$mt" ] && [ $((now - mt)) -lt 3600 ] && return 0
-        done
-    done < <(session_dirs "$sid" "$cwd")
-    return 1
-}
-
-# Is a background SUBAGENT (the Agent tool, not a Workflow) still running?
-#
-# These are in-process: no child pid, no caffeinate of their own, and the
-# parent's turn has usually ENDED — it dispatched them and replied "I'll report
-# back" — so status reads idle, the composer is empty, and every other guard
-# here says "safe". They die with the process, and a review that took twenty
-# minutes is gone. This is the guard that was missing on 2026-08-25.
-#
-# There is no completion record to key on (the .meta.json beside each
-# transcript is written at SPAWN — agentType, description, model — and never
-# updated), only the transcript itself. Rule: a transcript touched in the last
-# SUBAGENT_QUIET seconds is in flight regardless of what it says; one touched
-# within the hour is in flight unless its last entry is a pure-text assistant
-# record — the shape of a delivered report.
-#
-# The shape test is reliable because content blocks are written ONE RECORD
-# EACH, text first (measured over a 9-reviewer workflow: zero records mixing
-# text and tool_use), so mid-turn a text record is followed by its tool_use
-# record within 2.13s worst-case. 30s of quiet after a pure-text ending is
-# therefore finished with ~15x margin. This was 300s as a blanket — which
-# locked every tab out of hiding for five minutes after any subagent finished,
-# and a 9-reviewer workflow ends staggered, so the lockout kept renewing;
-# reported as "it won't let me hide it" on a tab whose work was all done.
-# The genuinely-dangerous shape — a subagent silent for minutes INSIDE a tool
-# call — still reads live at any age, because its last record is the tool_use.
-SUBAGENT_QUIET=30
-has_live_subagent() {
-    local sid="$1" cwd="$2" base f mt now age last
-    [ -n "$sid" ] && [ -n "$cwd" ] || return 1
-    now=$(date +%s)
-    while read -r base; do
-        [ -d "$base/subagents" ] || continue
-        for f in "$base"/subagents/agent-*.jsonl; do
-            [ -f "$f" ] || continue
-            mt=$(stat -f %m "$f" 2>/dev/null); [ -n "$mt" ] || continue
-            age=$((now - mt))
-            [ "$age" -lt 3600 ] || continue
-            [ "$age" -ge "$SUBAGENT_QUIET" ] || return 0
-            last=$(tail -c 65536 "$f" 2>/dev/null | tail -n 1)
-            case "$last" in
-                *'"role":"assistant","content":[{"type":"text"'*) continue ;;
-            esac
-            return 0
-        done
-    done < <(session_dirs "$sid" "$cwd")
-    return 1
-}
+# If the lib is missing, fail toward "still running": suspension quietly
+# stops working, which costs memory — never a turn. The watcher's stub for
+# the same situation fails the opposite way (no gear), which is ITS safe
+# direction; the asymmetry is deliberate.
+if ! . "$HOME/.config/tmux/scripts/agent-session-lib.sh" 2>/dev/null; then
+    session_has_running_workflow() { log "agent-session-lib.sh missing — treating a possible workflow as live"; return 0; }
+    session_has_running_subagent() { log "agent-session-lib.sh missing — treating a possible subagent as live"; return 0; }
+fi
 
 # Is this agent driving an app through cua-driver right now? Same reasoning as
 # above: read the shim's own activity file rather than trusting @agent_cua,
@@ -798,12 +687,17 @@ suspend_agent() {
     # A backgrounded workflow outlives its turn and computer-use spans turns;
     # both would die with the process. Checked TWO ways each — the watcher's
     # flag, which is instant but goes stale if the daemon dies, and the
-    # underlying files, which are authoritative but cost a little more. Either
-    # saying "busy" is enough to leave the agent alone.
-    if [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] || has_live_workflow "$a_sid" "$a_cwd"; then
+    # underlying files via the shared lib, which are authoritative but cost a
+    # little more. Either saying "busy" is enough to leave the agent alone.
+    # The lib takes the PID and reads the session file itself — still present,
+    # since the kill has not happened yet — then follows the compaction chain,
+    # so a post-compaction session is judged by the dirs its work actually
+    # lives in. (@agent_workflow is one gear for workflows AND subagents, so
+    # the first line's tab check covers both while the watcher is alive.)
+    if [ -n "$(tmux show -wqv -t "$win" @agent_workflow 2>/dev/null)" ] || session_has_running_workflow "$a_pid"; then
         log "background workflow still in flight — left running"; return 0
     fi
-    if has_live_subagent "$a_sid" "$a_cwd"; then
+    if session_has_running_subagent "$a_pid"; then
         log "background subagent still running — left running"; return 0
     fi
     if [ -n "$(tmux show -wqv -t "$win" @agent_cua 2>/dev/null)" ] || has_live_cua "$a_pid"; then
@@ -1031,8 +925,8 @@ park_one() {
 #
 # Reads the options the tab watcher maintains — the same ones the tab bar
 # renders — rather than re-deriving from session files. That is a deliberate
-# exception to the rule has_live_workflow follows (never trust a watcher option,
-# it fails open if the watcher dies), and the difference is which way the
+# exception to the kill path's rule (never trust a watcher option alone, it
+# fails open if the watcher dies), and the difference is which way the
 # failure points: this gates a REFUSAL, not a kill. A dead watcher frozen at
 # `running` merely declines to hide the tab, which costs nothing; frozen at
 # `idle` the tab parks and suspend_agent's own guards — status, the caffeinate
