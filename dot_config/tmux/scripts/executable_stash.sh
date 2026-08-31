@@ -1071,19 +1071,24 @@ agent_running() {
         fi
         return 1
     fi
-    # The tab can be BLIND to background work, not merely stale: the watcher
-    # derives a session's runtime directory from the id in its session file,
-    # and after a compaction that is not where the subagents are (see
-    # session_dirs). So a tab with two reviewers in flight showed no gear at
-    # all, the tab-only test above passed, and the park went through. The
-    # same lineage-aware lookup the kill guard uses is applied here too, so
-    # that hiding is refused for the same reasons suspending would be — the
-    # alternative is hidden-but-alive, which is the outcome parking exists to
-    # prevent. One live_sessions fork per window, once per park.
-    rec=$(window_agent "$win"); [ -n "$rec" ] || return 1
-    IFS="$SEP" read -r pid sid cwd <<< "$rec"
-    has_live_workflow "$sid" "$cwd" && { AGENT_RUNNING_WHY="live workflow under ${sid%%-*}"; return 0; }
-    has_live_subagent "$sid" "$cwd" && { AGENT_RUNNING_WHY="live subagent transcript under ${sid%%-*}"; return 0; }
+    # No file-derived checks here any more — the tab settles it. They were
+    # added when the tab was BLIND to background work (the watcher derived a
+    # session's runtime dir from the pre-compaction id, so two in-flight
+    # reviewers showed no gear and a park SIGTERMed them), and they cost real
+    # things: pre-move latency the user sits through, and a lockout window
+    # after a subagent finishes that the watcher's own finished-rule does not
+    # have (it clears the gear when the parent is TOLD the result — the
+    # authoritative signal; watcher commit c554ffa also follows the
+    # compaction chain now). With the blindness fixed, duplicating the lookup
+    # here buys nothing on the good days and five minutes of "won't hide" on
+    # the staggered end of a review fleet.
+    #
+    # The failure this accepts: watcher dead or one tick behind at the moment
+    # of the press → the tab parks with work in flight. That lands on
+    # suspend_agent, which keeps EVERY deep guard (status, caffeinate, the
+    # lineage-aware workflow/subagent walks, the last-moment re-check) — so
+    # the outcome is hidden-but-left-running with a logged reason, never a
+    # killed turn, and prefix+h brings it straight back.
     return 1
 }
 
