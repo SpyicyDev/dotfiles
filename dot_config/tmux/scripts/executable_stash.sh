@@ -25,6 +25,9 @@
 #   stash.sh unstash [<window>]   bring one back; picker if several are parked
 #   stash.sh stash-many <w>...    park a group in one transaction
 #   stash.sh unstash-many <w>...  bring a group back in one transaction
+#   stash.sh kill-many <w>...     destroy parked windows (⌃x in the picker);
+#                                 discarded session ids land in the log with
+#                                 the command that resumes them by hand
 #   stash.sh sel-start here|left|right  start a range at the current tab
 #   stash.sh sel-move  left|right grow or shrink it
 #   stash.sh sel-cancel           drop the selection
@@ -339,6 +342,25 @@ save_state() {
 # state, so a skipped row was silently erased on the following park.
 ORPHAN_FILE=""
 orphan_file() { [ -n "$ORPHAN_FILE" ] || ORPHAN_FILE="$(resurrect_dir)/stash-orphans.tsv"; printf '%s' "$ORPHAN_FILE"; }
+
+# Drop specific session ids from the sidecar. The kill path only: everywhere
+# else a sid that leaves live state must be PRESERVED — that is save_state's
+# whole merge — but a kill is the user explicitly discarding the
+# conversation, and a preserved row would resurface in the orphans file as
+# clutter that outranks the user's decision. Rows with an empty sid are
+# untouched: " $7 " for those is two spaces, and the drop list, built from
+# single-space-joined uuids, never contains two in a row.
+forget_sids() {
+    local sf tmp
+    sf=$(state_file)
+    [ -f "$sf" ] && [ "$#" -gt 0 ] || return 0
+    lock_acquire "$SAVE_LOCKDIR" || { log "sidecar busy — could not forget discarded sids"; return 0; }
+    tmp="${sf}.forget.$$"
+    awk -F"$SEP" -v drop=" $* " 'index(drop, " " $7 " ") == 0' "$sf" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$sf" 2>/dev/null
+    rm -f "$tmp" 2>/dev/null
+    lock_release "$SAVE_LOCKDIR"
+}
 
 # Re-attach the options to the windows resurrect just rebuilt.
 #
@@ -1487,21 +1509,116 @@ do_unstash_many() {
     done
 }
 
+# Destroy parked windows outright — the picker's other exit. Killing is the
+# one stash verb that cannot be undone, so it never guesses:
+#  - it acts only on windows still parked at the moment it runs (the picker
+#    may have sat open a while), re-resolved under the lock;
+#  - every discarded session id goes to the LOG first, with the exact command
+#    that resumes it by hand — the picker showed a label, not a conversation,
+#    and a mispick must stay recoverable;
+#  - a still-live agent (a park whose suspend was refused) gets SIGTERM and a
+#    short grace before the window goes, so it reaps its MCP children and
+#    deletes its own session file — a bare kill-window is a SIGHUP, the crash
+#    path that fires no SessionEnd;
+#  - the sid leaves the SIDECAR before the window dies. kill-window fires the
+#    window-unlinked hook, whose backgrounded publish merges the old sidecar
+#    against a world where the window is gone and the sid is not live — which
+#    is exactly save_state's cue to move the row to the orphans file,
+#    resurrecting as clutter the conversation the user just discarded. The
+#    options are unset first for the same reason: a concurrent snapshot that
+#    catches the window still alive would re-mirror them. If the kill then
+#    FAILS, the options and mirror are restored — until then the log line
+#    already holds the pointer, so no window exists where it is nowhere.
+do_kill_many() {
+    local w win sid cwd lbl pidx apid i killed=0 nsids=0
+    hold_exists || { msg "nothing is parked"; return 0; }
+    lock_acquire || { msg "busy — try again"; return 0; }
+
+    local ordered=() wanted=" $* "
+    while read -r w; do
+        [ -n "$w" ] || continue
+        case "$wanted" in *" $w "*) ordered+=("$w") ;; esac
+    done < <(tmux list-windows -t "=$HOLD" -F '#{window_id}' 2>/dev/null)
+    if [ "${#ordered[@]}" -eq 0 ]; then
+        lock_release; msg "nothing to kill — not parked any more"; return 0
+    fi
+
+    for win in "${ordered[@]}"; do
+        sid=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
+        cwd=$(tmux show -wqv -t "$win" @stash_cwd 2>/dev/null)
+        pidx=$(tmux show -wqv -t "$win" @stash_pane_idx 2>/dev/null)
+        lbl=$(tmux show -wqv -t "$win" @stash_label 2>/dev/null)
+        [ -n "$lbl" ] || lbl=$(tmux display-message -p -t "$win" '#{window_name}' 2>/dev/null)
+
+        if [ -n "$sid" ]; then
+            log "killing parked window $win ($lbl) — discarding suspended session ${sid}; resume by hand: cd ${cwd:-?} && claude --resume $sid"
+            tmux set-option -uw -t "$win" @stash_session 2>/dev/null
+            tmux set-option -uw -t "$win" @stash_cwd 2>/dev/null
+            tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
+            forget_sids "$sid"
+            nsids=$((nsids + 1))
+        fi
+
+        apid=$(agent_pid_in_window "$win")
+        if [ -n "$apid" ]; then
+            log "killing parked window $win ($lbl) — its agent (pid $apid) is still live; SIGTERM first"
+            kill -TERM "$apid" 2>/dev/null
+            i=0
+            while [ "$i" -lt 12 ] && kill -0 "$apid" 2>/dev/null; do sleep 0.25; i=$((i + 1)); done
+        fi
+
+        if tmux kill-window -t "$win" 2>/dev/null; then
+            killed=$((killed + 1))
+            [ -z "$sid" ] && [ -z "$apid" ] && log "killed parked window $win ($lbl)"
+        else
+            if [ -n "$sid" ]; then
+                tmux set-option -w -t "$win" @stash_session "$sid" 2>/dev/null
+                [ -n "$cwd" ]  && tmux set-option -w -t "$win" @stash_cwd "$cwd" 2>/dev/null
+                [ -n "$pidx" ] && tmux set-option -w -t "$win" @stash_pane_idx "$pidx" 2>/dev/null
+                save_state
+                log "could not kill $win — restored its suspended-session record"
+            else
+                log "could not kill $win"
+            fi
+        fi
+    done
+
+    renumber "$HOLD"
+    publish
+    lock_release
+    if [ "$killed" -gt 0 ]; then
+        if [ "$nsids" -gt 0 ]; then
+            msg "killed $killed — $nsids suspended session(s) discarded, resume commands in $(basename "$LOGFILE")"
+        else
+            msg "killed $killed"
+        fi
+    else
+        msg "could not kill it"
+    fi
+}
+
 # Runs inside the popup, where there is a real terminal for fzf.
 #
 # --multi so a group parked together can come back together. Shift-Up/Shift-Down
 # are bound alongside fzf's own Tab/Shift-Tab because shift+arrow is the gesture
 # this pairs with on the tab-bar side, and having the two halves of the feature
 # answer to the same key is most of what makes it memorable.
+#
+# ⌃x kills instead of restoring — same selection semantics as ⏎, via fzf's
+# --expect, which prefixes the output with the key that accepted it (empty
+# line for a plain Enter). ⌃x because fzf already means something by most
+# mnemonic keys (⌃k is line-up, ⌃d is deselect-all here) and ⌃x is unbound.
 do_pick() {
-    local wins
-    wins=$(tmux list-windows -t "=$HOLD" \
+    local out key wins
+    out=$(tmux list-windows -t "=$HOLD" \
             -F '#{window_id}	#{?#{@stash_label},#{@stash_label},#{?#{@agent_summary},#{@agent_summary},#{window_name}}}	#{pane_current_path}' \
           | fzf --with-nth=2.. --delimiter='\t' --reverse --prompt='bring back > ' \
                 --multi \
+                --expect=ctrl-x \
                 --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
-                --header '⇧↑/⇧↓ or Tab to pick several · ⌃a all · ⏎ bring back' \
-          | cut -f1 | tr '\n' ' ')
+                --header '⇧↑/⇧↓ or Tab to pick several · ⌃a all · ⏎ bring back · ⌃x kill')
+    key=${out%%$'\n'*}
+    wins=$(printf '%s\n' "$out" | tail -n +2 | cut -f1 | tr '\n' ' ')
     # Hand off rather than doing the work here. the resume polls for up to
     # RESUME_WAIT, and display-popup -E keeps the popup on screen — holding the
     # keyboard and covering the windows it just restored — until its command
@@ -1510,7 +1627,12 @@ do_pick() {
     # Unquoted on purpose: this is a list of ids for the command line to split.
     # They are tmux window ids (@ plus digits), so there is nothing in them for
     # a shell to interpret.
-    [ -n "${wins// /}" ] && tmux run-shell -b "'$SELF' unstash-many $wins"
+    [ -n "${wins// /}" ] || return 0
+    if [ "$key" = "ctrl-x" ]; then
+        tmux run-shell -b "'$SELF' kill-many $wins"
+    else
+        tmux run-shell -b "'$SELF' unstash-many $wins"
+    fi
 }
 
 do_list() {
@@ -1552,6 +1674,7 @@ case "${1:-}" in
     unstash) shift; do_unstash "${1:-}" ;;
     stash-many)   shift; do_stash_many "$@" ;;
     unstash-many) shift; do_unstash_many "$@" ;;
+    kill-many)    shift; do_kill_many "$@" ;;
     sel-start)  shift; do_sel_start "${1:-right}" "${2:-}" ;;
     sel-move)   shift; do_sel_move "${1:-right}" "${2:-}" ;;
     sel-cancel) do_sel_cancel ;;
