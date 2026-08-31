@@ -116,6 +116,12 @@ hyper + fn - m : yabai -m window --toggle native-fullscreen
 # toggle the focused space's layout: bsp <-> stack
 hyper + fn - b : {{ .chezmoi.homeDir }}/code/various_scripts/yabai_skhd_mode.sh
 
+# sleep the displays now; immediate screen-lock policy locks the session with
+# them. Must ALWAYS work, even while an agent holds a display-awake assertion
+# (forced sleep overrides idle assertions — cua v2 canaries this). On the fn
+# layer because bare hyper-s is reserved by BetterTouchTool (see README §6).
+hyper + fn - s : {{ .chezmoi.homeDir }}/code/various_scripts/display_sleep_lock.sh
+
 # hyper+fn+? (hyper+fn + / , keycode 0x2C) : toggle the system-wide keybind help
 # overlay (Hammerspoon yabaiHelpToggle, see init.lua). On the fn layer because BARE
 # hyper+/ is swallowed before skhd — macOS reserves the cmd+? ("?") combo even with

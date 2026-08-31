@@ -327,6 +327,7 @@ Bare-hyper bsp cluster: directional focus, resize, balance, split-orientation, a
 | `hyper - t` | T | `yabai_toggle_float.sh` | Toggle the focused window's float (works in **both** stack & bsp). **Directional guard:** refuses to *float* a pinned app on its home space (or Arc on main/school), but always allows *un*-floating one — that's the manual way back from a window yabai flagged FLOAT on its own. manage=off apps are not guarded |
 | `hyper + fn - m` | Fn+M | `yabai -m window --toggle native-fullscreen` | Toggle native fullscreen (global; **no-op on WezTerm** by design — see the "WezTerm is not fullscreenable" note) |
 | `hyper + fn - b` | Fn+B | `yabai_skhd_mode.sh` | Toggle space layout (bsp ↔ stack) |
+| `hyper + fn - s` | Fn+S | `display_sleep_lock.sh` | Sleep displays now (+ session locks via the immediate screen-lock policy). On the fn layer: bare `hyper-s` is BTT-reserved. Must always work, even over an agent-held display-awake assertion — forced sleep overrides idle assertions (cua v2 canaries this) |
 
 #### Native-Fullscreen App Access (Hyper)
 
@@ -892,6 +893,7 @@ git push origin main
 | `hyper + fn - m` | Fn+M | Toggle native fullscreen | Global; no-op on WezTerm by design |
 | `hyper + fn - b` | Fn+B | Toggle space layout (bsp ↔ stack) | |
 | `hyper - a` / `hyper - s` | A / S | *(reserved by BetterTouchTool)* | Not skhd binds — never assign |
+| `hyper + fn - s` | Fn+S | Sleep displays + lock | `display_sleep_lock.sh`; forced sleep overrides agent display-awake assertions |
 | **Display & Cross-Display Movement** |
 | `f13` | Hyper+F1 | Focus master (laptop) display | Karabiner-mapped |
 | `f14` | Hyper+F2 | Focus external display | Karabiner-mapped |

@@ -265,6 +265,7 @@ local HELP_COL3 = {
   { gap = true },
   { h = "SYSTEM" },
   { k = "hyper",       d = "= caps lock = ⌘⌃⌥⇧" },
+  { k = "hyper+fn+s",  d = "sleep displays + lock" },
   { k = "hyper+fn+?",  d = "toggle this help" },
   { k = "esc",         d = "close this help" },
 }
