@@ -1,16 +1,8 @@
-#!/bin/bash
-source "$CONFIG_DIR/colors.sh" # Loads all defined colors
-
-TODAY=$(date +%Y-%m-%d)
-DATA=$(curl -s -X GET https://api.todoist.com/rest/v2/tasks -H "Authorization: Bearer {{ onepasswordRead "op://Developer/todoist-api-token/credential" }}" | jq --arg today "$TODAY" '[.[] | select(.due.date == $today)] | length')
-
-if [[ $DATA -eq 0 ]]; then
-	COLOR=$GREEN
-else
-	COLOR=$RED
-fi
-
-sketchybar --set todos \
-	label.drawing=on \
-	label=$DATA \
-	icon.color=$COLOR
+#!/bin/sh
+# Todoist due-today counter for sketchybar — DISARMED 2026-09-01.
+# The todoist-api-token 1Password item went dead (401) and was archived at
+# Mack's ask; sketchybar isn't running on this machine anymore. If sketchybar
+# returns: mint a new token (Todoist → Settings → Integrations → Developer),
+# store it as op://Developer/todoist-api-token/credential, and restore this
+# plugin from git history (pre-2026-09-01).
+sketchybar --set "$NAME" label="–" 2>/dev/null || true
