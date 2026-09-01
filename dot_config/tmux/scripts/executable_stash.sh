@@ -54,6 +54,15 @@ TERM_WAIT=12          # seconds to allow for a graceful exit
 RESUME_WAIT=360       # 0.25s ticks => 90s; a big transcript takes a while to replay
 ACTIVE_SECS=15        # a transcript written this recently means a turn is in flight
 
+# The picker popup's geometry — and, derived from it, the size a suspended
+# agent's screen is captured at for the picker's preview pane. One pair of
+# numbers feeding both sides, so the snapshot is taken at the width the
+# preview will actually render it at. Snapshots are keyed by session id,
+# which survives a tmux restart; window ids do not.
+POPUP_W_PCT=80
+POPUP_H_PCT=60
+PREVIEW_DIR="$HOME/.local/state/tmux-stash/previews"
+
 # Records are delimited with the unit separator, NOT a tab: bash treats tab as
 # IFS whitespace and collapses runs of it, so a session that has not reported a
 # `status` yet loses that empty field and every later field shifts left.
@@ -661,6 +670,42 @@ has_unsent_input() {
         }'
 }
 
+# The screen a suspended agent was showing, saved for the picker's preview.
+# Captured BEFORE the kill — afterwards the pane holds a dead shell and the
+# conversation's rendering is gone. The window is first resized to the size
+# the preview pane will have (the popup is POPUP_*_PCT of the client, fzf
+# splits it in half, borders come off both layers), so the TUI reflows to
+# exactly the width the preview renders at; -e keeps the colours.
+# resize-window pins window-size to manual, so it is unset again after the
+# capture or the window would come home tiny and stay that way.
+snapshot_pane() {
+    local win="$1" pane="$2" sid="$3" c="" r="" cols lines
+    [ -n "$win" ] && [ -n "$pane" ] && [ -n "$sid" ] || return 0
+    read -r c r < <(tmux list-clients -F '#{client_width} #{client_height}' 2>/dev/null | head -1)
+    case "$c" in ''|*[!0-9]*) c=0 ;; esac
+    case "$r" in ''|*[!0-9]*) r=0 ;; esac
+    if [ "$c" -gt 0 ] && [ "$r" -gt 0 ]; then
+        # Popup border takes 2 each way; fzf gives the preview half its width
+        # and border-left another column. Undershoot rather than clip: a
+        # missing column cuts through the composer's box border, a one-column
+        # gap is invisible.
+        cols=$(( (c * POPUP_W_PCT / 100 - 2) / 2 - 2 ))
+        lines=$(( r * POPUP_H_PCT / 100 - 3 ))
+        if [ "$cols" -ge 20 ] && [ "$lines" -ge 5 ]; then
+            # The redraw is asynchronous — give the TUI a beat to take the
+            # SIGWINCH. This runs after the tab is already off the bar, so
+            # the wait is out of sight like the rest of the suspend.
+            tmux resize-window -t "$win" -x "$cols" -y "$lines" 2>/dev/null && sleep 0.6
+        fi
+    fi
+    mkdir -p "$PREVIEW_DIR" 2>/dev/null
+    tmux capture-pane -ep -t "$pane" > "$PREVIEW_DIR/$sid.ansi" 2>/dev/null
+    tmux set-option -uw -t "$win" window-size 2>/dev/null
+    # Snapshots whose cleanup path never ran (a crash, a kill from outside
+    # this script) age out here rather than accumulating forever.
+    find "$PREVIEW_DIR" -name '*.ansi' -mtime +30 -delete 2>/dev/null
+}
+
 # Best-effort: parking always succeeds, suspending is the bonus. Anything
 # uncertain leaves the agent running inside the parked window, which costs
 # memory but can never lose work.
@@ -784,6 +829,10 @@ suspend_agent() {
         return 0
     fi
 
+    # The last thing before the signal, so the picker's preview shows the
+    # conversation as it looked at the moment it was put away.
+    snapshot_pane "$win" "$a_pane" "$a_sid"
+
     kill -TERM "$a_pid" 2>/dev/null
     local i=0
     while [ "$i" -lt "$TERM_WAIT" ] && kill -0 "$a_pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
@@ -885,6 +934,7 @@ resume_agent() {
             tmux set-option -uw -t "$win" @stash_cwd 2>/dev/null
             tmux set-option -uw -t "$win" @stash_pane_idx 2>/dev/null
             save_state
+            rm -f "$PREVIEW_DIR/$sid.ansi" 2>/dev/null
             return 0
         fi
         [ "$waited" -ge "$RESUME_WAIT" ] && break
@@ -1386,7 +1436,7 @@ do_unstash() {
             # if-shell in tmux.conf keeps the branch in one place and avoids a
             # second layer of shell quoting inside a tmux command string.
             # Deliberately outside the lock: the popup waits on a human.
-            tmux display-popup -E -w 60% -h 60% "'$SELF' pick"
+            tmux display-popup -E -w "${POPUP_W_PCT}%" -h "${POPUP_H_PCT}%" "'$SELF' pick"
             return 0
         fi
     fi
@@ -1569,6 +1619,9 @@ do_kill_many() {
 
         if tmux kill-window -t "$win" 2>/dev/null; then
             killed=$((killed + 1))
+            # After the kill, not beside forget_sids: a failed kill restores
+            # the record, and its snapshot should still be there to back it.
+            [ -n "$sid" ] && rm -f "$PREVIEW_DIR/$sid.ansi" 2>/dev/null
             [ -z "$sid" ] && [ -z "$apid" ] && log "killed parked window $win ($lbl)"
         else
             if [ -n "$sid" ]; then
@@ -1604,10 +1657,42 @@ do_kill_many() {
 # this pairs with on the tab-bar side, and having the two halves of the feature
 # answer to the same key is most of what makes it memorable.
 #
+# What the preview pane shows for one parked window: the snapshot taken at
+# suspend time if the agent was suspended (the live pane is a dead shell by
+# then), otherwise the pane as it looks right now — an agent left running, or
+# a plain shell, still has a real screen to show. The live capture is NOT
+# resized to fit: fzf clips the right edge, and reflowing a running agent's
+# window once per cursor movement in the picker is worse than a clipped edge.
+do_preview() {
+    local win="${1:-}" sid pidx pane=""
+    [ -n "$win" ] || return 0
+    sid=$(tmux show -wqv -t "$win" @stash_session 2>/dev/null)
+    if [ -n "$sid" ] && [ -f "$PREVIEW_DIR/$sid.ansi" ]; then
+        cat "$PREVIEW_DIR/$sid.ansi"
+        return 0
+    fi
+    # The agent's pane if one was recorded, the active pane otherwise — the
+    # same preference resume_agent has, for the same reason.
+    pidx=$(tmux show -wqv -t "$win" @stash_pane_idx 2>/dev/null)
+    if [ -n "$pidx" ]; then
+        pane=$(tmux list-panes -t "$win" -F '#{pane_index} #{pane_id}' 2>/dev/null \
+               | awk -v i="$pidx" '$1==i{print $2}')
+    fi
+    [ -n "$pane" ] || pane=$(tmux list-panes -t "$win" -F '#{?pane_active,#{pane_id},}' 2>/dev/null \
+                             | grep -v '^$' | head -1)
+    # An empty target is the CURRENT pane, not a no-op — never capture -t ''.
+    [ -n "$pane" ] || return 0
+    tmux capture-pane -ep -t "$pane" 2>/dev/null
+}
+
 # ⌃x kills instead of restoring — same selection semantics as ⏎, via fzf's
 # --expect, which prefixes the output with the key that accepted it (empty
 # line for a plain Enter). ⌃x because fzf already means something by most
 # mnemonic keys (⌃k is line-up, ⌃d is deselect-all here) and ⌃x is unbound.
+#
+# The preview pane on the right is half the popup, matching the size
+# snapshot_pane captures at; border-left rather than the default box so no
+# rows are lost to a top/bottom border and the snapshot's height fits.
 do_pick() {
     local out key wins
     out=$(tmux list-windows -t "=$HOLD" \
@@ -1616,6 +1701,8 @@ do_pick() {
                 --multi \
                 --expect=ctrl-x \
                 --bind 'shift-down:toggle+down,shift-up:toggle+up,ctrl-a:select-all,ctrl-d:deselect-all' \
+                --preview "'$SELF' preview {1}" \
+                --preview-window 'right,50%,border-left' \
                 --header '⇧↑/⇧↓ or Tab to pick several · ⌃a all · ⏎ bring back · ⌃x kill')
     key=${out%%$'\n'*}
     wins=$(printf '%s\n' "$out" | tail -n +2 | cut -f1 | tr '\n' ' ')
@@ -1682,6 +1769,7 @@ case "${1:-}" in
     count)   count ;;
     publish) publish ;;
     pick)    do_pick ;;
+    preview) shift; do_preview "${1:-}" ;;
     resume)  shift; resume_agent "${1:-}" ;;
     restore-state) do_restore_state ;;
     list)    do_list ;;
