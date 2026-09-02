@@ -9,8 +9,10 @@ LOCKDIR="${CACHE_FILE}.lock"
 
 # Rolling sample history for recent-rate pacing projection. Each line is
 # {"t":epoch,"s":session_used,"w":weekly_used,"sr":session_resets_at,
-# "wr":weekly_resets_at}. The "sr"/"wr" fields let us discard samples
-# that belong to a previous rolling window when projecting forward.
+# "wr":weekly_resets_at,"f":fable_used,"fr":fable_resets_at}. The
+# "sr"/"wr"/"fr" fields let us discard samples that belong to a previous
+# rolling window when projecting forward. Lines written before the fable
+# module existed have no "f"/"fr" and are simply never selected for it.
 HISTORY_FILE="${CACHE_DIR}/usage-history.jsonl"
 HISTORY_MAX_LINES=120
 HISTORY_RECENT_WINDOW_SECONDS=1800
@@ -98,6 +100,12 @@ WEB_TIMEOUT_SECONDS="$(clamp_int_range "$(opt_or_env_or_default '@codexbar_web_t
 AUTH_REQUIRED_COLOR="$(opt_or_env_or_default '@codexbar_auth_required_color' 'CODEXBAR_USAGE_AUTH_REQUIRED_COLOR' '#cba6f7')"
 AUTH_REQUIRED_TEXT="$(opt_or_env_or_default '@codexbar_auth_required_text' 'CODEXBAR_USAGE_AUTH_REQUIRED_TEXT' 'Need to log in')"
 
+# The third module tracks the model-scoped weekly limit the OAuth usage
+# endpoint reports under .limits[] with kind "weekly_scoped". Matched by the
+# scope's model display name, case-insensitively and by prefix, so a versioned
+# name ("Fable 5.1") still matches.
+FABLE_MODEL_NAME="$(opt_or_env_or_default '@codexbar_fable_model' 'CODEXBAR_USAGE_FABLE_MODEL' 'Fable')"
+
 USAGE_PROVIDER="$(opt_or_env_or_default '@codexbar_provider' 'CODEXBAR_USAGE_PROVIDER' 'codex')"
 case "$USAGE_PROVIDER" in
   claude|codex) ;;
@@ -162,22 +170,25 @@ debug_flash_codex_icons() {
     flash_color='default'
   fi
 
-  local prev_session prev_weekly nonce
+  local prev_session prev_weekly prev_fable nonce
   prev_session="$(tmux show-option -gqv @codex_session_color 2>/dev/null || true)"
   prev_weekly="$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true)"
+  prev_fable="$(tmux show-option -gqv @codex_fable_color 2>/dev/null || true)"
 
   nonce="$(date +%s%N 2>/dev/null || date +%s)"
 
   tmux set-option -gq @codexbar_debug_flash_nonce "$nonce" >/dev/null 2>&1 || true
   tmux set-option -gq @codexbar_debug_flash_prev_session_color "$prev_session" >/dev/null 2>&1 || true
   tmux set-option -gq @codexbar_debug_flash_prev_weekly_color "$prev_weekly" >/dev/null 2>&1 || true
+  tmux set-option -gq @codexbar_debug_flash_prev_fable_color "$prev_fable" >/dev/null 2>&1 || true
 
   tmux set-option -gq @codex_session_color "$flash_color" >/dev/null 2>&1 || true
   tmux set-option -gq @codex_weekly_color "$flash_color" >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_fable_color "$flash_color" >/dev/null 2>&1 || true
   tmux refresh-client -S >/dev/null 2>&1 || true
   log_debug "flash: on color=${flash_color}"
 
-  tmux run-shell -b "sleep 0.5; n=\$(tmux show-option -gqv @codexbar_debug_flash_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] || exit 0; fc='$flash_color'; cs=\$(tmux show-option -gqv @codex_session_color 2>/dev/null || true); cw=\$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true); s=\$(tmux show-option -gqv @codexbar_debug_flash_prev_session_color 2>/dev/null); w=\$(tmux show-option -gqv @codexbar_debug_flash_prev_weekly_color 2>/dev/null); if [ \"\$cs\" = \"\$fc\" ]; then if [ -n \"\$s\" ]; then tmux set-option -gq @codex_session_color \"\$s\"; else tmux set-option -gu @codex_session_color; fi; fi; if [ \"\$cw\" = \"\$fc\" ]; then if [ -n \"\$w\" ]; then tmux set-option -gq @codex_weekly_color \"\$w\"; else tmux set-option -gu @codex_weekly_color; fi; fi; tmux refresh-client -S;" >/dev/null 2>&1 || true
+  tmux run-shell -b "sleep 0.5; n=\$(tmux show-option -gqv @codexbar_debug_flash_nonce 2>/dev/null); [ \"\$n\" = \"$nonce\" ] || exit 0; fc='$flash_color'; cs=\$(tmux show-option -gqv @codex_session_color 2>/dev/null || true); cw=\$(tmux show-option -gqv @codex_weekly_color 2>/dev/null || true); cfb=\$(tmux show-option -gqv @codex_fable_color 2>/dev/null || true); s=\$(tmux show-option -gqv @codexbar_debug_flash_prev_session_color 2>/dev/null); w=\$(tmux show-option -gqv @codexbar_debug_flash_prev_weekly_color 2>/dev/null); f=\$(tmux show-option -gqv @codexbar_debug_flash_prev_fable_color 2>/dev/null); if [ \"\$cs\" = \"\$fc\" ]; then if [ -n \"\$s\" ]; then tmux set-option -gq @codex_session_color \"\$s\"; else tmux set-option -gu @codex_session_color; fi; fi; if [ \"\$cw\" = \"\$fc\" ]; then if [ -n \"\$w\" ]; then tmux set-option -gq @codex_weekly_color \"\$w\"; else tmux set-option -gu @codex_weekly_color; fi; fi; if [ \"\$cfb\" = \"\$fc\" ]; then if [ -n \"\$f\" ]; then tmux set-option -gq @codex_fable_color \"\$f\"; else tmux set-option -gu @codex_fable_color; fi; fi; tmux refresh-client -S;" >/dev/null 2>&1 || true
 }
 
 script_abs_path() {
@@ -273,7 +284,7 @@ LOCK_STALE_SECONDS=120
 WAKE_GAP_SECONDS=60
 
 usage() {
-  printf '%s\n' "Usage: $0 {session|weekly|--refresh|--publish|--tick|--auth-required|--login|--debug-flash-tick <nonce>}" >&2
+  printf '%s\n' "Usage: $0 {session|weekly|fable|--refresh|--publish|--tick|--auth-required|--login|--debug-flash-tick <nonce>}" >&2
 }
 
 now_epoch() {
@@ -605,6 +616,7 @@ format_time_until_reset() {
 # HISTORY_MAX_LINES entries to bound disk usage and read cost.
 append_usage_history() {
   local now="$1" session_used="$2" weekly_used="$3" session_resets="$4" weekly_resets="$5"
+  local fable_used="${6:-}" fable_resets="${7:-}"
 
   [[ "$now" =~ ^[0-9]+$ ]] || return 0
   [[ "$session_used" =~ ^[0-9]+$ ]] || return 0
@@ -612,15 +624,19 @@ append_usage_history() {
 
   mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
 
-  local sr_json wr_json
+  local sr_json wr_json f_json fr_json
   sr_json='null'
   wr_json='null'
+  f_json='null'
+  fr_json='null'
   [[ "$session_resets" =~ ^[0-9]+$ ]] && sr_json="$session_resets"
   [[ "$weekly_resets"  =~ ^[0-9]+$ ]] && wr_json="$weekly_resets"
+  [[ "$fable_used"     =~ ^[0-9]+$ ]] && f_json="$fable_used"
+  [[ "$fable_resets"   =~ ^[0-9]+$ ]] && fr_json="$fable_resets"
 
   umask 077
-  printf '{"t":%s,"s":%s,"w":%s,"sr":%s,"wr":%s}\n' \
-    "$now" "$session_used" "$weekly_used" "$sr_json" "$wr_json" \
+  printf '{"t":%s,"s":%s,"w":%s,"sr":%s,"wr":%s,"f":%s,"fr":%s}\n' \
+    "$now" "$session_used" "$weekly_used" "$sr_json" "$wr_json" "$f_json" "$fr_json" \
     >>"$HISTORY_FILE" 2>/dev/null || return 0
 
   local line_count
@@ -661,6 +677,7 @@ pace_recent_rate() {
   case "$mode" in
     session) used_key='s'; resets_key='sr' ;;
     weekly)  used_key='w'; resets_key='wr' ;;
+    fable)   used_key='f'; resets_key='fr' ;;
     *) return 0 ;;
   esac
 
@@ -714,8 +731,8 @@ pace_recent_rate() {
 # nothing (empty stdout) when the projection is not computable.
 #
 # Args: used window_minutes resets_at now [mode]
-#   mode = "session" or "weekly" - enables the recent-rate path. Omit to
-#   force long-term-only behavior (used by tests).
+#   mode = "session", "weekly" or "fable" - enables the recent-rate path.
+#   Omit to force long-term-only behavior (used by tests).
 pace_eta_seconds() {
   local used="$1" window_minutes="$2" resets_at="$3" now="$4" mode="${5:-}"
 
@@ -956,7 +973,7 @@ format_session_reset_text() {
 # weekday name for the near term, month+day for projections that would
 # otherwise be ambiguous as a bare weekday.
 format_weekly_reset_text() {
-  local resets_at="$1" used="$2" window_minutes="$3" now="$4"
+  local resets_at="$1" used="$2" window_minutes="$3" now="$4" mode="${5:-weekly}"
 
   local time_until reset_daytime
   time_until="$(format_time_until_reset "$resets_at" "$now")"
@@ -984,7 +1001,7 @@ format_weekly_reset_text() {
   [[ "$time_until" != "--" ]] || return 0
 
   local eta_seconds
-  eta_seconds="$(pace_eta_seconds "$used" "$window_minutes" "$resets_at" "$now" "weekly")"
+  eta_seconds="$(pace_eta_seconds "$used" "$window_minutes" "$resets_at" "$now" "$mode")"
   [[ -n "${eta_seconds:-}" ]] || return 0
   [[ "$eta_seconds" =~ ^[0-9]+$ ]] || return 0
 
@@ -1064,7 +1081,8 @@ effective_view_from_context() {
       [[ "$mode" == 'session' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
       ;;
     weekly)
-      [[ "$mode" == 'weekly' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
+      # fable is a weekly-window limit, so it follows the weekly scope.
+      [[ "$mode" == 'weekly' || "$mode" == 'fable' ]] && printf '%s' 'reset' || printf '%s' "$PRINT_VIEW_BASELINE"
       ;;
   esac
 }
@@ -1081,6 +1099,11 @@ load_cache_fields() {
   CACHE_WEEKLY_USED=''
   CACHE_SESSION_WINDOW_MINUTES=''
   CACHE_WEEKLY_WINDOW_MINUTES=''
+  CACHE_FABLE_TEXT=''
+  CACHE_FABLE_COLOR=''
+  CACHE_FABLE_RESETS=''
+  CACHE_FABLE_USED=''
+  CACHE_FABLE_WINDOW_MINUTES=''
 
   [[ -f "$CACHE_FILE" ]] || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -1092,9 +1115,9 @@ load_cache_fields() {
   # tail fields off the end. Use a non-whitespace separator (US, \037) so empty
   # fields survive; @tsv escapes any literal tab in a value, so this is lossless.
   local parsed
-  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
+  parsed="$(jq -r '[.state//"ok", .session_text//"", .weekly_text//"", .session_color//"", .weekly_color//"", .session_resets_at//"", .weekly_resets_at//"", .session_used//"", .weekly_used//"", .session_window_minutes//"", .weekly_window_minutes//"", .fable_text//"", .fable_color//"", .fable_resets_at//"", .fable_used//"", .fable_window_minutes//""] | @tsv' "$CACHE_FILE" 2>/dev/null | tr '\t' '\037' || true)"
   [[ -n "$parsed" ]] || return 0
-  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES <<<"$parsed"
+  IFS=$'\037' read -r CACHE_STATE CACHE_SESSION_TEXT CACHE_WEEKLY_TEXT CACHE_SESSION_COLOR CACHE_WEEKLY_COLOR CACHE_SESSION_RESETS CACHE_WEEKLY_RESETS CACHE_SESSION_USED CACHE_WEEKLY_USED CACHE_SESSION_WINDOW_MINUTES CACHE_WEEKLY_WINDOW_MINUTES CACHE_FABLE_TEXT CACHE_FABLE_COLOR CACHE_FABLE_RESETS CACHE_FABLE_USED CACHE_FABLE_WINDOW_MINUTES <<<"$parsed"
 }
 
 render_text_for_mode() {
@@ -1127,11 +1150,23 @@ render_text_for_mode() {
         window_minutes="$CACHE_WEEKLY_WINDOW_MINUTES"
         out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now")"
         ;;
+      fable)
+        resets_at="$CACHE_FABLE_RESETS"
+        used="$CACHE_FABLE_USED"
+        window_minutes="$CACHE_FABLE_WINDOW_MINUTES"
+        if [[ -z "$used" ]]; then
+          # The provider reported no Fable-scoped weekly limit at all.
+          out='n/a'
+        else
+          out="$(format_weekly_reset_text "$resets_at" "$used" "$window_minutes" "$now" "fable")"
+        fi
+        ;;
     esac
   else
     case "$mode" in
       session) out="$CACHE_SESSION_TEXT" ;;
       weekly)  out="$CACHE_WEEKLY_TEXT" ;;
+      fable)   out="$CACHE_FABLE_TEXT" ;;
     esac
     if [[ -z "$out" ]]; then
       out="--%"
@@ -1156,24 +1191,31 @@ publish_to_tmux_opts() {
     debug_suffix=" d${c}"
   fi
 
-  local session_view weekly_view session_text weekly_text
+  local session_view weekly_view fable_view session_text weekly_text fable_text
   session_view="$(effective_view_from_context session)"
   weekly_view="$(effective_view_from_context weekly)"
+  fable_view="$(effective_view_from_context fable)"
   session_text="$(render_text_for_mode session "$session_view" "$debug_suffix")"
   weekly_text="$(render_text_for_mode weekly  "$weekly_view"  "$debug_suffix")"
+  fable_text="$(render_text_for_mode fable   "$fable_view"   "$debug_suffix")"
 
   tmux set-option -gq @codex_session_text "$session_text" >/dev/null 2>&1 || true
   tmux set-option -gq @codex_weekly_text  "$weekly_text"  >/dev/null 2>&1 || true
+  tmux set-option -gq @codex_fable_text   "$fable_text"   >/dev/null 2>&1 || true
 
   if [[ "$CACHE_STATE" == "auth_required" ]]; then
     tmux set-option -gq @codex_session_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
     tmux set-option -gq @codex_weekly_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+    tmux set-option -gq @codex_fable_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
   else
     if [[ -n "$CACHE_SESSION_COLOR" ]]; then
       tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true
     fi
     if [[ -n "$CACHE_WEEKLY_COLOR" ]]; then
       tmux set-option -gq @codex_weekly_color "$CACHE_WEEKLY_COLOR" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$CACHE_FABLE_COLOR" ]]; then
+      tmux set-option -gq @codex_fable_color "$CACHE_FABLE_COLOR" >/dev/null 2>&1 || true
     fi
   fi
 }
@@ -1196,10 +1238,12 @@ print_value() {
     if [[ "$CACHE_STATE" == "auth_required" ]]; then
       tmux set-option -gq @codex_session_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
       tmux set-option -gq @codex_weekly_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
+      tmux set-option -gq @codex_fable_color "$AUTH_REQUIRED_COLOR" >/dev/null 2>&1 || true
     else
       case "$mode" in
         session) [[ -n "$CACHE_SESSION_COLOR" ]] && tmux set-option -gq @codex_session_color "$CACHE_SESSION_COLOR" >/dev/null 2>&1 || true ;;
         weekly)  [[ -n "$CACHE_WEEKLY_COLOR" ]]  && tmux set-option -gq @codex_weekly_color  "$CACHE_WEEKLY_COLOR"  >/dev/null 2>&1 || true ;;
+        fable)   [[ -n "$CACHE_FABLE_COLOR" ]]   && tmux set-option -gq @codex_fable_color   "$CACHE_FABLE_COLOR"   >/dev/null 2>&1 || true ;;
       esac
     fi
   fi
@@ -1672,19 +1716,25 @@ fetch_claude_oauth_usage_json() {
 
 FETCH_SESSION_USED=''
 FETCH_WEEKLY_USED=''
+FETCH_FABLE_USED=''
 FETCH_SESSION_WINDOW_MINUTES=''
 FETCH_WEEKLY_WINDOW_MINUTES=''
+FETCH_FABLE_WINDOW_MINUTES=''
 FETCH_SESSION_RESETS_AT=''
 FETCH_WEEKLY_RESETS_AT=''
+FETCH_FABLE_RESETS_AT=''
 FETCH_AUTH_REQUIRED=0
 
 reset_fetch_outputs() {
   FETCH_SESSION_USED=''
   FETCH_WEEKLY_USED=''
+  FETCH_FABLE_USED=''
   FETCH_SESSION_WINDOW_MINUTES=''
   FETCH_WEEKLY_WINDOW_MINUTES=''
+  FETCH_FABLE_WINDOW_MINUTES=''
   FETCH_SESSION_RESETS_AT=''
   FETCH_WEEKLY_RESETS_AT=''
+  FETCH_FABLE_RESETS_AT=''
   FETCH_AUTH_REQUIRED=0
   CLAUDE_OAUTH_REFRESH_REAUTH_REQUIRED=0
 }
@@ -1905,6 +1955,32 @@ fetch_via_claude_oauth() {
     FETCH_WEEKLY_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
   fi
 
+  # Model-scoped weekly limit (Fable). It lives only in .limits[]; there is no
+  # top-level seven_day_<model> key for it. Absent scope => module renders
+  # "n/a" rather than failing the whole refresh.
+  local fable_limit
+  fable_limit="$(printf '%s' "$raw" | jq -c \
+    --arg m "$FABLE_MODEL_NAME" '
+      [ .limits[]?
+        | select((.kind? // "") == "weekly_scoped")
+        | select(((.scope?.model?.display_name? // "") | ascii_downcase)
+                 | startswith($m | ascii_downcase))
+      ] | first // empty
+    ' 2>/dev/null || true)"
+
+  if [[ -n "${fable_limit:-}" ]]; then
+    FETCH_FABLE_USED="$(printf '%s' "$fable_limit" | jq -er '.percent | tonumber' 2>/dev/null || true)"
+    if [[ -n "${FETCH_FABLE_USED:-}" ]]; then
+      FETCH_FABLE_WINDOW_MINUTES=10080
+      iso="$(printf '%s' "$fable_limit" | jq -er -r '.resets_at // empty | tostring' 2>/dev/null || true)"
+      if [[ -n "${iso:-}" ]]; then
+        FETCH_FABLE_RESETS_AT="$(iso_utc_to_epoch "$iso" 2>/dev/null || true)"
+      fi
+    fi
+  else
+    log_debug "refresh[claude]: no weekly_scoped limit for model=${FABLE_MODEL_NAME}"
+  fi
+
   return 0
 }
 
@@ -2012,14 +2088,19 @@ refresh_cache() {
 
   local session_window_minutes="$FETCH_SESSION_WINDOW_MINUTES"
   local weekly_window_minutes="$FETCH_WEEKLY_WINDOW_MINUTES"
+  local fable_window_minutes="$FETCH_FABLE_WINDOW_MINUTES"
   local session_resets_at="$FETCH_SESSION_RESETS_AT"
   local weekly_resets_at="$FETCH_WEEKLY_RESETS_AT"
+  local fable_resets_at="$FETCH_FABLE_RESETS_AT"
 
   local session_window_minutes_json session_resets_at_json weekly_window_minutes_json weekly_resets_at_json
+  local fable_window_minutes_json fable_resets_at_json
   session_window_minutes_json='null'
   session_resets_at_json='null'
   weekly_window_minutes_json='null'
   weekly_resets_at_json='null'
+  fable_window_minutes_json='null'
+  fable_resets_at_json='null'
 
   if [[ "$session_window_minutes" =~ ^[0-9]+$ ]]; then
     session_window_minutes_json="$session_window_minutes"
@@ -2033,10 +2114,23 @@ refresh_cache() {
   if [[ "$weekly_resets_at" =~ ^[0-9]+$ ]]; then
     weekly_resets_at_json="$weekly_resets_at"
   fi
+  if [[ "$fable_window_minutes" =~ ^[0-9]+$ ]]; then
+    fable_window_minutes_json="$fable_window_minutes"
+  fi
+  if [[ "$fable_resets_at" =~ ^[0-9]+$ ]]; then
+    fable_resets_at_json="$fable_resets_at"
+  fi
 
   local session_used weekly_used
   session_used="$(clamp_0_100_int "$FETCH_SESSION_USED")" || { refresh_fail; return 1; }
   weekly_used="$(clamp_0_100_int "$FETCH_WEEKLY_USED")" || { refresh_fail; return 1; }
+
+  # A missing model-scoped limit is normal (other providers, other plans); it
+  # blanks the fable module instead of failing the refresh.
+  local fable_used=''
+  if [[ -n "${FETCH_FABLE_USED:-}" ]]; then
+    fable_used="$(clamp_0_100_int "$FETCH_FABLE_USED" || true)"
+  fi
 
   local updated_at
   updated_at="$(now_epoch)"
@@ -2050,6 +2144,18 @@ refresh_cache() {
   weekly_text="${weekly_used}%${weekly_pace}"
   session_color="$(color_for_window "$session_used" "$session_window_minutes" "$session_resets_at" "$updated_at")"
   weekly_color="$(color_for_window "$weekly_used"  "$weekly_window_minutes"  "$weekly_resets_at"  "$updated_at")"
+
+  local fable_used_json='null' fable_text='' fable_color=''
+  if [[ -n "$fable_used" ]]; then
+    fable_used_json="$fable_used"
+    local fable_pace
+    fable_pace="$(pace_suffix "$fable_used" "$fable_window_minutes" "$fable_resets_at" "$updated_at")"
+    fable_text="${fable_used}%${fable_pace}"
+    fable_color="$(color_for_window "$fable_used" "$fable_window_minutes" "$fable_resets_at" "$updated_at")"
+  else
+    fable_text='n/a'
+    fable_color='brightblack'
+  fi
 
   # Between 5-hour windows the endpoint reports utilization 0 with a null
   # resets_at — there is no window, so pacing is undefined and the reset time is
@@ -2065,17 +2171,18 @@ refresh_cache() {
 
   umask 077
   cat >"$tmp" <<EOF
-{"updated_at":${updated_at},"state":"ok","session_used":${session_used},"weekly_used":${weekly_used},"session_window_minutes":${session_window_minutes_json},"session_resets_at":${session_resets_at_json},"weekly_window_minutes":${weekly_window_minutes_json},"weekly_resets_at":${weekly_resets_at_json},"session_windowMinutes":${session_window_minutes_json},"session_resetsAt":${session_resets_at_json},"weekly_windowMinutes":${weekly_window_minutes_json},"weekly_resetsAt":${weekly_resets_at_json},"session_text":"${session_text}","weekly_text":"${weekly_text}","session_color":"${session_color}","weekly_color":"${weekly_color}"}
+{"updated_at":${updated_at},"state":"ok","session_used":${session_used},"weekly_used":${weekly_used},"fable_used":${fable_used_json},"session_window_minutes":${session_window_minutes_json},"session_resets_at":${session_resets_at_json},"weekly_window_minutes":${weekly_window_minutes_json},"weekly_resets_at":${weekly_resets_at_json},"fable_window_minutes":${fable_window_minutes_json},"fable_resets_at":${fable_resets_at_json},"session_windowMinutes":${session_window_minutes_json},"session_resetsAt":${session_resets_at_json},"weekly_windowMinutes":${weekly_window_minutes_json},"weekly_resetsAt":${weekly_resets_at_json},"session_text":"${session_text}","weekly_text":"${weekly_text}","fable_text":"${fable_text}","session_color":"${session_color}","weekly_color":"${weekly_color}","fable_color":"${fable_color}"}
 EOF
 
   mv -f "$tmp" "$CACHE_FILE"
 
   append_usage_history "$updated_at" "$session_used" "$weekly_used" \
-    "$session_resets_at" "$weekly_resets_at" || true
+    "$session_resets_at" "$weekly_resets_at" "$fable_used" "$fable_resets_at" || true
 
   if command -v tmux >/dev/null 2>&1; then
     tmux set-option -gq @codex_session_color "$session_color" >/dev/null 2>&1 || true
     tmux set-option -gq @codex_weekly_color "$weekly_color" >/dev/null 2>&1 || true
+    tmux set-option -gq @codex_fable_color "$fable_color" >/dev/null 2>&1 || true
 
     local debug_opt
     debug_opt="$(tmux show-option -gqv @codexbar_debug 2>/dev/null || true)"
@@ -2095,7 +2202,7 @@ EOF
     tmux refresh-client -S >/dev/null 2>&1 || true
   fi
 
-  log_info "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}% provider=${USAGE_PROVIDER}"
+  log_info "refresh: success updated_at=${updated_at} session=${session_used}% weekly=${weekly_used}% fable=${fable_used:-n/a}% provider=${USAGE_PROVIDER}"
 
   reset_refresh_backoff
 }
@@ -2122,8 +2229,8 @@ main() {
       exit $?
       ;;
     --tick)
-      # Debounce: when both catppuccin modules render in the same status tick,
-      # only the first --tick does work; the second sees a fresh marker and bails.
+      # Debounce: the catppuccin modules all render in the same status tick, so
+      # only the first --tick does work; the rest see a fresh marker and bail.
       local tick_marker="${CACHE_DIR}/last_tick"
       local tick_marker_age=999
       if [[ -f "$tick_marker" ]]; then
@@ -2184,7 +2291,7 @@ main() {
       debug_flash_tick "${2:-}"
       exit 0
       ;;
-    session|weekly)
+    session|weekly|fable)
       :
       ;;
     *)

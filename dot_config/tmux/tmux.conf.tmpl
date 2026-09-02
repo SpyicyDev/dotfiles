@@ -114,6 +114,7 @@ set -gF @catppuccin_custom_plugin_dir "#{HOME}/.config/tmux/catppuccin-custom"
 # Safe defaults for custom modules (can be overridden per-host).
 set -g @codex_session_color "colour239"
 set -g @codex_weekly_color "colour239"
+set -g @codex_fable_color "colour239"
 set -g @codexbar_view "percent"
 
 # Coffee (caffeinate) indicator disabled — module dropped from the status bar
@@ -140,6 +141,9 @@ set -g @codexbar_debug "0"
 set -g @codexbar_web_timeout "2"
 set -g @codexbar_auth_required_color "#cba6f7"
 set -g @codexbar_auth_required_text "Need to log in"
+# Model whose weekly model-scoped limit the codex_fable module tracks (matched
+# case-insensitively by prefix against the limit's scope model display name).
+set -g @codexbar_fable_model "Fable"
 
 # Ensure the old inline binding is removed on reload.
 unbind u
@@ -156,8 +160,8 @@ run-shell -b "bash #{HOME}/.config/tmux/scripts/codexbar-usage-status.sh --tick"
 
 # set -g @catppuccin_status_modules_right "application session battery date_time"
 # Coffee (caffeinate) and battery modules disabled.
-# set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session coffee battery"
-set -g @catppuccin_status_modules_right "directory codex_session codex_weekly session"
+# set -g @catppuccin_status_modules_right "directory codex_session codex_weekly codex_fable session coffee battery"
+set -g @catppuccin_status_modules_right "directory codex_session codex_weekly codex_fable session"
 set -g @catppuccin_date_time_text "%I:%M %p | %m-%d-%y"
 set -g @catppuccin_status_left_separator "█"
 
